@@ -57,7 +57,7 @@ REGISTER_OP("tensor.add")
 ### BlockOp: Hardware-Optimized Block Operations
 
 **Purpose**: Hardware-optimized block operations with explicit memory management
-**Type**: `TileType` (2D tiles in unified buffers)
+**Type**: `TileType` (tiles in unified buffers)
 **Location**: `src/ir/op/block_ops/`
 **Python API**: `from pypto.ir.op import block`
 
@@ -79,6 +79,7 @@ REGISTER_OP("tensor.add")
 
 #### Example Usage
 
+**Low-level API (IRBuilder):**
 ```python
 from pypto.ir.op import block
 
@@ -97,6 +98,28 @@ with ib.function("block_computation") as f:
     tile_sum = ib.let("tile_sum", block.sum(tile_sqrt, axis=1, keepdim=True))
     result = ib.let("result", block.store(tile_sum, 0, 0, 32, 1, output))
     ib.return_stmt(result)
+```
+
+**High-level API (Language DSL):**
+```python
+import pypto.language as pl
+
+@pl.program
+class MyProgram:
+    @pl.function
+    def block_computation(
+        self,
+        input_a: pl.Tensor[[128, 128], pl.FP32],
+        input_b: pl.Tensor[[128, 128], pl.FP32],
+        output: pl.Tensor[[128, 1], pl.FP32],
+    ) -> pl.Tensor[[128, 1], pl.FP32]:
+        tile_a: pl.Tile[[32, 128], pl.FP32] = pl.op.block.load(input_a, 0, 0, 32, 128)
+        tile_b: pl.Tile[[32, 128], pl.FP32] = pl.op.block.load(input_b, 0, 0, 32, 128)
+        tile_mul: pl.Tile[[32, 128], pl.FP32] = pl.op.block.mul(tile_a, tile_b)
+        tile_sqrt: pl.Tile[[32, 128], pl.FP32] = pl.op.block.sqrt(tile_mul)
+        tile_sum: pl.Tile[[32, 1], pl.FP32] = pl.op.block.row_sum(tile_sqrt)
+        result: pl.Tensor[[128, 1], pl.FP32] = pl.op.block.store(tile_sum, 0, 0, 32, 1, output)
+        return result
 ```
 
 #### C++ Implementation Patterns
@@ -184,7 +207,7 @@ REGISTER_OP("system.bar_all")
 | Type | Dimensions | Use Case | Memory | Special Fields |
 |------|-----------|----------|--------|----------------|
 | **TensorType** | N-D | General tensors, function params/returns | DDR (optional MemRef) | None |
-| **TileType** | ≤2D | Hardware-optimized tiles in unified buffers | Unified buffer (optional MemRef) | Optional TileView |
+| **TileType** | N-D | Hardware-optimized tiles in unified buffers | Unified buffer (optional MemRef) | Optional TileView |
 | **ScalarType** | 0D | Scalar values | Register | dtype only |
 | **UnknownType** | N/A | No return value (sync ops) | N/A | None |
 
@@ -201,7 +224,7 @@ Type (abstract)
 
 **When to use:**
 - **TensorType**: N-D tensors, DDR storage, function boundaries, flexible shapes
-- **TileType**: 2D tiles, unified buffers, hardware-optimized computations, explicit memory management
+- **TileType**: Tiles in unified buffers, hardware-optimized computations, explicit memory management
 
 ## Organization Benefits
 
@@ -234,7 +257,7 @@ REGISTER_OP("block.mul").f_deduce_type(DeduceBlockOpElementwiseBinaryType);
 
 ```cpp
 DeduceTensorOpElementwiseBinaryType(...)  // Tensor: Full N-D broadcasting
-DeduceBlockOpElementwiseBinaryType(...)   // Block: 2D + scalar support
+DeduceBlockOpElementwiseBinaryType(...)   // Block: Tile + scalar support
 DeduceBlockSumType(...)                   // Block: Reduction with axis/keepdim
 ```
 
@@ -260,20 +283,6 @@ set(PYPTO_SOURCES
     src/ir/op/sync_ops/sync.cpp  # Add new files here
 )
 ```
-
-## Summary
-
-**Organization improvements:**
-- Modular code organization by operator category
-- Reduced compilation dependencies
-- Clear separation between TensorOp, BlockOp, SyncOp
-- Hardware-optimized programming patterns
-- All functionality maintained, all tests passing
-
-**Comparison with other projects:**
-- **TVM/Relax**: `src/relax/op/tensor/`, `src/relax/op/nn/` (similar category-based structure)
-- **PyTorch**: `aten/src/ATen/native/BinaryOps.cpp`, `ReduceOps.cpp` (similar functional grouping)
-- **PyPTO**: Clearer categorization for hardware-specific needs (tensor vs block vs sync)
 
 ## Related Documentation
 
