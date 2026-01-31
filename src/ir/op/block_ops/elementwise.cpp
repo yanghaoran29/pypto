@@ -189,5 +189,150 @@ REGISTER_OP("block.subs")
       return DeduceBlockOpScalarBinaryType(args, kwargs, "block.subs");
     });
 
+REGISTER_OP("block.where_tt")
+    .set_op_category("BlockOp")
+    .set_description("Element-wise selection based on condition: where(condition, x, y) returns x where condition is true, y otherwise")
+    .set_pipe(PipeType::V)
+    .add_argument("condition", "Condition tile (TileType, typically INT32, 0 for false, non-zero for true)")
+    .add_argument("x", "Tile to select from when condition is true (TileType)")
+    .add_argument("y", "Tile to select from when condition is false (TileType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 3) << "The operator block.where requires exactly 3 arguments, but got "
+                              << args.size();
+
+      auto condition_type = As<TileType>(args[0]->GetType());
+      auto x_type = As<TileType>(args[1]->GetType());
+      auto y_type = As<TileType>(args[2]->GetType());
+
+      CHECK(condition_type) << "The operator block.where requires first argument (condition) to be a TileType, but got "
+                            << args[0]->GetType()->TypeName();
+      CHECK(x_type) << "The operator block.where requires second argument (x) to be a TileType, but got "
+                    << args[1]->GetType()->TypeName();
+      CHECK(y_type) << "The operator block.where requires third argument (y) to be a TileType, but got "
+                    << args[2]->GetType()->TypeName();
+
+      // Promote data types between x and y
+      auto result_dtype = PromoteDataTypes(x_type->dtype_, y_type->dtype_);
+      CHECK(result_dtype) << "The operator block.where requires compatible data types for x and y, but got "
+                          << args[1]->GetType()->TypeName() << " and " << args[2]->GetType()->TypeName();
+
+      // Broadcast shapes: x and y
+      auto broadcast_xy = BroadcastShapes(x_type->shape_, y_type->shape_);
+      CHECK(broadcast_xy.success) << "The operator block.where requires compatible shapes for x and y, but got "
+                                   << x_type->shape_ << " and " << y_type->shape_;
+
+      // Broadcast condition with x/y result
+      auto broadcast_result = BroadcastShapes(condition_type->shape_, broadcast_xy.shape);
+      CHECK(broadcast_result.success) << "The operator block.where requires compatible shapes for condition and x/y, but got condition "
+                                      << condition_type->shape_ << " and x/y " << broadcast_xy.shape;
+
+      return std::make_shared<TileType>(broadcast_result.shape, *result_dtype);
+    });
+
+REGISTER_OP("block.where_ts")
+    .set_op_category("BlockOp")
+    .set_description("Element-wise selection: where(condition, x, y) with scalar y")
+    .set_pipe(PipeType::V)
+    .add_argument("condition", "Condition tile (TileType)")
+    .add_argument("x", "Tile to select from when condition is true (TileType)")
+    .add_argument("y", "Scalar to select from when condition is false (ScalarType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 3) << "The operator block.where_ts requires exactly 3 arguments, but got "
+                              << args.size();
+
+      auto condition_type = As<TileType>(args[0]->GetType());
+      auto x_type = As<TileType>(args[1]->GetType());
+      auto y_type = As<ScalarType>(args[2]->GetType());
+
+      CHECK(condition_type) << "The operator block.where_ts requires first argument (condition) to be a TileType, but got "
+                            << args[0]->GetType()->TypeName();
+      CHECK(x_type) << "The operator block.where_ts requires second argument (x) to be a TileType, but got "
+                    << args[1]->GetType()->TypeName();
+      CHECK(y_type) << "The operator block.where_ts requires third argument (y) to be a ScalarType, but got "
+                    << args[2]->GetType()->TypeName();
+
+      // Promote data types between x tile and y scalar
+      auto result_dtype = PromoteDataTypes(x_type->dtype_, y_type->dtype_);
+      CHECK(result_dtype) << "The operator block.where_ts requires compatible data types for x and y, but got "
+                          << args[1]->GetType()->TypeName() << " and " << args[2]->GetType()->TypeName();
+
+      // Result shape is broadcast of condition and x
+      auto broadcast_result = BroadcastShapes(condition_type->shape_, x_type->shape_);
+      CHECK(broadcast_result.success) << "The operator block.where_ts requires compatible shapes for condition and x, but got "
+                                      << condition_type->shape_ << " and " << x_type->shape_;
+
+      return std::make_shared<TileType>(broadcast_result.shape, *result_dtype);
+    });
+
+REGISTER_OP("block.where_st")
+    .set_op_category("BlockOp")
+    .set_description("Element-wise selection: where(condition, x, y) with scalar x")
+    .set_pipe(PipeType::V)
+    .add_argument("condition", "Condition tile (TileType)")
+    .add_argument("x", "Scalar to select from when condition is true (ScalarType)")
+    .add_argument("y", "Tile to select from when condition is false (TileType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 3) << "The operator block.where_st requires exactly 3 arguments, but got "
+                              << args.size();
+
+      auto condition_type = As<TileType>(args[0]->GetType());
+      auto x_type = As<ScalarType>(args[1]->GetType());
+      auto y_type = As<TileType>(args[2]->GetType());
+
+      CHECK(condition_type) << "The operator block.where_st requires first argument (condition) to be a TileType, but got "
+                            << args[0]->GetType()->TypeName();
+      CHECK(x_type) << "The operator block.where_st requires second argument (x) to be a ScalarType, but got "
+                    << args[1]->GetType()->TypeName();
+      CHECK(y_type) << "The operator block.where_st requires third argument (y) to be a TileType, but got "
+                    << args[2]->GetType()->TypeName();
+
+      // Promote data types between x scalar and y tile
+      auto result_dtype = PromoteDataTypes(x_type->dtype_, y_type->dtype_);
+      CHECK(result_dtype) << "The operator block.where_st requires compatible data types for x and y, but got "
+                          << args[1]->GetType()->TypeName() << " and " << args[2]->GetType()->TypeName();
+
+      // Result shape is broadcast of condition and y
+      auto broadcast_result = BroadcastShapes(condition_type->shape_, y_type->shape_);
+      CHECK(broadcast_result.success) << "The operator block.where_st requires compatible shapes for condition and y, but got "
+                                      << condition_type->shape_ << " and " << y_type->shape_;
+
+      return std::make_shared<TileType>(broadcast_result.shape, *result_dtype);
+    });
+
+REGISTER_OP("block.where_ss")
+    .set_op_category("BlockOp")
+    .set_description("Element-wise selection: where(condition, x, y) with both x and y as scalars")
+    .set_pipe(PipeType::V)
+    .add_argument("condition", "Condition tile (TileType)")
+    .add_argument("x", "Scalar to select from when condition is true (ScalarType)")
+    .add_argument("y", "Scalar to select from when condition is false (ScalarType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 3) << "The operator block.where_ss requires exactly 3 arguments, but got "
+                              << args.size();
+
+      auto condition_type = As<TileType>(args[0]->GetType());
+      auto x_type = As<ScalarType>(args[1]->GetType());
+      auto y_type = As<ScalarType>(args[2]->GetType());
+
+      CHECK(condition_type) << "The operator block.where_ss requires first argument (condition) to be a TileType, but got "
+                            << args[0]->GetType()->TypeName();
+      CHECK(x_type) << "The operator block.where_ss requires second argument (x) to be a ScalarType, but got "
+                    << args[1]->GetType()->TypeName();
+      CHECK(y_type) << "The operator block.where_ss requires third argument (y) to be a ScalarType, but got "
+                    << args[2]->GetType()->TypeName();
+
+      // Promote data types between x and y scalars
+      auto result_dtype = PromoteDataTypes(x_type->dtype_, y_type->dtype_);
+      CHECK(result_dtype) << "The operator block.where_ss requires compatible data types for x and y, but got "
+                          << args[1]->GetType()->TypeName() << " and " << args[2]->GetType()->TypeName();
+
+      // Result shape is the condition shape
+      return std::make_shared<TileType>(condition_type->shape_, *result_dtype);
+    });
+
 }  // namespace ir
 }  // namespace pypto

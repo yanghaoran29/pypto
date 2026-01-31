@@ -259,6 +259,186 @@ class TestBlockElementwiseOps:
         assert func is not None
         assert "block.maximum" in str(func)
 
+    def test_block_where(self):
+        """Test block.where operation."""
+        ib = IRBuilder()
+
+        with ib.function("test_block_where") as f:
+            input_cond = f.param("input_cond", ir.TensorType([128, 128], DataType.INT32))
+            input_x = f.param("input_x", ir.TensorType([128, 128], DataType.FP32))
+            input_y = f.param("input_y", ir.TensorType([128, 128], DataType.FP32))
+            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
+            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+
+            tile_cond = ib.let("tile_cond", block.load(input_cond, 0, 0, 32, 32))
+            tile_x = ib.let("tile_x", block.load(input_x, 0, 0, 32, 32))
+            tile_y = ib.let("tile_y", block.load(input_y, 0, 0, 32, 32))
+            tile_result = ib.let("tile_result", block.where(tile_cond, tile_x, tile_y))
+            result = ib.let("result", block.store(tile_result, 0, 0, 32, 32, output))
+            ib.return_stmt(result)
+
+        func = f.get_result()
+        assert func is not None
+        assert "block.where_tt" in str(func)
+
+    def test_block_where_broadcasting(self):
+        """Test block.where with broadcasting."""
+        ib = IRBuilder()
+
+        with ib.function("test_block_where_broadcasting") as f:
+            input_cond = f.param("input_cond", ir.TensorType([128, 128], DataType.INT32))
+            input_x = f.param("input_x", ir.TensorType([128, 128], DataType.FP32))
+            input_y = f.param("input_y", ir.TensorType([128, 1], DataType.FP32))
+            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
+            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+
+            # Load condition and x as full tiles [32, 32]
+            tile_cond = ib.let("tile_cond", block.load(input_cond, 0, 0, 32, 32))
+            tile_x = ib.let("tile_x", block.load(input_x, 0, 0, 32, 32))
+            # Load y as a column vector [32, 1] which will broadcast
+            tile_y = ib.let("tile_y", block.load(input_y, 0, 0, 32, 1))
+            # where with broadcasting: [32, 32], [32, 32], [32, 1] -> [32, 32]
+            tile_result = ib.let("tile_result", block.where(tile_cond, tile_x, tile_y))
+            result = ib.let("result", block.store(tile_result, 0, 0, 32, 32, output))
+            ib.return_stmt(result)
+
+        func = f.get_result()
+        assert func is not None
+        assert "block.where_tt" in str(func)
+
+    def test_block_where_type_promotion(self):
+        """Test block.where with type promotion."""
+        ib = IRBuilder()
+
+        with ib.function("test_block_where_type_promotion") as f:
+            input_cond = f.param("input_cond", ir.TensorType([128, 128], DataType.INT32))
+            input_x = f.param("input_x", ir.TensorType([128, 128], DataType.FP16))
+            input_y = f.param("input_y", ir.TensorType([128, 128], DataType.FP32))
+            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
+            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+
+            tile_cond = ib.let("tile_cond", block.load(input_cond, 0, 0, 32, 32))
+            tile_x = ib.let("tile_x", block.load(input_x, 0, 0, 32, 32))
+            tile_y = ib.let("tile_y", block.load(input_y, 0, 0, 32, 32))
+            # where with type promotion: FP16 + FP32 -> FP32
+            tile_result = ib.let("tile_result", block.where(tile_cond, tile_x, tile_y))
+            result = ib.let("result", block.store(tile_result, 0, 0, 32, 32, output))
+            ib.return_stmt(result)
+
+        func = f.get_result()
+        assert func is not None
+        assert "block.where_tt" in str(func)
+
+    def test_block_where_ts(self):
+        """Test block.where with tile x and scalar y."""
+        span = ir.Span.unknown()
+
+        # Create condition and x tile [32, 32], y scalar
+        dim32_1 = ir.ConstInt(32, DataType.INT32, span)
+        dim32_2 = ir.ConstInt(32, DataType.INT32, span)
+        cond_type = ir.TileType([dim32_1, dim32_2], DataType.INT32)
+        x_type = ir.TileType([dim32_1, dim32_2], DataType.FP32)
+
+        cond_tile = ir.Var("cond", cond_type, span)
+        x_tile = ir.Var("x", x_type, span)
+        y_scalar = 0.5  # scalar value
+
+        # Apply where with scalar y
+        call = block.where(cond_tile, x_tile, y_scalar)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.where_ts"
+
+        # Check result type
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+
+    def test_block_where_st(self):
+        """Test block.where with scalar x and tile y."""
+        span = ir.Span.unknown()
+
+        # Create condition and y tile [32, 32], x scalar
+        dim32_1 = ir.ConstInt(32, DataType.INT32, span)
+        dim32_2 = ir.ConstInt(32, DataType.INT32, span)
+        cond_type = ir.TileType([dim32_1, dim32_2], DataType.INT32)
+        y_type = ir.TileType([dim32_1, dim32_2], DataType.FP32)
+
+        cond_tile = ir.Var("cond", cond_type, span)
+        x_scalar = 1.0  # scalar value
+        y_tile = ir.Var("y", y_type, span)
+
+        # Apply where with scalar x
+        call = block.where(cond_tile, x_scalar, y_tile)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.where_st"
+
+        # Check result type
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+
+    def test_block_where_ss(self):
+        """Test block.where with both x and y as scalars."""
+        span = ir.Span.unknown()
+
+        # Create condition tile [32, 32], both x and y scalars
+        dim32_1 = ir.ConstInt(32, DataType.INT32, span)
+        dim32_2 = ir.ConstInt(32, DataType.INT32, span)
+        cond_type = ir.TileType([dim32_1, dim32_2], DataType.INT32)
+
+        cond_tile = ir.Var("cond", cond_type, span)
+        x_scalar = 1.0  # scalar value
+        y_scalar = 0.0  # scalar value
+
+        # Apply where with both scalars
+        call = block.where(cond_tile, x_scalar, y_scalar)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.where_ss"
+
+        # Check result type
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+
+    def test_block_where_all_four_combinations(self):
+        """Test all four parameter combinations of block.where."""
+        span = ir.Span.unknown()
+
+        # Setup common tiles
+        dim32_1 = ir.ConstInt(32, DataType.INT32, span)
+        dim32_2 = ir.ConstInt(32, DataType.INT32, span)
+        cond_type = ir.TileType([dim32_1, dim32_2], DataType.INT32)
+        x_type = ir.TileType([dim32_1, dim32_2], DataType.FP32)
+        y_type = ir.TileType([dim32_1, dim32_2], DataType.FP32)
+
+        cond_tile = ir.Var("cond", cond_type, span)
+        x_tile = ir.Var("x", x_type, span)
+        y_tile = ir.Var("y", y_type, span)
+
+        # Test 1: Both tiles
+        call1 = block.where(cond_tile, x_tile, y_tile)
+        assert call1.op.name == "block.where_tt"
+
+        # Test 2: Tile x, scalar y
+        call2 = block.where(cond_tile, x_tile, 0.5)
+        assert call2.op.name == "block.where_ts"
+
+        # Test 3: Scalar x, tile y
+        call3 = block.where(cond_tile, 1.0, y_tile)
+        assert call3.op.name == "block.where_st"
+
+        # Test 4: Both scalars
+        call4 = block.where(cond_tile, 1.0, 0.0)
+        assert call4.op.name == "block.where_ss"
+
+        # All should return TileType
+        for call in [call1, call2, call3, call4]:
+            result_type = call.type
+            assert isinstance(result_type, ir.TileType)
+
 
 class TestBlockBroadcastOps:
     """Tests for block row broadcast operations."""
@@ -693,6 +873,10 @@ def test_block_ops_pipe():
         "block.div",
         "block.sub",
         "block.maximum",
+        "block.where_tt",
+        "block.where_ts",
+        "block.where_st",
+        "block.where_ss",
         "block.sum",
         "block.max",
         "block.row_max",

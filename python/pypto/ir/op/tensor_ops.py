@@ -434,3 +434,67 @@ def assemble(target: Expr, source: Expr, offset: List[Union[int, Expr]], span: O
         args.append(_normalize_expr(off, actual_span, int_dtype=DataType.INT32))
 
     return _ir_core.create_op_call("tensor.assemble", args, {}, actual_span)
+
+
+def where(condition: Expr, x: Union[int, float, Expr], y: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
+    """Element-wise selection based on condition.
+
+    Returns x where condition is true (non-zero), y otherwise.
+    Similar to torch.where and numpy.where.
+
+    Supports four parameter combinations:
+    - where(condition: Tensor, x: Tensor, y: Tensor)
+    - where(condition: Tensor, x: Tensor, y: Scalar)
+    - where(condition: Tensor, x: Scalar, y: Tensor)
+    - where(condition: Tensor, x: Scalar, y: Scalar)
+
+    Args:
+        condition: Condition tensor (typically INT32 or BOOL, 0 for false, non-zero for true)
+        x: Tensor or scalar to select from when condition is true
+        y: Tensor or scalar to select from when condition is false
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise conditional selection
+
+    Example:
+        ```python
+        # Select between two tensors based on condition
+        result = tensor.where(condition, true_values, false_values)
+        # Equivalent to: result[i] = true_values[i] if condition[i] else false_values[i]
+
+        # Select between tensor and scalar
+        result = tensor.where(condition, tensor_values, 0.0)
+
+        # Select between two scalars
+        result = tensor.where(condition, 1.0, 0.0)
+        ```
+    """
+    actual_span = _get_span_or_capture(span)
+
+    # Normalize x and y to Expr if they are int/float
+    x_expr = (
+        _normalize_expr(x, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(x, Expr)
+        else x
+    )
+    y_expr = (
+        _normalize_expr(y, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(y, Expr)
+        else y
+    )
+
+    # Determine which operator to use based on x and y types
+    x_is_scalar = isinstance(x_expr.type, ScalarType)
+    y_is_scalar = isinstance(y_expr.type, ScalarType)
+
+    if x_is_scalar and y_is_scalar:
+        op_name = "tensor.where_ss"
+    elif x_is_scalar:
+        op_name = "tensor.where_st"
+    elif y_is_scalar:
+        op_name = "tensor.where_ts"
+    else:
+        op_name = "tensor.where_tt"
+
+    return _ir_core.create_op_call(op_name, [condition, x_expr, y_expr], {}, actual_span)

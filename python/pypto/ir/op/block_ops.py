@@ -541,6 +541,75 @@ def maximum(lhs: Expr, rhs: Expr, span: Optional[Span] = None) -> Call:
     return _ir_core.create_op_call("block.maximum", [lhs, rhs], {}, actual_span)
 
 
+def where(condition: Expr, x: Union[int, float, Expr], y: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
+    """Element-wise selection based on condition.
+
+    Selects elements from x where condition is true (non-zero), otherwise from y.
+    Supports broadcasting for all operands.
+
+    Supports four parameter combinations:
+    - where(condition: Tile, x: Tile, y: Tile)
+    - where(condition: Tile, x: Tile, y: Scalar)
+    - where(condition: Tile, x: Scalar, y: Tile)
+    - where(condition: Tile, x: Scalar, y: Scalar)
+
+    Args:
+        condition: Condition tile (TileType, typically INT32, 0 for false, non-zero for true)
+        x: Tile or scalar to select from when condition is true
+        y: Tile or scalar to select from when condition is false
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise conditional selection
+
+    Example:
+        ```python
+        # Basic usage with tiles
+        cond_tile = block.load(cond_tensor, 0, 0, 32, 32)  # INT32 tile
+        x_tile = block.load(x_tensor, 0, 0, 32, 32)        # FP32 tile
+        y_tile = block.load(y_tensor, 0, 0, 32, 32)        # FP32 tile
+        result = block.where(cond_tile, x_tile, y_tile)    # FP32 tile
+
+        # With scalar
+        result = block.where(cond_tile, x_tile, 0.0)       # FP32 tile
+
+        # Both scalars
+        result = block.where(cond_tile, 1.0, 0.0)          # FP32 tile
+        ```
+    """
+    actual_span = _get_span_or_capture(span)
+
+    # Normalize x and y to Expr if they are int/float
+    x_expr = (
+        _normalize_expr(x, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(x, Expr)
+        else x
+    )
+    y_expr = (
+        _normalize_expr(y, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(y, Expr)
+        else y
+    )
+
+    # Import ScalarType here to avoid circular import
+    from pypto.pypto_core.ir import ScalarType
+
+    # Determine which operator to use based on x and y types
+    x_is_scalar = isinstance(x_expr.type, ScalarType)
+    y_is_scalar = isinstance(y_expr.type, ScalarType)
+
+    if x_is_scalar and y_is_scalar:
+        op_name = "block.where_ss"
+    elif x_is_scalar:
+        op_name = "block.where_st"
+    elif y_is_scalar:
+        op_name = "block.where_ts"
+    else:
+        op_name = "block.where_tt"
+
+    return _ir_core.create_op_call(op_name, [condition, x_expr, y_expr], {}, actual_span)
+
+
 # ============================================================================
 # Reduction Operations (continued)
 # ============================================================================

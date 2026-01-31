@@ -318,6 +318,205 @@ def test_tensor_div():
     assert call.op.name == "tensor.div"
 
 
+def test_tensor_where():
+    """Test tensor.where operation."""
+    span = ir.Span.unknown()
+
+    # Create condition, x, and y tensors [8]
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim8], DataType.INT32)  # INT32 as boolean (0/1)
+    x_type = ir.TensorType([dim8], DataType.FP32)
+    y_type = ir.TensorType([dim8], DataType.FP32)
+
+    condition = ir.Var("condition", condition_type, span)
+    x = ir.Var("x", x_type, span)
+    y = ir.Var("y", y_type, span)
+
+    # Apply where
+    call = ir.op.tensor.where(condition, x, y)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.where_tt"
+
+    # Check result type - should be same shape as inputs, dtype promoted from x and y
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 1
+
+
+def test_tensor_where_broadcasting():
+    """Test tensor.where with broadcasting."""
+    span = ir.Span.unknown()
+
+    # Create tensors with different shapes that can broadcast
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+
+    # condition: [4, 1], x: [4, 8], y: [8]
+    condition_type = ir.TensorType([dim4, dim1], DataType.INT32)
+    x_type = ir.TensorType([dim4, dim8], DataType.FP16)
+    y_type = ir.TensorType([dim8], DataType.FP16)
+
+    condition = ir.Var("cond", condition_type, span)
+    x = ir.Var("x", x_type, span)
+    y = ir.Var("y", y_type, span)
+
+    # Apply where with broadcasting
+    call = ir.op.tensor.where(condition, x, y)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.where_tt"
+
+    # Result should broadcast to [4, 8]
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert len(result_type.shape) == 2
+
+
+def test_tensor_where_type_promotion():
+    """Test tensor.where with type promotion between x and y."""
+    span = ir.Span.unknown()
+
+    # Create tensors with different dtypes
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim8], DataType.INT32)
+    x_type = ir.TensorType([dim8], DataType.FP16)  # FP16
+    y_type = ir.TensorType([dim8], DataType.FP32)  # FP32
+
+    condition = ir.Var("cond", condition_type, span)
+    x = ir.Var("x", x_type, span)
+    y = ir.Var("y", y_type, span)
+
+    # Apply where - should promote to FP32
+    call = ir.op.tensor.where(condition, x, y)
+
+    assert isinstance(call, ir.Call)
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    # FP32 should win over FP16
+    assert result_type.dtype == DataType.FP32
+
+
+def test_tensor_where_ts():
+    """Test tensor.where with tensor x and scalar y."""
+    span = ir.Span.unknown()
+
+    # Create condition and x tensor [8], y scalar
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim8], DataType.INT32)
+    x_type = ir.TensorType([dim8], DataType.FP32)
+
+    condition = ir.Var("condition", condition_type, span)
+    x = ir.Var("x", x_type, span)
+    y_scalar = 0.5  # scalar value
+
+    # Apply where with scalar y
+    call = ir.op.tensor.where(condition, x, y_scalar)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.where_ts"
+
+    # Check result type - should be same shape as x, dtype promoted
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 1
+
+
+def test_tensor_where_st():
+    """Test tensor.where with scalar x and tensor y."""
+    span = ir.Span.unknown()
+
+    # Create condition and y tensor [4, 8], x scalar
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim4, dim8], DataType.INT32)
+    y_type = ir.TensorType([dim4, dim8], DataType.FP16)
+
+    condition = ir.Var("condition", condition_type, span)
+    x_scalar = 1.0  # scalar value
+    y = ir.Var("y", y_type, span)
+
+    # Apply where with scalar x
+    call = ir.op.tensor.where(condition, x_scalar, y)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.where_st"
+
+    # Check result type - should be same shape as y
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 2
+
+
+def test_tensor_where_ss():
+    """Test tensor.where with both x and y as scalars."""
+    span = ir.Span.unknown()
+
+    # Create condition tensor [4, 8], both x and y scalars
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim4, dim8], DataType.INT32)
+
+    condition = ir.Var("condition", condition_type, span)
+    x_scalar = 1.0  # scalar value
+    y_scalar = 0.0  # scalar value
+
+    # Apply where with both scalars
+    call = ir.op.tensor.where(condition, x_scalar, y_scalar)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.where_ss"
+
+    # Check result type - should be same shape as condition
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 2
+
+
+def test_tensor_where_all_four_combinations():
+    """Test all four parameter combinations of tensor.where."""
+    span = ir.Span.unknown()
+
+    # Setup common condition
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    condition_type = ir.TensorType([dim8], DataType.INT32)
+    condition = ir.Var("cond", condition_type, span)
+
+    # Setup tensors
+    x_type = ir.TensorType([dim8], DataType.FP32)
+    y_type = ir.TensorType([dim8], DataType.FP32)
+    x_tensor = ir.Var("x", x_type, span)
+    y_tensor = ir.Var("y", y_type, span)
+
+    # Test 1: Both tensors
+    call1 = ir.op.tensor.where(condition, x_tensor, y_tensor)
+    assert call1.op.name == "tensor.where_tt"
+
+    # Test 2: Tensor x, scalar y
+    call2 = ir.op.tensor.where(condition, x_tensor, 0.5)
+    assert call2.op.name == "tensor.where_ts"
+
+    # Test 3: Scalar x, tensor y
+    call3 = ir.op.tensor.where(condition, 1.0, y_tensor)
+    assert call3.op.name == "tensor.where_st"
+
+    # Test 4: Both scalars
+    call4 = ir.op.tensor.where(condition, 1.0, 0.0)
+    assert call4.op.name == "tensor.where_ss"
+
+    # All should return TensorType with same shape as condition
+    for call in [call1, call2, call3, call4]:
+        result_type = call.type
+        assert isinstance(result_type, ir.TensorType)
+        assert len(result_type.shape) == 1
+
+
 def test_const_float():
     """Test ConstFloat expression creation and usage."""
     span = ir.Span.unknown()
@@ -355,6 +554,10 @@ def test_operator_registration():
     assert ir.is_op_registered("tensor.cast")
     assert ir.is_op_registered("tensor.assemble")
     assert ir.is_op_registered("tensor.maximum")
+    assert ir.is_op_registered("tensor.where_tt")
+    assert ir.is_op_registered("tensor.where_ts")
+    assert ir.is_op_registered("tensor.where_st")
+    assert ir.is_op_registered("tensor.where_ss")
 
 
 def test_get_new_ops():
