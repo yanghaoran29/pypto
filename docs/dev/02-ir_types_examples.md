@@ -289,14 +289,14 @@ seq = ir.SeqStmts([stmt1, stmt2, stmt3], span)
 ## Type Checking and Casting
 
 ```python
-# Check and cast expression types
-if ir.IsA[ir.Var](expr):
-    var = ir.As[ir.Var](expr)
-    print(var.name_)
+# Check expression types
+if isinstance(expr, ir.Var):
+    print(expr.name_)
 
-# Check and cast type objects
-if ir.IsA[ir.TileType](type_obj):
-    tile = ir.As[ir.TileType](type_obj)
+# Check type objects
+if isinstance(type_obj, ir.TileType):
+    # Access tile-specific properties
+    shape = type_obj.shape
 ```
 
 ## Related Documentation
