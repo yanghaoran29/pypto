@@ -69,8 +69,6 @@ else:
     result = pl.yield_(negative)
 ```
 
-**Note**: Spelled `yeild` (not `yield`) to avoid Python keyword conflict.
-
 ## Text-Based Parsing
 
 Parse DSL code from strings or files for dynamic code generation:
@@ -191,7 +189,7 @@ class MathOps:
 - Cross-function calls use `self.method_name()` → resolved to `GlobalVar` references
 - Two-pass parsing: collect `GlobalVar`s, then parse bodies (supports forward references)
 - Access functions: `program.get_function("name")`
-- Text parsing: `pl.parse_program(code)`, `pl.load_program(path)`
+- Text parsing: `pl.parse(code)`, `pl.loads(path)` (auto-detects program/function)
 - Printing: `pypto.ir.python_print(program)` generates valid `@pl.program` class
 
 **Examples**: See `examples/ir_parser/program_example.py` and `examples/ir_builder/program_builder_example.py`
