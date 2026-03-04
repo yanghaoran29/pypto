@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/reflection/field_traits.h"
@@ -41,6 +42,86 @@ enum class ForKind : uint8_t {
   Parallel = 1,    ///< Parallel for loop
   Unroll = 2       ///< Compile-time unrolled for loop
 };
+
+/**
+ * @brief Chunk policy for loop chunking
+ *
+ * Controls how iterations are distributed across chunks.
+ */
+enum class ChunkPolicy : uint8_t {
+  LeadingFull = 0  ///< Full chunks first, smaller remainder at end
+};
+
+/**
+ * @brief Convert ChunkPolicy to string
+ */
+inline std::string ChunkPolicyToString(ChunkPolicy policy) {
+  switch (policy) {
+    case ChunkPolicy::LeadingFull:
+      return "LeadingFull";
+    default:
+      INTERNAL_CHECK(false) << "Unknown ChunkPolicy: " << static_cast<int>(policy);
+      return "";  // Unreachable
+  }
+}
+
+/**
+ * @brief Convert string to ChunkPolicy
+ */
+inline ChunkPolicy StringToChunkPolicy(const std::string& str) {
+  if (str == "LeadingFull" || str == "leading_full") {
+    return ChunkPolicy::LeadingFull;
+  }
+  throw pypto::TypeError("Unknown ChunkPolicy: " + str);
+}
+
+/**
+ * @brief Loop origin classification for tracking how a loop was generated
+ *
+ * Used by SplitChunkedLoops to tag each generated loop with its origin.
+ */
+enum class LoopOrigin : uint8_t {
+  Original = 0,       ///< Regular loop (default)
+  ChunkOuter = 1,     ///< Outer loop from chunk splitting
+  ChunkInner = 2,     ///< Inner loop from chunk splitting
+  ChunkRemainder = 3  ///< Remainder loop from chunk splitting
+};
+
+/**
+ * @brief Convert LoopOrigin to string
+ */
+inline std::string LoopOriginToString(LoopOrigin origin) {
+  switch (origin) {
+    case LoopOrigin::Original:
+      return "Original";
+    case LoopOrigin::ChunkOuter:
+      return "ChunkOuter";
+    case LoopOrigin::ChunkInner:
+      return "ChunkInner";
+    case LoopOrigin::ChunkRemainder:
+      return "ChunkRemainder";
+    default:
+      INTERNAL_CHECK(false) << "Unknown LoopOrigin: " << static_cast<int>(origin);
+      return "";  // Unreachable
+  }
+}
+
+/**
+ * @brief Convert string to LoopOrigin
+ */
+inline LoopOrigin StringToLoopOrigin(const std::string& str) {
+  if (str == "Original") {
+    return LoopOrigin::Original;
+  } else if (str == "ChunkOuter") {
+    return LoopOrigin::ChunkOuter;
+  } else if (str == "ChunkInner") {
+    return LoopOrigin::ChunkInner;
+  } else if (str == "ChunkRemainder") {
+    return LoopOrigin::ChunkRemainder;
+  } else {
+    throw pypto::TypeError("Unknown LoopOrigin: " + str);
+  }
+}
 
 /**
  * @brief Distinguishes different scope kinds
@@ -345,9 +426,14 @@ class ForStmt : public Stmt {
    * @param return_vars Return variables (capture final values, accessible after loop)
    * @param span Source location
    * @param kind Loop kind (Sequential, Parallel, or Unroll; default: Sequential)
+   * @param chunk_size Optional chunk size for loop chunking (nullopt = no chunking)
+   * @param chunk_policy Chunk distribution policy (default: LeadingFull)
+   * @param loop_origin Loop origin classification (default: Original)
    */
   ForStmt(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, std::vector<IterArgPtr> iter_args,
-          StmtPtr body, std::vector<VarPtr> return_vars, Span span, ForKind kind = ForKind::Sequential)
+          StmtPtr body, std::vector<VarPtr> return_vars, Span span, ForKind kind = ForKind::Sequential,
+          std::optional<ExprPtr> chunk_size = std::nullopt,
+          ChunkPolicy chunk_policy = ChunkPolicy::LeadingFull, LoopOrigin loop_origin = LoopOrigin::Original)
       : Stmt(std::move(span)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
@@ -356,7 +442,10 @@ class ForStmt : public Stmt {
         iter_args_(std::move(iter_args)),
         body_(std::move(body)),
         return_vars_(std::move(return_vars)),
-        kind_(kind) {}
+        kind_(kind),
+        chunk_size_(std::move(chunk_size)),
+        chunk_policy_(chunk_policy),
+        loop_origin_(loop_origin) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ForStmt; }
   [[nodiscard]] std::string TypeName() const override { return "ForStmt"; }
@@ -375,7 +464,10 @@ class ForStmt : public Stmt {
                                           reflection::DefField(&ForStmt::iter_args_, "iter_args"),
                                           reflection::UsualField(&ForStmt::body_, "body"),
                                           reflection::DefField(&ForStmt::return_vars_, "return_vars"),
-                                          reflection::UsualField(&ForStmt::kind_, "kind")));
+                                          reflection::UsualField(&ForStmt::kind_, "kind"),
+                                          reflection::UsualField(&ForStmt::chunk_size_, "chunk_size"),
+                                          reflection::UsualField(&ForStmt::chunk_policy_, "chunk_policy"),
+                                          reflection::IgnoreField(&ForStmt::loop_origin_, "loop_origin")));
   }
 
  public:
@@ -387,6 +479,9 @@ class ForStmt : public Stmt {
   StmtPtr body_;                       // Loop body statement (must yield if iter_args non-empty)
   std::vector<VarPtr> return_vars_;    // Variables capturing final iteration values (accessible after loop)
   ForKind kind_;                       // Loop kind (Sequential, Parallel, or Unroll)
+  std::optional<ExprPtr> chunk_size_;  // Chunk size (nullopt = no chunking)
+  ChunkPolicy chunk_policy_ = ChunkPolicy::LeadingFull;  // Chunk distribution policy
+  LoopOrigin loop_origin_ = LoopOrigin::Original;        // Loop origin classification
 };
 
 using ForStmtPtr = std::shared_ptr<const ForStmt>;
