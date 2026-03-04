@@ -681,9 +681,6 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
   // SSA-style for with pl.range() or pl.parallel() - no inline type annotations in unpacking
   stream_ << "for " << op->loop_var_->name_;
 
-  // Determine range keyword based on kind
-  bool is_parallel = (op->kind_ == ForKind::Parallel);
-
   // If we have iter_args, add tuple unpacking without type annotations
   if (!op->iter_args_.empty()) {
     stream_ << ", (";
@@ -697,7 +694,23 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
     }
     stream_ << ")";
   }
-  stream_ << " in " << prefix_ << (is_parallel ? ".parallel(" : ".range(");
+
+  // Select range function based on loop kind
+  const char* range_func = ".range(";
+  switch (op->kind_) {
+    case ForKind::Unroll:
+      range_func = ".unroll(";
+      break;
+    case ForKind::Parallel:
+      range_func = ".parallel(";
+      break;
+    case ForKind::Sequential:
+      break;
+    default:
+      INTERNAL_CHECK(false) << "Unknown ForKind in python_printer: " << ForKindToString(op->kind_);
+      break;
+  }
+  stream_ << " in " << prefix_ << range_func;
 
   VisitExpr(op->start_);
   stream_ << ", ";
@@ -705,7 +718,10 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
   stream_ << ", ";
   VisitExpr(op->step_);
 
-  // Add init_values for iter_args
+  // Add init_values for iter_args (not supported for Unroll loops)
+  if (op->kind_ == ForKind::Unroll && !op->iter_args_.empty()) {
+    INTERNAL_CHECK(false) << "ForKind::Unroll does not support iter_args/init_values";
+  }
   if (!op->iter_args_.empty()) {
     stream_ << ", init_values=(";
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {

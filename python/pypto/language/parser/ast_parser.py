@@ -32,6 +32,27 @@ if TYPE_CHECKING:
     from .decorator import InlineFunction
 
 
+def _is_const_int(value: object) -> bool:
+    """Check if a value is a compile-time constant integer.
+
+    Handles plain int, ir.ConstInt, and ir.Neg(ir.ConstInt) (negative literals).
+    """
+    if isinstance(value, (int, ir.ConstInt)):
+        return True
+    return isinstance(value, ir.Neg) and isinstance(value.operand, ir.ConstInt)
+
+
+def _const_int_value(value: object) -> int | None:
+    """Extract integer value from a compile-time constant, or None."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, ir.ConstInt):
+        return value.value
+    if isinstance(value, ir.Neg) and isinstance(value.operand, ir.ConstInt):
+        return -value.operand.value
+    return None
+
+
 class ASTParser:
     """Parses Python AST and builds IR using IRBuilder."""
 
@@ -379,32 +400,33 @@ class ASTParser:
                     # Will be resolved from loop outputs
                     self.scope_manager.define_var(var_name, f"loop_yield_{i}")
 
+    _VALID_ITERATORS = {"range", "parallel", "unroll", "while_"}
+    _ITERATOR_ERROR = "For loop must use pl.range(), pl.parallel(), pl.unroll(), or pl.while_()"
+    _ITERATOR_HINT = "Use pl.range(), pl.parallel(), pl.unroll(), or pl.while_() as the iterator"
+
     def _validate_for_loop_iterator(self, stmt: ast.For) -> tuple[ast.Call, str]:
-        """Validate that for loop uses pl.range(), pl.parallel(), or pl.while_() and return the call node.
+        """Validate that for loop uses pl.range(), pl.parallel(), pl.unroll(), or pl.while_().
 
         Returns:
-            Tuple of (call_node, iterator_type) where iterator_type is "range", "parallel", or "while_"
+            Tuple of (call_node, iterator_type) where iterator_type is
+            "range", "parallel", "unroll", or "while_"
         """
         if not isinstance(stmt.iter, ast.Call):
             raise ParserSyntaxError(
-                "For loop must use pl.range(), pl.parallel(), or pl.while_()",
+                self._ITERATOR_ERROR,
                 span=self.span_tracker.get_span(stmt.iter),
-                hint="Use pl.range(), pl.parallel(), or pl.while_() as the iterator",
+                hint=self._ITERATOR_HINT,
             )
 
         iter_call = stmt.iter
         func = iter_call.func
-        if isinstance(func, ast.Attribute):
-            if func.attr == "range":
-                return iter_call, "range"
-            if func.attr == "parallel":
-                return iter_call, "parallel"
-            if func.attr == "while_":
-                return iter_call, "while_"
+        if isinstance(func, ast.Attribute) and func.attr in self._VALID_ITERATORS:
+            return iter_call, func.attr
+
         raise ParserSyntaxError(
-            "For loop must use pl.range(), pl.parallel(), or pl.while_()",
+            self._ITERATOR_ERROR,
             span=self.span_tracker.get_span(stmt.iter),
-            hint="Use pl.range(), pl.parallel(), or pl.while_() as the iterator",
+            hint=self._ITERATOR_HINT,
         )
 
     def _parse_for_loop_target(self, stmt: ast.For) -> tuple[str, ast.AST | None, bool]:
@@ -461,9 +483,9 @@ class ASTParser:
             loop.return_var(f"{iter_arg_node.id}_out")
 
     def parse_for_loop(self, stmt: ast.For) -> None:
-        """Parse for loop with pl.range(), pl.parallel(), or while-as-for with pl.while_().
+        """Parse for loop with pl.range(), pl.parallel(), pl.unroll(), or pl.while_().
 
-        Supports patterns for range/parallel:
+        Supports patterns for range/parallel/unroll:
           Pattern A (explicit): for i, (vars,) in pl.range(..., init_values=(...,))
           Pattern B (simple):   for i in pl.range(n)
 
@@ -472,6 +494,7 @@ class ASTParser:
               pl.cond(condition)
 
         Both patterns also work with pl.parallel() for parallel loops.
+        pl.unroll() is for compile-time loop unrolling (no init_values).
         Pattern B produces a ForStmt without iter_args/return_vars/yield.
         The C++ ConvertToSSA pass handles converting to SSA form.
         """
@@ -482,8 +505,12 @@ class ASTParser:
             self._parse_while_as_for(stmt, iter_call)
             return
 
-        # Handle pl.range() or pl.parallel()
-        is_parallel = iterator_type == "parallel"
+        # Handle pl.range(), pl.parallel(), or pl.unroll()
+        _ITERATOR_TO_KIND = {
+            "range": ir.ForKind.Sequential,
+            "parallel": ir.ForKind.Parallel,
+            "unroll": ir.ForKind.Unroll,
+        }
         loop_var_name, iter_args_node, is_simple_for = self._parse_for_loop_target(stmt)
         range_args = self._parse_range_call(iter_call)
 
@@ -494,7 +521,35 @@ class ASTParser:
                 hint="Use: for i, (var1,) in pl.range(n, init_values=(val1,)) to include iter_args",
             )
 
-        kind = ir.ForKind.Parallel if is_parallel else ir.ForKind.Sequential
+        if iterator_type == "unroll" and range_args["init_values"]:
+            raise ParserSyntaxError(
+                "pl.unroll() cannot be combined with init_values",
+                span=self.span_tracker.get_span(iter_call),
+                hint="Unrolled loops do not support loop-carried values (init_values)",
+            )
+
+        # For pl.unroll(), require compile-time constant integer bounds
+        # and reject step=0. Fail early with clear parser errors instead of
+        # later generic failures in the UnrollLoops C++ pass.
+        # Note: negative literals like -1 become ir.Neg(ir.ConstInt(1)).
+        if iterator_type == "unroll":
+            for _bound_name in ("start", "stop", "step"):
+                _bound_value = range_args.get(_bound_name)
+                if _bound_value is not None and not _is_const_int(_bound_value):
+                    raise ParserSyntaxError(
+                        "pl.unroll() requires compile-time constant integer bounds",
+                        span=self.span_tracker.get_span(iter_call),
+                        hint="Use integer literals for start, stop, and step in pl.unroll().",
+                    )
+            _step = range_args.get("step")
+            if _const_int_value(_step) == 0:
+                raise ParserSyntaxError(
+                    "pl.unroll() step cannot be zero",
+                    span=self.span_tracker.get_span(iter_call),
+                    hint="Use a non-zero step in pl.unroll(start, stop, step).",
+                )
+
+        kind = _ITERATOR_TO_KIND[iterator_type]
         loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX))
         span = self.span_tracker.get_span(stmt)
         loop_output_vars: list[str] = []
