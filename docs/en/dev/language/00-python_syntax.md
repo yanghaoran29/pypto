@@ -193,17 +193,19 @@ else:
 ### For Loop (SSA-style with iter_args)
 
 ```python
-# Simple loop
-for i in pl.range(start, stop, step):
-    body_statements
+# Simple loop (1-3 positional args, like Python's range())
+for i in pl.range(stop):                    # start=0, step=1
+for i in pl.range(start, stop):             # step=1
+for i in pl.range(start, stop, step):       # explicit
 
 # Loop with iter_args (loop-carried values)
 sum_init: pl.INT64 = 0
-for i, (sum,) in pl.range(0, n, 1, init_values=(sum_init,)):
+for i, (sum,) in pl.range(n, init_values=(sum_init,)):
     sum = pl.yield_(sum + i)
 sum_final = sum
 
-# Parallel for loop
+# Parallel for loop (same 1-3 arg forms)
+for i in pl.parallel(stop):
 for i in pl.parallel(start, stop, step):
     body_statements
 ```
@@ -214,13 +216,13 @@ for i in pl.parallel(start, stop, step):
 
 ```python
 # Split loop into chunks of C iterations (nested outer/inner loops)
-for i in pl.range(0, 10, 1, chunk=5):
+for i in pl.range(10, chunk=5):
     body_statements
 
-for i in pl.parallel(0, 8, 1, chunk=4):
+for i in pl.parallel(8, chunk=4):
     body_statements
 
-for i in pl.unroll(0, 12, 1, chunk=4):
+for i in pl.unroll(12, chunk=4):
     body_statements
 ```
 
@@ -313,7 +315,7 @@ import pypto.language as pl
 
 def loop_sum(n: pl.INT64) -> pl.INT64:
     sum_init: pl.INT64 = 0
-    for i, (sum,) in pl.range(0, n, 1, init_values=(sum_init,)):
+    for i, (sum,) in pl.range(n, init_values=(sum_init,)):
         sum = pl.yield_(sum + i)
     return sum
 ```
@@ -353,7 +355,7 @@ else:
 
 # For: loop-carried values via iter_args
 sum_init: pl.INT64 = 0
-for i, (sum,) in pl.range(0, 10, 1, init_values=(sum_init,)):
+for i, (sum,) in pl.range(10, init_values=(sum_init,)):
     sum = pl.yield_(sum + i)
 sum_final: pl.INT64 = sum  # captures final value
 ```

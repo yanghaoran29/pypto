@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <ios>
@@ -752,11 +753,36 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
   }
   stream_ << " in " << prefix_ << range_func;
 
-  VisitExpr(op->start_);
-  stream_ << ", ";
-  VisitExpr(op->stop_);
-  stream_ << ", ";
-  VisitExpr(op->step_);
+  // Use concise range form like Python: range(stop) when start==0 and step==1,
+  // range(start, stop) when step==1, range(start, stop, step) otherwise.
+  auto is_const_int = [](const ExprPtr& expr, int64_t value) -> bool {
+    if (auto ci = As<ConstInt>(expr)) {
+      // Only elide for canonical loop-bound dtypes to preserve round-trip fidelity.
+      return ci->value_ == value &&
+             (ci->dtype() == DataType::DEFAULT_CONST_INT || ci->dtype() == DataType::INDEX);
+    }
+    return false;
+  };
+
+  bool start_is_zero = is_const_int(op->start_, 0);
+  bool step_is_one = is_const_int(op->step_, 1);
+
+  if (start_is_zero && step_is_one) {
+    // range(stop)
+    VisitExpr(op->stop_);
+  } else if (step_is_one) {
+    // range(start, stop)
+    VisitExpr(op->start_);
+    stream_ << ", ";
+    VisitExpr(op->stop_);
+  } else {
+    // range(start, stop, step)
+    VisitExpr(op->start_);
+    stream_ << ", ";
+    VisitExpr(op->stop_);
+    stream_ << ", ";
+    VisitExpr(op->step_);
+  }
 
   // Unroll loops cannot have iter_args. The DSL parser forbids init_values for
   // pl.unroll(), and SplitChunkedLoops preserves this: chunk-split unroll loops
