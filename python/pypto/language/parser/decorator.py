@@ -22,6 +22,7 @@ from pypto.pypto_core import ir
 
 from .ast_parser import ASTParser
 from .diagnostics import ParserError, ParserSyntaxError, concise_error_message
+from .enum_utils import LEVEL_MAP, ROLE_MAP, extract_enum_value
 
 
 @dataclasses.dataclass
@@ -266,6 +267,45 @@ def _extract_function_type_from_decorator(node: ast.FunctionDef) -> ir.FunctionT
     return ir.FunctionType.Opaque
 
 
+def _extract_function_level_role_from_decorator(
+    node: ast.FunctionDef,
+) -> tuple[ir.Level | None, ir.Role | None]:
+    """Extract level and role from @pl.function(level=..., role=...) decorator.
+
+    Args:
+        node: AST FunctionDef node to extract level/role from
+
+    Returns:
+        Tuple of (level, role), either or both may be None
+    """
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+
+        is_function_call = (
+            isinstance(decorator.func, ast.Attribute) and decorator.func.attr == "function"
+        ) or (isinstance(decorator.func, ast.Name) and decorator.func.id == "function")
+
+        if not is_function_call:
+            continue
+
+        level = None
+        role = None
+        for keyword in decorator.keywords:
+            if keyword.arg == "level":
+                if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+                    level = None
+                else:
+                    level = extract_enum_value(keyword.value, LEVEL_MAP, "Level", "pl.Level")
+            elif keyword.arg == "role":
+                if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+                    role = None
+                else:
+                    role = extract_enum_value(keyword.value, ROLE_MAP, "Role", "pl.Role")
+        return level, role
+    return None, None
+
+
 def _prescan_reserve_buffers(
     func_def: ast.FunctionDef, buffer_name_meta: dict[tuple[str, str], dict[str, Any]]
 ) -> None:
@@ -484,6 +524,8 @@ def function(
     func: Callable | None = None,
     *,
     type: ir.FunctionType = ir.FunctionType.Opaque,
+    level: ir.Level | None = None,
+    role: ir.Role | None = None,
     strict_ssa: bool = False,
 ) -> ir.Function:
     """Decorator that parses a DSL function and returns IR Function.
@@ -495,6 +537,8 @@ def function(
     Args:
         func: Python function decorated with @pl.function
         type: Function type (Opaque, Orchestration, or InCore)
+        level: Hierarchy level (e.g. pl.Level.HOST)
+        role: Function role (e.g. pl.Role.Worker)
         strict_ssa: If True, enforce SSA (single assignment per variable).
                    If False (default), allow variable reassignment (non-SSA mode).
 
@@ -506,9 +550,9 @@ def function(
         ... def my_func(x: pl.Tensor[[64, 128], pl.FP16]) -> pl.Tensor[[64, 128], pl.FP32]:
         ...     result = pl.create_tensor([64, 128], dtype=pl.FP32)
         ...     return result
-        >>> @pl.function(type=pl.FunctionType.Orchestration)
-        ... def orchestrator():
-        ...     pass
+        >>> @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+        ... def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        ...     return x
     """
 
     # Capture the caller's scope for variable resolution in type annotations
@@ -553,7 +597,7 @@ def function(
             )
 
             try:
-                ir_func = parser.parse_function(func_def, func_type=type)
+                ir_func = parser.parse_function(func_def, func_type=type, func_level=level, func_role=role)
             except ParserError:
                 # Re-raise ParserError as-is, it already has source lines
                 raise
@@ -717,8 +761,9 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program:
                 _prescan_reserve_buffers(func_def, buffer_name_meta)
 
             for func_def in func_defs:
-                # Extract function type from decorator
+                # Extract function type and level/role from decorator
                 func_type = _extract_function_type_from_decorator(func_def)
+                func_level, func_role = _extract_function_level_role_from_decorator(func_def)
 
                 # Strip 'self' parameter if present (must be done before parsing)
                 func_def_to_parse = _strip_self_parameter(func_def)
@@ -737,7 +782,9 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program:
                 )
 
                 try:
-                    ir_func = parser.parse_function(func_def_to_parse, func_type=func_type)
+                    ir_func = parser.parse_function(
+                        func_def_to_parse, func_type=func_type, func_level=func_level, func_role=func_role
+                    )
                 except ParserError:
                     raise
                 except SyntaxError as e:
