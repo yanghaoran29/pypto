@@ -12,6 +12,11 @@
 All C++ nanobind types (DataType, ChipCallable, ChipStorageTaskArgs, etc.) and
 torch-aware helpers (make_tensor_arg, scalar_to_uint64) come from the
 ``simpler`` package installed via ``pip install simpler``.
+
+Some torch helpers (``make_tensor_arg``, ``torch_dtype_to_datatype``) live in
+``simpler_setup.torch_interop`` after simpler PR #618; older simpler versions
+keep them in ``simpler.task_interface``. Try the legacy path first so we work
+against both pinned (a9f3ea9) and post-#618 simpler.
 """
 
 from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
@@ -19,9 +24,16 @@ from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
     ChipCallConfig,
     ChipStorageTaskArgs,
     CoreCallable,
-    make_tensor_arg,
     scalar_to_uint64,
 )
+
+try:
+    from simpler.task_interface import (  # type: ignore[attr-defined]  # pyright: ignore[reportMissingImports]
+        make_tensor_arg,
+    )
+except ImportError:
+    from simpler_setup.torch_interop import make_tensor_arg  # pyright: ignore[reportMissingImports]
+
 from simpler.worker import Worker  # pyright: ignore[reportMissingImports]
 
 __all__ = [
