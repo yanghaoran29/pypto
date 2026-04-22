@@ -10,10 +10,10 @@
 """Tests for MemoryReusePass.
 
 Most tests use the Before/Expected pattern with
-``ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)``.
-``enable_auto_mapping=True`` aligns MemRef objects consistently across the
-comparison: if two tiles share a MemRef in ``After``, the corresponding tiles
-in ``Expected`` must also share (i.e. use the same ``mem_*`` pointer name).
+``ir.assert_structural_equal(After, Expected)``.
+DefFields always auto-map, so ``enable_auto_mapping=True`` is unnecessary.
+This aligns MemRef objects consistently: if two tiles share a MemRef in
+``After``, the corresponding tiles in ``Expected`` must also share.
 """
 
 import pypto.language as pl
@@ -83,7 +83,7 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_sequential(self):
         """Sequential chain: tile_a/c/e share one buffer, tile_b/d share another."""
@@ -136,7 +136,7 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_different_sizes(self):
         """Different-shaped tiles cannot reuse each other's buffer."""
@@ -202,7 +202,7 @@ class TestBasic:
                 return result_f
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_empty_function(self):
         """Empty function (no TileType) should pass through unchanged."""
@@ -226,7 +226,7 @@ class TestBasic:
                 return output
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_transitive_conflict(self):
         """Transitive conflict: tile_c and tile_d cannot share."""
@@ -280,7 +280,7 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestAllocCleanup:
@@ -331,7 +331,7 @@ class TestAllocCleanup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_partial_reuse_with_overlapping_lifetimes(self):
         """When some lifetimes truly overlap, only partial reuse happens.
@@ -379,7 +379,7 @@ class TestAllocCleanup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestDtype:
@@ -439,7 +439,7 @@ class TestDtype:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestFillpad:
@@ -499,7 +499,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_fillpad_different_pad_no_reuse(self):
         """Two fillpad outputs with different pad values cannot reuse each other."""
@@ -585,7 +585,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_fillpad_same_pad_can_reuse(self):
         """Two fillpad outputs with identical TileView attributes CAN reuse."""
@@ -669,7 +669,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestValidShapeDivergence:
@@ -848,7 +848,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_reshape_not_broken_by_memory_reuse(self):
         """MemoryReuse should propagate reuse to ALL variables sharing MemRef.
@@ -904,7 +904,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_reshape_shared_buffer_can_be_reused_after_all_dead(self):
         """After all aliases are dead, shared buffer can be reused."""
@@ -955,7 +955,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestInplaceOps:
@@ -1000,7 +1000,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_inplace_unsafe_op_allows_non_producer_consumer_reuse(self):
         """tile.recip output must never share a buffer with its input.
@@ -1065,7 +1065,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_inplace_safe_op_allows_producer_consumer_reuse(self):
         """tile.add (inplace-safe) CAN reuse its input's buffer."""
@@ -1104,7 +1104,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_ands_no_producer_consumer_reuse(self):
         """tile.ands must NOT reuse its input's buffer."""
@@ -1144,7 +1144,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_xors_no_producer_consumer_reuse(self):
         """tile.xors must NOT reuse its input's buffer."""
@@ -1194,7 +1194,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_inplace_unsafe_two_level_transitive_chain(self):
         """tile.recip must not reuse a buffer occupied by its input via a two-level chain.
@@ -1260,7 +1260,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestYieldFixup:
@@ -1321,7 +1321,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_simple_loop_memrefs_unified(self):
         """Simple loop: iter_arg/initValue/return_var/next_0 all land in a
@@ -1371,7 +1371,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_multiple_iter_args_producers_retyped_independently(self):
         """With 2 iter_args, the retargeter retypes each yield producer
@@ -1442,7 +1442,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_if_stmt_return_var_memref_patched(self):
         """tile_b/tile_c reuse tile_a's MemRef; if_result picks up the patched MemRef."""
@@ -1524,7 +1524,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_if_stmt_tile_move_when_branch_memrefs_differ(self):
         """When IfStmt branches yield tiles with different MemRefs, the pass
@@ -1599,7 +1599,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestControlFlow:
@@ -1670,7 +1670,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_different_if_branches_can_share(self):
         """Variables in different IfStmt branches CAN share MemRef (non-overlapping lifetimes)."""
@@ -1742,7 +1742,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_loop_local_var_can_be_reused(self):
         """Loop-local vars share a scratch buffer; the yield producer is
@@ -1813,7 +1813,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_nested_for_loops_outer_var_extends_to_outer_end(self):
         """Variable defined before nested loops, used in inner loop body --
@@ -1892,7 +1892,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_if_without_else_branch(self):
         """IfStmt with only then branch (no else): tile_a is alive through the
@@ -1951,7 +1951,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_for_with_if_multiple_vars_competing(self):
         """ForStmt with IfStmt inside: `tile_a` and `tile_b` are live across
@@ -2035,7 +2035,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_branch_local_var_does_not_leak(self):
         """A variable defined and consumed entirely inside one IfStmt branch
@@ -2101,7 +2101,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_loop_return_var_blocks_init_memref_reuse(self):
         """Return_var used after loop must block reuse of initValue's MemRef.
@@ -2184,7 +2184,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestTopDownRetargeter:
@@ -2288,7 +2288,7 @@ class TestTopDownRetargeter:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_retargeter_declines_when_target_still_live(self):
         """Safety check: if target's base is read after the candidate
@@ -2360,7 +2360,7 @@ class TestTopDownRetargeter:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_retargeter_declines_when_read_after_nested_if(self):
         """Regression test for the ancestor-walking liveness check.
@@ -2446,7 +2446,7 @@ class TestTopDownRetargeter:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
     def test_retargeter_declines_for_not_inplace_safe_op(self):
         """Regression test for the not_inplace_safe check.
@@ -2534,7 +2534,7 @@ class TestTopDownRetargeter:
                 return out_val
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
 
 class TestMetadata:
@@ -2577,7 +2577,7 @@ class TestMetadata:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(After, Expected)
 
         # Sanity: split metadata round-trips through the pass.
         after_vp = After.get_function("vector_producer")
