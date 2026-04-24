@@ -365,6 +365,60 @@ class TestOutlineClusterScopes:
         After = passes.outline_cluster_scopes()(After)
         ir.assert_structural_equal(After, Expected)
 
+    def test_outline_spmd_for_loop_marks_assemble_dest_as_inout(self):
+        """`for n0 in pl.spmd(N): out = pl.assemble(out, slice, [n0, ...])`
+        must make `out` an InOut parameter on both the outlined InCore and
+        Spmd wrapper. Without this, the orchestration codegen later drops the
+        SSA-result alias for the inout call and emits a use of an undeclared
+        ``out__ssa_vN`` C++ identifier.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for n0 in pl.spmd(4):
+                    offset = n0 * 128
+                    chunk: pl.Tensor[[128, 128], pl.FP32] = pl.slice(a, [128, 128], [offset, 0])
+                    out = pl.assemble(out, chunk, [offset, 0])
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        After = passes.outline_incore_scopes()(Before)
+        After = passes.outline_cluster_scopes()(After)
+
+        def directions_by_hint(func):
+            return {p.name_hint: d for p, d in zip(func.params, func.param_directions)}
+
+        def find_param(hints, prefix):
+            matches = [h for h in hints if h == prefix or h.startswith(prefix + "__")]
+            assert len(matches) == 1, f"expected exactly one param starting with {prefix!r}, got {matches}"
+            return matches[0]
+
+        spmd_funcs = [f for f in After.functions.values() if f.func_type == ir.FunctionType.Spmd]
+        assert len(spmd_funcs) == 1, "expected exactly one outlined Spmd wrapper"
+        spmd_dirs = directions_by_hint(spmd_funcs[0])
+        assert spmd_dirs[find_param(spmd_dirs, "out")] == ir.ParamDirection.InOut, (
+            f"spmd wrapper's `out` param should be InOut, got {spmd_dirs}"
+        )
+        assert spmd_dirs[find_param(spmd_dirs, "a")] == ir.ParamDirection.In, (
+            f"spmd wrapper's `a` param should remain In, got {spmd_dirs}"
+        )
+
+        incore_funcs = [f for f in After.functions.values() if f.func_type == ir.FunctionType.InCore]
+        assert len(incore_funcs) == 1, "expected exactly one outlined InCore wrapper"
+        incore_dirs = directions_by_hint(incore_funcs[0])
+        assert incore_dirs[find_param(incore_dirs, "out")] == ir.ParamDirection.InOut, (
+            f"incore wrapper's `out` param should be InOut, got {incore_dirs}"
+        )
+        assert incore_dirs[find_param(incore_dirs, "a")] == ir.ParamDirection.In, (
+            f"incore wrapper's `a` param should remain In, got {incore_dirs}"
+        )
+
     def test_cluster_outlined_verifier_rejects_cluster_in_incore(self):
         """Test that ClusterOutlined verifier flags Cluster scopes in InCore functions."""
 
