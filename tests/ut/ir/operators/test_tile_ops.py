@@ -2513,5 +2513,50 @@ class TestTileFormatShapeError:
             op_callable(tile_a, tile_b)
 
 
+class TestTileCiOp:
+    """Tests for tile.ci (contiguous integer sequence generation, pto.tci)."""
+
+    def test_tile_ci_ascending(self):
+        """tile.ci returns a TileType with requested shape / dtype."""
+        call = tile.ci(0, [1, 32], dtype=DataType.INT32)
+        t = call.type
+        assert isinstance(t, ir.TileType)
+        assert t.dtype == DataType.INT32
+        assert len(t.shape) == 2
+        assert "tile.ci" in str(call)
+        assert "descending=False" in str(call)
+
+    def test_tile_ci_descending_kwarg_printed(self):
+        """descending=True should appear in the printed IR."""
+        call = tile.ci(10, [1, 16], dtype=DataType.INT32, descending=True)
+        assert "descending=True" in str(call)
+
+    def test_tile_ci_rejects_float_dtype(self):
+        with pytest.raises(ValueError, match=r"INT16.*INT32.*UINT16.*UINT32"):
+            tile.ci(0, [1, 32], dtype=DataType.FP32)
+
+    def test_tile_ci_accepts_uint_dtype(self):
+        call = tile.ci(0, [1, 16], dtype=DataType.UINT32)
+        assert call is not None
+
+    def test_tile_ci_rejects_cols_equal_one(self):
+        with pytest.raises(ValueError, match="innermost dimension"):
+            tile.ci(0, [32, 1], dtype=DataType.INT32)
+
+    def test_tile_ci_rejects_multi_row_shape(self):
+        """pto.tci only populates the first row, so leading dims must be 1."""
+        with pytest.raises(ValueError, match=r"leading dimensions must be 1"):
+            tile.ci(0, [4, 32], dtype=DataType.INT32)
+
+    def test_tile_ci_rejects_start_dtype_mismatch(self):
+        span = ir.Span.unknown()
+        start = ir.Var("s", ir.ScalarType(DataType.INT16), span)
+        with pytest.raises(ValueError, match=r"start.*dtype"):
+            tile.ci(start, [1, 32], dtype=DataType.INT32)
+
+    def test_tile_arange_alias_is_ci(self):
+        assert pl.tile.arange is pl.tile.ci
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
