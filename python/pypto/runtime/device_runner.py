@@ -185,7 +185,7 @@ def _checkout_pto_isa_commit(clone_path: Path, commit: str) -> None:
                 capture_output=True,
                 text=True,
                 cwd=str(clone_path),
-                timeout=120,
+                timeout=30,
                 check=True,
             )
             subprocess.run(
@@ -208,7 +208,7 @@ def _update_pto_isa_to_latest(clone_path: Path) -> None:
             capture_output=True,
             text=True,
             cwd=str(clone_path),
-            timeout=120,
+            timeout=30,
             check=True,
         )
         subprocess.run(
@@ -490,7 +490,7 @@ def execute_on_device(
     cfg = ChipCallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_thread_num
-    cfg.enable_profiling = enable_profiling
+    cfg.enable_l2_swimlane = enable_profiling
 
     env = runtime_env or {}
     with _temporary_env(env):
