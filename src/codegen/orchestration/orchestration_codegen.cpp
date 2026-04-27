@@ -1066,12 +1066,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
           << "Internal error: tuple element index " << elem.index << " out of range for " << call->op_->name_
           << " (has " << out_indices.size() << " Out/InOut params)";
       size_t param_idx = out_indices[static_cast<size_t>(elem.index)];
-      INTERNAL_CHECK_SPAN(param_idx < effective_dirs.size(), call->span_)
+      INTERNAL_CHECK_SPAN(param_idx < call->args_.size(), call->span_)
           << "Internal error: resolved param_idx " << param_idx << " out of range for " << call->op_->name_
-          << " (has " << effective_dirs.size() << " params)";
-      if (effective_dirs[param_idx] == ParamDirection::InOut) {
-        continue;
-      }
+          << " (has " << call->args_.size() << " args)";
+
       if (!effective_uses_.count(elem.var)) {
         continue;
       }
