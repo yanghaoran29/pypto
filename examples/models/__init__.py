@@ -18,6 +18,7 @@ Model examples — multi-kernel programs with orchestration, ordered by complexi
   06_paged_attention_dynamic.py     — dynamic shapes
   07_paged_attention_multi_config.py — multi-config variant
   08_llama_mini.py                  — single-head LLaMA 7B
+  09_paged_attention_spmd.py        — SPMD paged attention
 """
 
 import importlib
@@ -32,6 +33,7 @@ _ALIASES = {
     "paged_attention_dynamic": "06_paged_attention_dynamic",
     "paged_attention_multi_config": "07_paged_attention_multi_config",
     "llama_mini": "08_llama_mini",
+    "paged_attention_spmd": "09_paged_attention_spmd",
 }
 
 for _alias, _numbered in _ALIASES.items():

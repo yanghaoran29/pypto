@@ -29,6 +29,7 @@
  * produces the same IR properties it requires (MixedKernelExpanded).
  */
 
+#include <algorithm>
 #include <any>
 #include <cstdint>
 #include <functional>
@@ -46,6 +47,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
@@ -376,6 +378,60 @@ int64_t ComputeGMBufferSizeFromPipeOps(const std::vector<FunctionPtr>& functions
   return max_bytes;
 }
 
+int64_t GetSpmdCoreNumOrOne(const FunctionPtr& func) {
+  if (!func || func->func_type_ != FunctionType::Spmd) return 1;
+  for (const auto& [key, value] : func->attrs_) {
+    if (key != "core_num") continue;
+    // outline_cluster_scopes stores core_num as Expr in attrs.
+    if (const auto* expr_ptr = std::any_cast<ExprPtr>(&value)) {
+      if (auto c = As<ConstInt>(*expr_ptr)) {
+        return std::max<int64_t>(1, c->value_);
+      }
+    }
+    // Be permissive if future passes materialize plain integral attrs.
+    if (const auto* i32 = std::any_cast<int>(&value)) {
+      return std::max<int64_t>(1, static_cast<int64_t>(*i32));
+    }
+    if (const auto* i64 = std::any_cast<int64_t>(&value)) {
+      return std::max<int64_t>(1, *i64);
+    }
+  }
+  return 1;
+}
+
+int64_t ResolveSpmdCoreNumFromCallers(
+    const std::unordered_set<std::string>& needs_gm_param,
+    const std::unordered_map<std::string, std::unordered_set<std::string>>& callers,
+    const std::unordered_map<std::string, FunctionPtr*>& func_by_name) {
+  int64_t core_num = 1;
+  bool saw_spmd_caller = false;
+
+  // Prefer the SPMD wrapper(s) that directly call GM-pipe functions.
+  for (const auto& callee_name : needs_gm_param) {
+    auto it = callers.find(callee_name);
+    if (it == callers.end()) continue;
+    for (const auto& caller_name : it->second) {
+      auto fit = func_by_name.find(caller_name);
+      if (fit == func_by_name.end()) continue;
+      const auto& caller = *fit->second;
+      if (caller && caller->func_type_ == FunctionType::Spmd) {
+        saw_spmd_caller = true;
+        core_num = std::max(core_num, GetSpmdCoreNumOrOne(caller));
+      }
+    }
+  }
+
+  // Fallback: if no direct SPMD caller, use any SPMD function in the propagated set.
+  if (!saw_spmd_caller) {
+    for (const auto& name : needs_gm_param) {
+      auto fit = func_by_name.find(name);
+      if (fit == func_by_name.end()) continue;
+      core_num = std::max(core_num, GetSpmdCoreNumOrOne(*fit->second));
+    }
+  }
+  return core_num;
+}
+
 void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
   std::unordered_map<std::string, FunctionPtr*> func_by_name;
   for (auto& func : functions) func_by_name[func->name_] = &func;
@@ -394,7 +450,6 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
   int64_t gm_buffer_bytes = ComputeGMBufferSizeFromPipeOps(functions);
   INTERNAL_CHECK(gm_buffer_bytes > 0) << "Internal error: cross-core pipe functions found but no "
                                          "initialize_pipe ops to determine buffer size";
-  int64_t gm_buffer_elems = (gm_buffer_bytes + 3) / 4;
 
   // Propagate upward, stopping at Orchestration boundaries (they materialize
   // the buffer locally instead of taking it as a parameter).
@@ -416,6 +471,14 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
       }
     }
   }
+
+  // SPMD mode: reserve disjoint GM pipe workspace per logical block_idx.
+  // Use SPMD wrapper core_num (i.e. pl.spmd first argument) when present.
+  int64_t spmd_core_num = ResolveSpmdCoreNumFromCallers(needs_gm_param, callers, func_by_name);
+  if (spmd_core_num > 1) {
+    gm_buffer_bytes *= spmd_core_num;
+  }
+  int64_t gm_buffer_elems = (gm_buffer_bytes + 3) / 4;
 
   for (auto& func : functions) {
     if (needs_gm_param.count(func->name_) && !HasGMPipeBufferParam(func)) {

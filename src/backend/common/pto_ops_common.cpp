@@ -2209,8 +2209,21 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     }
 
     std::string result_target = codegen.GetCurrentResultTarget();
-    std::string result_type = codegen.GetCurrentResultTileBufTypeString();
     INTERNAL_CHECK_SPAN(!result_target.empty(), op->span_) << "tile.slice requires assignment target";
+    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
+    // pto.subview verifier requires result valid_shape to agree with inferred valid_row/valid_col.
+    // Some slice results may carry unknown v_row/v_col ("?") from upstream type deduction;
+    // when slice extents are compile-time constants and no dynamic valid[] is provided,
+    // fill them with the static extents to satisfy verifier constraints.
+    if (!result_type.empty() && valid_row.empty()) {
+      const std::string unknown_marker = "v_row=?, v_col=?";
+      auto pos = result_type.find(unknown_marker);
+      if (pos != std::string::npos) {
+        std::ostringstream valid_ss;
+        valid_ss << "v_row=" << rows_const->value_ << ", v_col=" << cols_const->value_;
+        result_type.replace(pos, unknown_marker.size(), valid_ss.str());
+      }
+    }
 
     auto row_off_const = ir::As<ir::ConstInt>(offset_tuple->elements_[0]);
     auto col_off_const = ir::As<ir::ConstInt>(offset_tuple->elements_[1]);

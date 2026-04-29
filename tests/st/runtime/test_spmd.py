@@ -364,6 +364,51 @@ class SPMDSyncStartMixedProgram:
         return out
 
 
+# SPMD gm_pipe_buffer golden case: lightweight mixed-kernel under SPMD.
+GM_BLOCKS = 2
+GM_BLOCK_ROWS = 64
+GM_M = GM_BLOCKS * GM_BLOCK_ROWS  # 128
+GM_K = 16
+GM_N = 16
+
+
+@pl.program
+class SPMDGMPipeBufferProgram:
+    @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+    def kernel(
+        self,
+        a: pl.Tensor[[GM_M, GM_K], pl.FP32],
+        b: pl.Tensor[[GM_K, GM_N], pl.FP32],
+        bias: pl.Tensor[[GM_M, GM_N], pl.FP32],
+        out: pl.Out[pl.Tensor[[GM_M, GM_N], pl.FP32]],
+    ) -> pl.Tensor[[GM_M, GM_N], pl.FP32]:
+        block_idx = pl.tile.get_block_idx()
+        row_offset = block_idx * GM_BLOCK_ROWS
+
+        tile_a_l1 = pl.load(a, [row_offset, 0], [GM_BLOCK_ROWS, GM_K], target_memory=pl.MemorySpace.Mat)
+        tile_b_l1 = pl.load(b, [0, 0], [GM_K, GM_N], target_memory=pl.MemorySpace.Mat)
+        tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+        tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+        tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
+
+        tile_bias = pl.load(bias, [row_offset, 0], [GM_BLOCK_ROWS, GM_N])
+        tile_out = pl.add(tile_mm, tile_bias)
+        out = pl.store(tile_out, [row_offset, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        a: pl.Tensor[[GM_M, GM_K], pl.FP32],
+        b: pl.Tensor[[GM_K, GM_N], pl.FP32],
+        bias: pl.Tensor[[GM_M, GM_N], pl.FP32],
+        out: pl.Out[pl.Tensor[[GM_M, GM_N], pl.FP32]],
+    ) -> pl.Tensor[[GM_M, GM_N], pl.FP32]:
+        with pl.spmd(GM_BLOCKS, name_hint="gm_pipe_spmd"):
+            out = self.kernel(a, b, bias, out)
+        return out
+
+
 # --- Test Cases ---
 
 
@@ -529,6 +574,27 @@ class SPMDSyncStartMixedTestCase(_BaseSPMDTestCase):
         tensors["out"][:] = tensors["a"] + tensors["b"]
 
 
+class SPMDGMPipeBufferTestCase(_BaseSPMDTestCase):
+    """SPMD mixed-kernel down-proj residual golden test for gm_pipe_buffer path."""
+
+    def get_name(self) -> str:
+        return "spmd_gm_pipe_buffer_128x16"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [GM_M, GM_K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [GM_K, GM_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("bias", [GM_M, GM_N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("out", [GM_M, GM_N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return SPMDGMPipeBufferProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["out"][:] = torch.matmul(tensors["a"], tensors["b"]) + tensors["bias"]
+
+
 # --- Tests ---
 
 
@@ -577,6 +643,11 @@ class TestSPMDOperations:
     def test_spmd_sync_start_mixed(self, test_runner, platform):
         """4 submissions: T0 baseline + T1/T2/T3 with sync_start=True, mirroring the sync_start test."""
         self._run_case(test_runner, SPMDSyncStartMixedTestCase(platform=platform))
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_spmd_gm_pipe_buffer_golden(self, test_runner, platform):
+        """SPMD gm_pipe_buffer runtime path should pass golden on all platforms."""
+        self._run_case(test_runner, SPMDGMPipeBufferTestCase(platform=platform))
 
 
 if __name__ == "__main__":
