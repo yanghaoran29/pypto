@@ -32,26 +32,93 @@ for db0 in pl.spmd((HIDDEN // DOWN_N_CHUNK) // 2, name_hint="down_proj_residual_
 
 ## 为什么非 SPMD 能过，而 SPMD 会失败
 
-### 来自 Simpler/runtime 源码的关键行为
+### 来自 Simpler/runtime 源码的关键行为（含完整依赖代码）
 
-1. **每个编排作用域只做一次输出/工作区分配**  
-   在生成的 orchestrator 中，`alloc_tensors(...)` 调用一次，返回的 tensor 在任务提交中复用。  
-   示例文件：
-   `build_output/gm_pipe_golden_saved/spmd_gm_pipe_buffer_128x16/orchestration/orchestrator.cpp`
-   可见：
-   - 一次 `alloc_tensors(gm_pipe_buffer_0_ci)`
-   - 一次 `params_t0.add_output(gm_pipe_buffer_0)`
-   - 一次 `params_t0.launch_spec.set_block_num(2)` 提交。
+1. **内存分配链路：`alloc_tensors` 进入 runtime 并执行真实分配**
 
-2. **SPMD 是“一个任务 + 多个逻辑 block 分发”**  
-   调度器构建 payload 时，tensor 参数地址保持不变，只修改本次分发的 block 身份：
-   - `dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);`
-   - `dispatch_payload.local_context.block_idx = slot_state.next_block_idx;`
-   见 `runtime/.../scheduler/scheduler_dispatch.cpp`。
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/pto_orchestration_api.h`：
 
-3. **kernel 侧的 block_idx 来自每次分发的 local context**  
-   `get_block_idx(args)` 从 `LocalContext.block_idx` 读取，不同 block 值不同，证明同一任务内存在多 block 分发。  
-   见 `runtime/.../common/intrinsic.h`。
+```cpp
+static inline TaskOutputTensors alloc_tensors(const Arg &args) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
+    return rt->ops->alloc_tensors(rt, args);
+}
+```
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.cpp`：
+
+```cpp
+static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
+    return pto2_alloc_tensors(&rt->orchestrator, args);
+}
+```
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`：
+
+```cpp
+TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args) {
+    // ...
+    PTO2OutputLayout layout = pto2_calculate_output_layout(args);
+    PTO2PreparedTask prepared;
+    if (!pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared)) {
+        return TaskOutputTensors{};
+    }
+
+    PTO2TaskDescriptor &task = *prepared.task;
+    PTO2TaskPayload &payload = *prepared.payload;
+    // ...
+    payload.init(args, outputs, prepared.alloc_result, layout, false);
+    // ...
+}
+```
+
+以上代码说明 `alloc_tensors` 不是语法糖，而是进入 runtime 的真实分配路径，并将分配结果绑定到 task payload 中。
+
+2. **SPMD 是“一个任务 + 多个逻辑 block 分发”**
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp`：
+
+```cpp
+void SchedulerContext::build_payload(
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress
+) {
+    auto &payload = *slot_state.payload;
+    int n = 0;
+    for (int32_t i = 0; i < payload.tensor_count; i++) {
+        dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+    }
+    // ...
+    dispatch_payload.local_context.block_idx = slot_state.next_block_idx;
+    dispatch_payload.local_context.block_num = slot_state.logical_block_num;
+    // ...
+}
+```
+
+这段代码表明：同一 task 的 tensor 参数地址会被复用，而每次 dispatch 只更新 `block_idx/block_num`。
+
+3. **kernel 侧 block 身份来自 per-dispatch local context**
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`：
+
+```cpp
+struct LocalContext {
+    int32_t block_idx;  // Logical block index within the task [0, block_num)
+    int32_t block_num;  // How many logical blocks this task requires.
+    // ...
+};
+
+static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
+    __gm__ LocalContext *ctx =
+        reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
+    return ctx->block_idx;
+}
+```
+
+也就是说，不同逻辑 block 共享同一 task 的参数布局，但通过 local context 读取不同 `block_idx` 执行各自子任务。
 
 ### 直接后果
 

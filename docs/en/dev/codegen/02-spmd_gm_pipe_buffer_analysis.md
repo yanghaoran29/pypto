@@ -32,29 +32,96 @@ appears only in SPMD form, while equivalent non-SPMD form can pass.
 
 ## Why non-SPMD can pass while SPMD fails
 
-### Key runtime behavior from Simpler source
+### Key runtime behavior from Simpler source (with direct code excerpts)
 
-1. **Output/workspace allocation is created once per orchestration scope**  
-   In generated orchestration code, `alloc_tensors(...)` is called once and the
-   returned tensor is reused for the task submission.
-   Example generated file:
-   `build_output/gm_pipe_golden_saved/spmd_gm_pipe_buffer_128x16/orchestration/orchestrator.cpp`
-   shows:
-   - one `alloc_tensors(gm_pipe_buffer_0_ci)`
-   - one `params_t0.add_output(gm_pipe_buffer_0)`
-   - one `params_t0.launch_spec.set_block_num(2)` submission.
+1. **Allocation path: `alloc_tensors` enters runtime and performs real allocation**
 
-2. **SPMD dispatch creates multiple logical blocks for one task**  
-   In scheduler payload building, runtime keeps the same tensor argument pointers
-   and only updates local block identity per dispatch:
-   - `dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);`
-   - `dispatch_payload.local_context.block_idx = slot_state.next_block_idx;`
-   See `runtime/.../scheduler/scheduler_dispatch.cpp`.
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/pto_orchestration_api.h`:
 
-3. **Kernel-side block identity is read from per-dispatch local context**  
-   `get_block_idx(args)` reads `LocalContext.block_idx`, which differs by block
-   within the same task; this confirms one task is split into many dispatched blocks.
-   See `runtime/.../common/intrinsic.h`.
+```cpp
+static inline TaskOutputTensors alloc_tensors(const Arg &args) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
+    return rt->ops->alloc_tensors(rt, args);
+}
+```
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.cpp`:
+
+```cpp
+static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
+    return pto2_alloc_tensors(&rt->orchestrator, args);
+}
+```
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`:
+
+```cpp
+TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args) {
+    // ...
+    PTO2OutputLayout layout = pto2_calculate_output_layout(args);
+    PTO2PreparedTask prepared;
+    if (!pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared)) {
+        return TaskOutputTensors{};
+    }
+
+    PTO2TaskDescriptor &task = *prepared.task;
+    PTO2TaskPayload &payload = *prepared.payload;
+    // ...
+    payload.init(args, outputs, prepared.alloc_result, layout, false);
+    // ...
+}
+```
+
+This shows `alloc_tensors` is not a frontend-only abstraction: it reaches runtime
+allocation code and binds allocation results into task payload.
+
+2. **SPMD dispatch is one task split into many logical blocks**
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp`:
+
+```cpp
+void SchedulerContext::build_payload(
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress
+) {
+    auto &payload = *slot_state.payload;
+    int n = 0;
+    for (int32_t i = 0; i < payload.tensor_count; i++) {
+        dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+    }
+    // ...
+    dispatch_payload.local_context.block_idx = slot_state.next_block_idx;
+    dispatch_payload.local_context.block_num = slot_state.logical_block_num;
+    // ...
+}
+```
+
+Tensor argument addresses are reused for the task, while each dispatch updates
+`block_idx/block_num`.
+
+3. **Kernel-side block identity is read from per-dispatch local context**
+
+`runtime/src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`:
+
+```cpp
+struct LocalContext {
+    int32_t block_idx;  // Logical block index within the task [0, block_num)
+    int32_t block_num;  // How many logical blocks this task requires.
+    // ...
+};
+
+static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
+    __gm__ LocalContext *ctx =
+        reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
+    return ctx->block_idx;
+}
+```
+
+Different logical blocks therefore share one task-level argument layout but run
+with different `block_idx` values from local context.
 
 ### Consequence
 
