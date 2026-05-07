@@ -35,13 +35,14 @@ namespace pass {
 namespace {
 
 /// Unwrap nested Spmd scopes in a Group function body:
-/// Copy core_num/sync_start from the Spmd scope to the Group function's attrs,
+/// Copy core_num/split/sync_start from the Spmd scope to the Group function's attrs,
 /// then replace the ScopeStmt(Spmd) with its body. core_num is propagated as
 /// an ExprPtr — codegen is responsible for evaluating it.
 FunctionPtr UnwrapNestedSpmd(const FunctionPtr& group_func) {
   class SpmdUnwrapper : public IRMutator {
    public:
     ExprPtr core_num;
+    std::optional<SplitMode> split;
     std::optional<bool> sync_start;
 
    protected:
@@ -49,6 +50,7 @@ FunctionPtr UnwrapNestedSpmd(const FunctionPtr& group_func) {
       CHECK(core_num == nullptr)  // NOLINT(misc-include-cleaner)
           << "Only one pl.spmd() block is allowed per cluster scope";
       core_num = op->core_num_;
+      split = op->split_;
       sync_start = op->sync_start_;
       return VisitStmt(op->body_);
     }
@@ -63,6 +65,9 @@ FunctionPtr UnwrapNestedSpmd(const FunctionPtr& group_func) {
   auto mutable_func = MutableCopy(group_func);
   mutable_func->body_ = new_body;
   mutable_func->attrs_.emplace_back("core_num", unwrapper.core_num);
+  if (unwrapper.split.has_value() && *unwrapper.split != SplitMode::None) {
+    mutable_func->attrs_.emplace_back("split", static_cast<int>(*unwrapper.split));
+  }
   if (unwrapper.sync_start.has_value() && *unwrapper.sync_start) {
     mutable_func->attrs_.emplace_back("sync_start", true);
   }
@@ -86,7 +91,7 @@ FunctionPtr UnwrapNestedSpmd(const FunctionPtr& group_func) {
  * 1. Outline ScopeStmt(Cluster) into Function(Group) (first pass)
  * 2. Outline standalone ScopeStmt(Spmd) into Function(Spmd) (second pass)
  * 3. For nested Spmd inside Cluster: unwrap the Spmd scope and propagate
- *    core_num/sync_start as function attrs on the Group
+ *    core_num/split/sync_start as function attrs on the Group
  * 4. Parent function type is preserved (not promoted)
  */
 Pass OutlineClusterScopes() {

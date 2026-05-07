@@ -666,6 +666,7 @@ class ScopeOutliner : public IRMutator {
       append_split_attr(auto_incore->split_);
     } else if (auto spmd = As<SpmdScopeStmt>(op)) {
       outlined_attrs.emplace_back("core_num", spmd->core_num_);
+      append_split_attr(spmd->split_);
       if (spmd->sync_start_) {
         outlined_attrs.emplace_back("sync_start", true);
       }
@@ -675,6 +676,8 @@ class ScopeOutliner : public IRMutator {
     if (auto hier = As<HierarchyScopeStmt>(op)) {
       outlined_level = hier->level_;
       outlined_role = hier->role_;
+    } else if (auto spmd = As<SpmdScopeStmt>(op)) {
+      outlined_level = spmd->level_;
     }
     auto outlined_func = std::make_shared<Function>(
         outlined_func_name, input_params, input_param_directions, return_types, outlined_body, op->span_,

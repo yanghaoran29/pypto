@@ -346,8 +346,8 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 StmtPtr FlattenCallExprMutator::VisitStmt_(const SpmdScopeStmtPtr& op) {
   auto new_body = FlattenScopeBody(this, pending_stmts_, op->body_);
   if (new_body.get() == op->body_.get()) return op;
-  return std::make_shared<const SpmdScopeStmt>(op->core_num_, op->sync_start_, op->name_hint_,
-                                               std::move(new_body), op->span_);
+  return std::make_shared<const SpmdScopeStmt>(op->core_num_, op->sync_start_, op->level_, op->name_hint_,
+                                               std::move(new_body), op->span_, op->split_);
 }
 
 // Expression visitors implementation

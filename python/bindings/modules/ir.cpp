@@ -1084,21 +1084,25 @@ void BindIR(nb::module_& m) {
   // SpmdScopeStmt
   auto spmd_scope_stmt_class =
       nb::class_<SpmdScopeStmt, ScopeStmt>(ir, "SpmdScopeStmt", "SPMD dispatch scope");
-  spmd_scope_stmt_class.def(nb::init<ExprPtr, bool, std::string, const StmtPtr&, const Span&>(),
-                            nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("name_hint") = "",
-                            nb::arg("body"), nb::arg("span"), "Create an SPMD scope statement");
+  spmd_scope_stmt_class.def(
+      nb::init<ExprPtr, bool, std::optional<Level>, std::string, const StmtPtr&, const Span&,
+               std::optional<SplitMode>>(),
+      nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("level") = nb::none(),
+      nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"), nb::arg("split") = nb::none(),
+      "Create an SPMD scope statement");
   // Convenience overload: accept a plain Python int for core_num and wrap it as
   // ConstInt(DataType::INDEX) automatically, mirroring the surface of pl.spmd()
   // and IRBuilder.scope() so callers can write ir.SpmdScopeStmt(core_num=4, ...).
   spmd_scope_stmt_class.def(
       "__init__",
-      [](SpmdScopeStmt* self, int64_t core_num, bool sync_start, std::string name_hint, const StmtPtr& body,
-         const Span& span) {
+      [](SpmdScopeStmt* self, int64_t core_num, bool sync_start, std::optional<Level> level,
+         std::string name_hint, const StmtPtr& body, const Span& span, std::optional<SplitMode> split) {
         auto core_num_expr = std::make_shared<const ConstInt>(core_num, DataType::INDEX, span);
-        new (self) SpmdScopeStmt(core_num_expr, sync_start, std::move(name_hint), body, span);
+        new (self) SpmdScopeStmt(core_num_expr, sync_start, level, std::move(name_hint), body, span, split);
       },
-      nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("name_hint") = "", nb::arg("body"),
-      nb::arg("span"), "Create an SPMD scope statement (int core_num is wrapped as ConstInt)");
+      nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("level") = nb::none(),
+      nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"), nb::arg("split") = nb::none(),
+      "Create an SPMD scope statement (int core_num is wrapped as ConstInt)");
   BindFields<SpmdScopeStmt>(spmd_scope_stmt_class);
 
   // SeqStmts - const shared_ptr

@@ -346,8 +346,8 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
       break;
     case ScopeKind::Spmd:
       CHECK(core_num != nullptr) << "Spmd scope requires core_num";
-      scope_stmt = std::make_shared<const SpmdScopeStmt>(core_num, sync_start.value_or(false),
-                                                         std::move(name_hint), body, combined_span);
+      scope_stmt = std::make_shared<const SpmdScopeStmt>(core_num, sync_start.value_or(false), level,
+                                                         std::move(name_hint), body, combined_span, split);
       break;
   }
   // Safety net: every ScopeKind value above must populate scope_stmt. The switch has

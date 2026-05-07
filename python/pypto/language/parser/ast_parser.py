@@ -2600,16 +2600,12 @@ class ASTParser:
         call: ast.Call,
         *,
         usage_hint: str,
-    ) -> tuple["ir.Expr", bool, str]:
-        """Parse ``pl.spmd(core_num, *, sync_start=, name_hint=)`` arguments.
+    ) -> tuple["ir.Expr", bool, "ir.Level | None", str, bool, "ir.SplitMode | None"]:
+        """Parse ``pl.spmd(core_num, *, sync_start=, level=, optimizations=, name_hint=)``.
 
-        The first positional argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint)`` with ``sync_start`` defaulting
-        to ``False`` (matching the DSL default). Raises ParserSyntaxError for
-        missing core_num, unexpected kwargs, or ``**kwargs`` unpacking.
-
+        Returns ``(core_num, sync_start, level, name_hint, requests_auto_chunk, split_mode)``.
         ``core_num`` is lowered through :meth:`parse_expression`, so any
-        Python value that resolves to an IR expression is accepted here —
+        Python value that resolves to an IR expression is accepted here -
         closure-captured integers fold to ``ConstInt`` via ``parse_name``'s
         closure fallback, and closure arithmetic folds via ``parse_binop``'s
         constant-folding path. Non-foldable expressions (e.g. a Var) are
@@ -2667,13 +2663,17 @@ class ASTParser:
         if call.args:
             core_num = _parse_core_num_node(call.args[0], call.args[0])
         sync_start: bool = False
+        level: ir.Level | None = None
         name_hint = ""
+        requests_auto_chunk = False
+        split_mode: ir.SplitMode | None = None
+        seen_optimizations_kw = False
         for kw in call.keywords:
             if kw.arg is None:
                 # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
                 raise ParserSyntaxError(
                     "pl.spmd() does not accept **kwargs; pass core_num (positional) "
-                    "and sync_start=/name_hint= explicitly",
+                    "and sync_start=/level=/optimizations=/name_hint= explicitly",
                     span=self.span_tracker.get_span(kw.value),
                     hint=usage_hint,
                 )
@@ -2695,11 +2695,22 @@ class ASTParser:
                         hint=usage_hint,
                     )
                 sync_start = kw.value.value
+            elif kw.arg == "level":
+                level = extract_enum_value(kw.value, LEVEL_MAP, "Level", "pl.Level")
+            elif kw.arg == "optimizations":
+                if seen_optimizations_kw:
+                    raise ParserSyntaxError(
+                        "pl.spmd() got multiple values for argument 'optimizations'",
+                        span=self.span_tracker.get_span(kw),
+                        hint=usage_hint,
+                    )
+                seen_optimizations_kw = True
+                requests_auto_chunk, split_mode = self._parse_optimizations_list(kw.value)
             else:
                 raise ParserSyntaxError(
                     f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
                     span=self.span_tracker.get_span(anchor),
-                    hint="Supported keywords: 'sync_start', 'name_hint'",
+                    hint="Supported keywords: 'sync_start', 'level', 'optimizations', 'name_hint'",
                 )
         if core_num is None:
             raise ParserSyntaxError(
@@ -2707,7 +2718,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(anchor),
                 hint=usage_hint,
             )
-        return core_num, sync_start, name_hint
+        return core_num, sync_start, level, name_hint, requests_auto_chunk, split_mode
 
     def _parse_spmd_scope(
         self,
@@ -2717,7 +2728,15 @@ class ASTParser:
     ) -> None:
         """Parse ``with pl.spmd(...):`` into a ScopeStmt(Spmd)."""
         with_hint = "Use 'with pl.spmd(4):' with a single function call inside."
-        core_num, sync_start, name_hint = self._parse_spmd_kwargs(stmt, context_expr, usage_hint=with_hint)
+        core_num, sync_start, level, name_hint, requests_auto_chunk, split_mode = self._parse_spmd_kwargs(
+            stmt, context_expr, usage_hint=with_hint
+        )
+        if requests_auto_chunk:
+            raise ParserSyntaxError(
+                "pl.auto_chunk in pl.spmd(...) is only supported in loop form: for i in pl.spmd(...).",
+                span=self.span_tracker.get_span(context_expr),
+                hint="Use 'for i in pl.spmd(core_num, optimizations=[pl.auto_chunk, ...]): ...'.",
+            )
         # Validate body is exactly one statement that is a function call.
         # The loop form (for i in pl.spmd(n):) is what accepts inline
         # multi-statement bodies.
@@ -2750,6 +2769,8 @@ class ASTParser:
             stmt,
             scope_kind,
             span,
+            split=split_mode,
+            level=level,
             name_hint=name_hint,
             core_num=core_num,
             sync_start=sync_start,
@@ -2786,22 +2807,27 @@ class ASTParser:
                     hint=spmd_hint,
                 )
 
-        core_num, sync_start, name_hint = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
+        core_num, sync_start, level, name_hint, requests_auto_chunk, split_mode = self._parse_spmd_kwargs(
+            stmt, iter_call, usage_hint=spmd_hint
+        )
 
         span = self.span_tracker.get_span(stmt)
         with self.builder.scope(
             ir.ScopeKind.Spmd,
             span,
+            split=split_mode,
+            level=level,
             name_hint=name_hint,
             core_num=core_num,
             sync_start=sync_start,
         ):
             with self._scope_kind_context(ir.ScopeKind.Spmd):
                 self.scope_manager.enter_scope("spmd_for")
-                with self.builder.scope(ir.ScopeKind.InCore, span):
-                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                inner_scope_kind = ir.ScopeKind.AutoInCore if requests_auto_chunk else ir.ScopeKind.InCore
+                with self.builder.scope(inner_scope_kind, span, split=split_mode):
+                    with self._scope_kind_context(inner_scope_kind):
                         # Bind `i = pl.tile.get_block_idx()` as the first
-                        # statement of the outlined InCore body.
+                        # statement of the outlined inner scope body.
                         loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX), span=span)
                         self.scope_manager.define_var(loop_var_name, loop_var)
                         self.builder.assign(loop_var, ir_op.tile.get_block_idx(span=span), span=span)

@@ -1164,17 +1164,46 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   // multi-statement InCore-wrapped body as `with pl.spmd():` would fail
   // to reparse).
   auto incore = As<InCoreScopeStmt>(op->body_);
-  auto incore_seq = incore ? As<SeqStmts>(incore->body_) : nullptr;
+  auto auto_incore = As<AutoInCoreScopeStmt>(op->body_);
+  auto body_scope = incore ? std::static_pointer_cast<const ScopeStmt>(incore)
+                           : std::static_pointer_cast<const ScopeStmt>(auto_incore);
+  auto body_split = incore ? incore->split_ : (auto_incore ? auto_incore->split_ : std::nullopt);
+  auto effective_split = op->split_.has_value() ? op->split_ : body_split;
+  auto incore_seq = body_scope ? As<SeqStmts>(body_scope->body_) : nullptr;
   auto first_assign = incore_seq
                           ? (incore_seq->stmts_.empty() ? nullptr : As<AssignStmt>(incore_seq->stmts_[0]))
-                          : (incore ? As<AssignStmt>(incore->body_) : nullptr);
+                          : (body_scope ? As<AssignStmt>(body_scope->body_) : nullptr);
   auto first_call = first_assign ? As<Call>(first_assign->value_) : nullptr;
   auto first_op = first_call ? As<Op>(first_call->op_) : nullptr;
+  auto emit_spmd_optimizations = [&]() {
+    std::vector<std::string> entries;
+    if (auto_incore) {
+      entries.push_back(prefix_ + ".auto_chunk");
+    }
+    if (effective_split.has_value()) {
+      std::ostringstream split_oss;
+      split_oss << prefix_ << ".split(" << prefix_ << ".SplitMode."
+                << SplitModeToPythonString(effective_split.value()) << ")";
+      entries.push_back(split_oss.str());
+    }
+    if (!entries.empty()) {
+      stream_ << ", optimizations=[";
+      for (size_t i = 0; i < entries.size(); ++i) {
+        if (i > 0) stream_ << ", ";
+        stream_ << entries[i];
+      }
+      stream_ << "]";
+    }
+  };
   if (first_op && first_op->name_ == "tile.get_block_idx") {
     stream_ << "for " << GetVarName(first_assign->var_.get()) << " in " << prefix_ << ".spmd(";
     VisitExpr(op->core_num_);
+    emit_spmd_optimizations();
     if (op->sync_start_) {
       stream_ << ", sync_start=True";
+    }
+    if (op->level_.has_value()) {
+      stream_ << ", level=" << prefix_ << ".Level." << LevelToString(*op->level_);
     }
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
@@ -1197,8 +1226,12 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
 
   stream_ << "with " << prefix_ << ".spmd(";
   VisitExpr(op->core_num_);
+  emit_spmd_optimizations();
   if (op->sync_start_) {
     stream_ << ", sync_start=True";
+  }
+  if (op->level_.has_value()) {
+    stream_ << ", level=" << prefix_ << ".Level." << LevelToString(*op->level_);
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";

@@ -1985,17 +1985,25 @@ class SpmdScopeStmt(ScopeStmt):
     core_num: Final[Expr]
     """SPMD block count expression."""
 
+    split: Final[SplitMode | None]
+    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
+
     sync_start: Final[bool]
     """Require sync-start for SPMD dispatch."""
+
+    level: Final[Level | None]
+    """Optional hierarchy level hint for SPMD dispatch."""
 
     def __init__(
         self,
         core_num: int | Expr,
         sync_start: bool = False,
+        level: Level | None = None,
         name_hint: str = "",
         *,
         body: Stmt,
         span: Span,
+        split: SplitMode | None = None,
     ) -> None:
         """Create an SPMD scope statement.
 

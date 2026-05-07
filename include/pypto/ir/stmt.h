@@ -692,7 +692,7 @@ using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
  *   - `AutoInCoreScopeStmt`: optional `split_`
  *   - `ClusterScopeStmt`: no extra fields
  *   - `HierarchyScopeStmt`: required `level_`, optional `role_`
- *   - `SpmdScopeStmt`: required `core_num_`, `sync_start_` (default false)
+ *   - `SpmdScopeStmt`: required `core_num_`, optional `split_`, `sync_start_` (default false)
  *
  * **Syntax:**
  * with pl.incore():    # InCore scope -> InCoreScopeStmt
@@ -847,7 +847,7 @@ using HierarchyScopeStmtPtr = std::shared_ptr<const HierarchyScopeStmt>;
 /**
  * @brief SPMD dispatch scope.
  *
- * Required `core_num` expression; `sync_start` defaults to false.
+ * Required `core_num` expression; optional split hint and `sync_start`.
  *
  * `core_num_` is a generic `ExprPtr` so compile-time-known integer
  * expressions (closure variables, closure arithmetic, etc.) flow through
@@ -858,11 +858,14 @@ using HierarchyScopeStmtPtr = std::shared_ptr<const HierarchyScopeStmt>;
  */
 class SpmdScopeStmt : public ScopeStmt {
  public:
-  SpmdScopeStmt(ExprPtr core_num, bool sync_start, std::string name_hint, StmtPtr body, Span span,
+  SpmdScopeStmt(ExprPtr core_num, bool sync_start, std::optional<Level> level, std::string name_hint,
+                StmtPtr body, Span span, std::optional<SplitMode> split = std::nullopt,
                 std::vector<std::string> leading_comments = {})
       : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments)),
         core_num_(std::move(core_num)),
-        sync_start_(sync_start) {
+        split_(split),
+        sync_start_(sync_start),
+        level_(level) {
     INTERNAL_CHECK(core_num_ != nullptr) << "SpmdScopeStmt core_num must not be null";
   }
 
@@ -873,12 +876,16 @@ class SpmdScopeStmt : public ScopeStmt {
   static constexpr auto GetFieldDescriptors() {
     return std::tuple_cat(ScopeStmt::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&SpmdScopeStmt::core_num_, "core_num"),
-                                          reflection::UsualField(&SpmdScopeStmt::sync_start_, "sync_start")));
+                                          reflection::UsualField(&SpmdScopeStmt::split_, "split"),
+                                          reflection::UsualField(&SpmdScopeStmt::sync_start_, "sync_start"),
+                                          reflection::UsualField(&SpmdScopeStmt::level_, "level")));
   }
 
  public:
   ExprPtr core_num_;  ///< SPMD block count expression
+  std::optional<SplitMode> split_;  ///< Optional split mode metadata for outlined function attrs
   bool sync_start_;   ///< Require sync-start for SPMD dispatch
+  std::optional<Level> level_;  ///< Optional hierarchy level hint
 };
 
 using SpmdScopeStmtPtr = std::shared_ptr<const SpmdScopeStmt>;
