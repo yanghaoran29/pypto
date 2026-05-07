@@ -1176,6 +1176,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (op->sync_start_) {
       stream_ << ", sync_start=True";
     }
+    if (op->level_.has_value()) {
+      stream_ << ", level=" << prefix_ << ".Level." << LevelToString(*op->level_);
+    }
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
@@ -1199,6 +1202,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   VisitExpr(op->core_num_);
   if (op->sync_start_) {
     stream_ << ", sync_start=True";
+  }
+  if (op->level_.has_value()) {
+    stream_ << ", level=" << prefix_ << ".Level." << LevelToString(*op->level_);
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";

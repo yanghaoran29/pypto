@@ -849,10 +849,12 @@ class SpmdContext:
         self,
         core_num: int | _ir.Expr,
         sync_start: bool = False,
+        level: ir.Level | None = None,
         name_hint: str = "",
     ) -> None:
         self.core_num = core_num
         self.sync_start = sync_start
+        self.level = level
         self.name_hint = name_hint
 
     def __enter__(self) -> None:
@@ -879,6 +881,7 @@ def spmd(
     core_num: int | _ir.Expr,
     *,
     sync_start: bool = False,
+    level: ir.Level | None = None,
     name_hint: str = "",
 ) -> SpmdContext:
     """Dispatch a kernel with SPMD (Single Program Multiple Data) multi-block execution.
@@ -906,6 +909,8 @@ def spmd(
             by the parser and ``Simplify``; non-foldable expressions flow
             through to codegen unchanged.
         sync_start: If True, all blocks start execution simultaneously (default: False).
+        level: Optional hierarchy level hint for this SPMD scope
+            (for example ``pl.Level.CORE_GROUP``). Default: None.
         name_hint: Optional name hint for the outlined function.
 
     Returns:
@@ -932,7 +937,7 @@ def spmd(
         raise ValueError(f"core_num must be a positive integer or ir.Expr, got {core_num!r}")
     if isinstance(core_num, int) and core_num <= 0:
         raise ValueError(f"core_num must be a positive integer, got {core_num!r}")
-    return SpmdContext(core_num=core_num, sync_start=sync_start, name_hint=name_hint)
+    return SpmdContext(core_num=core_num, sync_start=sync_start, level=level, name_hint=name_hint)
 
 
 class AtContext:

@@ -716,10 +716,15 @@ static IRNodePtr DeserializeSpmdScopeStmt(const msgpack::object& fields_obj, msg
         << static_cast<int>(sync_start_obj->type);
     sync_start = sync_start_obj->as<bool>();
   }
+  std::optional<Level> level = std::nullopt;
+  auto level_obj = GetOptionalFieldObj(fields_obj, "level", ctx);
+  if (level_obj.has_value() && level_obj->type != msgpack::type::NIL) {
+    level = static_cast<Level>(level_obj->via.u64);
+  }
 
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
-  return std::make_shared<SpmdScopeStmt>(core_num, sync_start, std::move(name_hint), body, span,
+  return std::make_shared<SpmdScopeStmt>(core_num, sync_start, level, std::move(name_hint), body, span,
                                          DeserializeLeadingComments(fields_obj));
 }
 

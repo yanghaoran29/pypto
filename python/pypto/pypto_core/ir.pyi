@@ -1988,10 +1988,14 @@ class SpmdScopeStmt(ScopeStmt):
     sync_start: Final[bool]
     """Require sync-start for SPMD dispatch."""
 
+    level: Final[Level | None]
+    """Optional hierarchy level hint for SPMD dispatch."""
+
     def __init__(
         self,
         core_num: int | Expr,
         sync_start: bool = False,
+        level: Level | None = None,
         name_hint: str = "",
         *,
         body: Stmt,

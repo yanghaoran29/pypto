@@ -2600,11 +2600,11 @@ class ASTParser:
         call: ast.Call,
         *,
         usage_hint: str,
-    ) -> tuple["ir.Expr", bool, str]:
-        """Parse ``pl.spmd(core_num, *, sync_start=, name_hint=)`` arguments.
+    ) -> tuple["ir.Expr", bool, "ir.Level | None", str]:
+        """Parse ``pl.spmd(core_num, *, sync_start=, level=, name_hint=)`` arguments.
 
         The first positional argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint)`` with ``sync_start`` defaulting
+        ``(core_num, sync_start, level, name_hint)`` with ``sync_start`` defaulting
         to ``False`` (matching the DSL default). Raises ParserSyntaxError for
         missing core_num, unexpected kwargs, or ``**kwargs`` unpacking.
 
@@ -2667,13 +2667,14 @@ class ASTParser:
         if call.args:
             core_num = _parse_core_num_node(call.args[0], call.args[0])
         sync_start: bool = False
+        level: ir.Level | None = None
         name_hint = ""
         for kw in call.keywords:
             if kw.arg is None:
                 # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
                 raise ParserSyntaxError(
                     "pl.spmd() does not accept **kwargs; pass core_num (positional) "
-                    "and sync_start=/name_hint= explicitly",
+                    "and sync_start=/level=/name_hint= explicitly",
                     span=self.span_tracker.get_span(kw.value),
                     hint=usage_hint,
                 )
@@ -2695,11 +2696,13 @@ class ASTParser:
                         hint=usage_hint,
                     )
                 sync_start = kw.value.value
+            elif kw.arg == "level":
+                level = extract_enum_value(kw.value, LEVEL_MAP, "Level", "pl.Level")
             else:
                 raise ParserSyntaxError(
                     f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
                     span=self.span_tracker.get_span(anchor),
-                    hint="Supported keywords: 'sync_start', 'name_hint'",
+                    hint="Supported keywords: 'sync_start', 'level', 'name_hint'",
                 )
         if core_num is None:
             raise ParserSyntaxError(
@@ -2707,7 +2710,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(anchor),
                 hint=usage_hint,
             )
-        return core_num, sync_start, name_hint
+        return core_num, sync_start, level, name_hint
 
     def _parse_spmd_scope(
         self,
@@ -2717,7 +2720,7 @@ class ASTParser:
     ) -> None:
         """Parse ``with pl.spmd(...):`` into a ScopeStmt(Spmd)."""
         with_hint = "Use 'with pl.spmd(4):' with a single function call inside."
-        core_num, sync_start, name_hint = self._parse_spmd_kwargs(stmt, context_expr, usage_hint=with_hint)
+        core_num, sync_start, level, name_hint = self._parse_spmd_kwargs(stmt, context_expr, usage_hint=with_hint)
         # Validate body is exactly one statement that is a function call.
         # The loop form (for i in pl.spmd(n):) is what accepts inline
         # multi-statement bodies.
@@ -2750,6 +2753,7 @@ class ASTParser:
             stmt,
             scope_kind,
             span,
+            level=level,
             name_hint=name_hint,
             core_num=core_num,
             sync_start=sync_start,
@@ -2786,12 +2790,13 @@ class ASTParser:
                     hint=spmd_hint,
                 )
 
-        core_num, sync_start, name_hint = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
+        core_num, sync_start, level, name_hint = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
 
         span = self.span_tracker.get_span(stmt)
         with self.builder.scope(
             ir.ScopeKind.Spmd,
             span,
+            level=level,
             name_hint=name_hint,
             core_num=core_num,
             sync_start=sync_start,

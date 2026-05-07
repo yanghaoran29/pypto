@@ -865,6 +865,14 @@ class SpmdScopeStmt : public ScopeStmt {
         sync_start_(sync_start) {
     INTERNAL_CHECK(core_num_ != nullptr) << "SpmdScopeStmt core_num must not be null";
   }
+  SpmdScopeStmt(ExprPtr core_num, bool sync_start, std::optional<Level> level, std::string name_hint,
+                StmtPtr body, Span span, std::vector<std::string> leading_comments = {})
+      : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments)),
+        core_num_(std::move(core_num)),
+        sync_start_(sync_start),
+        level_(level) {
+    INTERNAL_CHECK(core_num_ != nullptr) << "SpmdScopeStmt core_num must not be null";
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SpmdScopeStmt; }
   [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::Spmd; }
@@ -873,12 +881,14 @@ class SpmdScopeStmt : public ScopeStmt {
   static constexpr auto GetFieldDescriptors() {
     return std::tuple_cat(ScopeStmt::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&SpmdScopeStmt::core_num_, "core_num"),
-                                          reflection::UsualField(&SpmdScopeStmt::sync_start_, "sync_start")));
+                                          reflection::UsualField(&SpmdScopeStmt::sync_start_, "sync_start"),
+                                          reflection::UsualField(&SpmdScopeStmt::level_, "level")));
   }
 
  public:
   ExprPtr core_num_;  ///< SPMD block count expression
   bool sync_start_;   ///< Require sync-start for SPMD dispatch
+  std::optional<Level> level_;  ///< Optional hierarchy level hint
 };
 
 using SpmdScopeStmtPtr = std::shared_ptr<const SpmdScopeStmt>;

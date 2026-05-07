@@ -675,6 +675,8 @@ class ScopeOutliner : public IRMutator {
     if (auto hier = As<HierarchyScopeStmt>(op)) {
       outlined_level = hier->level_;
       outlined_role = hier->role_;
+    } else if (auto spmd = As<SpmdScopeStmt>(op)) {
+      outlined_level = spmd->level_;
     }
     auto outlined_func = std::make_shared<Function>(
         outlined_func_name, input_params, input_param_directions, return_types, outlined_body, op->span_,
