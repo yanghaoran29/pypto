@@ -184,6 +184,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/parent_stmt_analysis.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
+    src/ir/transforms/utils/inline_call_splice.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Reporter

@@ -392,6 +392,18 @@ class ScopeOutliner : public IRMutator {
   StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return VisitScopeKind(op); }
 
  private:
+  struct IncoreOutlineDepthGuard {
+    int* depth;
+    explicit IncoreOutlineDepthGuard(int* d) : depth(d) {
+      if (depth != nullptr) ++(*depth);
+    }
+    ~IncoreOutlineDepthGuard() {
+      if (depth != nullptr) --(*depth);
+    }
+    IncoreOutlineDepthGuard(const IncoreOutlineDepthGuard&) = delete;
+    IncoreOutlineDepthGuard& operator=(const IncoreOutlineDepthGuard&) = delete;
+  };
+
   /**
    * @brief Outline a single scope into a separate function.
    *
@@ -399,6 +411,19 @@ class ScopeOutliner : public IRMutator {
    * @param used_after Variables (by pointer) used in subsequent statements (determines outputs)
    */
   StmtPtr OutlineScope(const ScopeStmtPtr& op, const std::unordered_set<const Var*>& used_after) {
+    // While recursively visiting the body of an InCore kernel being outlined,
+    // nested InCore/AutoInCore scopes cannot become separate InCore callees:
+    // PTO codegen resolves Call sites as tile/tensor ops, not nested kernel
+    // calls. Splice inner scope bodies into the same outlined kernel.
+    if (outlined_func_type_ == FunctionType::InCore && target_scope_kind_ == ScopeKind::InCore &&
+        incore_outline_depth_ > 0 &&
+        (op->GetScopeKind() == ScopeKind::InCore || op->GetScopeKind() == ScopeKind::AutoInCore)) {
+      bool prev = std::exchange(inside_nested_scope_body_, true);
+      StmtPtr result = VisitStmt(op->body_);
+      inside_nested_scope_body_ = prev;
+      return result;
+    }
+
     // Generate function name: use user-provided hint when available, otherwise auto-generate.
     // On collision, auto-deduplicate with a numeric suffix (name_hint semantics).
     std::string outlined_func_name;
@@ -548,6 +573,9 @@ class ScopeOutliner : public IRMutator {
     for (const auto& var : output_vars) {
       required_outputs_.insert(var.get());
     }
+    IncoreOutlineDepthGuard incore_depth_guard(
+        (outlined_func_type_ == FunctionType::InCore && target_scope_kind_ == ScopeKind::InCore) ? &incore_outline_depth_
+                                                                                                 : nullptr);
     auto recursed_body = VisitStmt(op->body_);
     func_name_ = saved_func_name;
     scope_counter_ = saved_scope_counter;
@@ -965,6 +993,8 @@ class ScopeOutliner : public IRMutator {
   std::string name_suffix_;
   ProgramPtr program_;
   int scope_counter_ = 0;
+  /// Non-zero while ``OutlineScope`` is inside ``VisitStmt`` for an InCore kernel body.
+  int incore_outline_depth_ = 0;
   /// True while we are visiting the body of a non-target ScopeStmt — a
   /// target-kind scope encountered here cannot leak locally-defined vars to
   /// any surrounding context (scope boundaries confine them), so the

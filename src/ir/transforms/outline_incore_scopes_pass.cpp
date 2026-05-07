@@ -11,16 +11,20 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "pypto/core/error.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/inline_call_splice.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -28,6 +32,130 @@
 
 namespace pypto {
 namespace ir {
+
+namespace {
+
+/// True when \p callee_fn is an outlined InCore name nested under \p parent_fn
+/// (e.g. ``qwen3_decode_incore_13_incore_0`` under ``qwen3_decode_incore_13``).
+bool IsNestedOutlinedIncoreCallee(const std::string& parent_fn, const std::string& callee_fn) {
+  const std::string prefix = parent_fn + "_incore_";
+  return callee_fn.size() > prefix.size() && callee_fn.compare(0, prefix.size(), prefix) == 0;
+}
+
+/**
+ * Like InlineFunctions' mutator, but splices only ``Call(GlobalVar)`` to
+ * ``FunctionType::InCore`` callees whose names are nested under the caller
+ * (``parent_incore_N_incore_M``), then records those callees for removal.
+ */
+class NestedIncoreCallInlineMutator : public IRMutator {
+ public:
+  NestedIncoreCallInlineMutator(const std::unordered_map<std::string, FunctionPtr>& funcs, const std::string& caller_fn,
+                               std::unordered_set<std::string>* inlined_names)
+      : funcs_(funcs), caller_fn_(caller_fn), inlined_names_(inlined_names) {}
+
+  [[nodiscard]] bool Changed() const { return changed_; }
+
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    std::vector<StmtPtr> new_stmts;
+    bool any_changed = false;
+    for (const auto& stmt : op->stmts_) {
+      auto handled = HandleTopLevel(stmt);
+      if (handled.has_value()) {
+        for (auto& s : *handled) new_stmts.push_back(std::move(s));
+        any_changed = true;
+        changed_ = true;
+        continue;
+      }
+      auto recursed = VisitStmt(stmt);
+      if (recursed.get() != stmt.get()) any_changed = true;
+      new_stmts.push_back(recursed);
+    }
+    if (!any_changed) return op;
+    return SeqStmts::Flatten(std::move(new_stmts), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto handled = HandleTopLevel(op);
+    if (!handled.has_value()) return IRMutator::VisitStmt_(op);
+    changed_ = true;
+    return SeqStmts::Flatten(std::move(*handled), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto handled = HandleTopLevel(op);
+    if (!handled.has_value()) return IRMutator::VisitStmt_(op);
+    changed_ = true;
+    return SeqStmts::Flatten(std::move(*handled), op->span_);
+  }
+
+ private:
+  std::optional<std::vector<StmtPtr>> HandleTopLevel(const StmtPtr& stmt) {
+    auto call = transform_utils::GetCallFromStmt(stmt);
+    if (!call) return std::nullopt;
+    auto callee = LookupNestedIncoreCallee(call);
+    if (!callee) return std::nullopt;
+    inlined_names_->insert(callee->name_);
+    if (auto assign = As<AssignStmt>(stmt)) {
+      return inline_splice::SpliceInlineCall(callee, call->args_, assign->var_, assign->span_);
+    }
+    if (auto eval = As<EvalStmt>(stmt)) {
+      return inline_splice::SpliceInlineCall(callee, call->args_, /*lhs=*/nullptr, eval->span_);
+    }
+    return std::nullopt;
+  }
+
+  FunctionPtr LookupNestedIncoreCallee(const CallPtr& call) const {
+    auto gv = As<GlobalVar>(call->op_);
+    if (!gv) return nullptr;
+    auto it = funcs_.find(gv->name_);
+    if (it == funcs_.end()) return nullptr;
+    const auto& fn = it->second;
+    if (fn->func_type_ != FunctionType::InCore) return nullptr;
+    if (!IsNestedOutlinedIncoreCallee(caller_fn_, gv->name_)) return nullptr;
+    return fn;
+  }
+
+  const std::unordered_map<std::string, FunctionPtr>& funcs_;
+  std::string caller_fn_;
+  std::unordered_set<std::string>* inlined_names_;
+  bool changed_ = false;
+};
+
+void InlineNestedIncoreCalleesIntoParents(std::vector<FunctionPtr>& functions) {
+  for (;;) {
+    std::unordered_map<std::string, FunctionPtr> by_name;
+    for (const auto& f : functions) {
+      by_name[f->name_] = f;
+    }
+    std::unordered_set<std::string> inlined_this_round;
+    bool any_body_changed = false;
+    for (size_t i = 0; i < functions.size(); ++i) {
+      auto f = functions[i];
+      if (f->func_type_ != FunctionType::InCore) continue;
+      NestedIncoreCallInlineMutator mut(by_name, f->name_, &inlined_this_round);
+      StmtPtr nb = mut.VisitStmt(f->body_);
+      if (mut.Changed()) {
+        auto u = MutableCopy(f);
+        u->body_ = std::move(nb);
+        functions[i] = u;
+        by_name[u->name_] = u;
+        any_body_changed = true;
+      }
+    }
+    if (!inlined_this_round.empty()) {
+      std::vector<FunctionPtr> kept;
+      kept.reserve(functions.size());
+      for (const auto& f : functions) {
+        if (inlined_this_round.count(f->name_) > 0) continue;
+        kept.push_back(f);
+      }
+      functions = std::move(kept);
+    }
+    if (!any_body_changed) break;
+  }
+}
+
+}  // namespace
 
 namespace pass {
 
@@ -50,8 +178,12 @@ namespace pass {
  *    - Extract body into new Function(InCore) with appropriate params/returns
  *    - Replace scope with Call to the outlined function + output assignments
  *    - EvalStmt(store) calls on output tensors are converted to AssignStmt
- * 2. Recursively handles nested InCore scopes
- * 3. Add outlined functions to the program
+ * 2. Recursively transforms nested InCore bodies; scopes nested under an InCore
+ *    kernel being outlined are spliced inline (no nested InCore callee) so PTO
+ *    codegen never sees Call(GlobalVar) to another InCore kernel.
+ * 3. Add outlined functions to the program, then inline any remaining nested
+ *    InCore callees (``parent_incore_N_incore_M``) into their parent kernels and
+ *    drop the leaf functions — covers paths where nested scopes became Calls.
  * 4. Promote Opaque parents to Orchestration when at least one InCore scope is
  *    outlined. Orchestration parents stay Orchestration.
  */
@@ -103,6 +235,11 @@ Pass OutlineIncoreScopes() {
 
     // Add all outlined functions before the originals
     all_outlined_functions.insert(all_outlined_functions.end(), new_functions.begin(), new_functions.end());
+
+    // PTO codegen does not lower ``Call(GlobalVar)`` from one InCore kernel into
+    // another. If nested outlining still produced ``parent_incore_N_incore_M``
+    // callees, splice them into the parent body and drop the leaf functions.
+    InlineNestedIncoreCalleesIntoParents(all_outlined_functions);
 
     // Create new program with all functions
     return std::make_shared<Program>(all_outlined_functions, program->name_, program->span_);
