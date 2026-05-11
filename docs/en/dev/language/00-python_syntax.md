@@ -297,6 +297,9 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(MODE)])` | `AutoInCore` | AutoInCore + split hint (independent entries) |
 | `pl.at(level=pl.Level.HOST)` *(or any non-`CORE_GROUP` level)* | `Hierarchy` | Distributed hierarchy scope |
 | `pl.cluster()` | `Cluster` | Co-scheduled AIC+AIV group |
+| `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd` (for-form wraps inner `InCore`) | SPMD multi-block dispatch — see [pl.spmd](#plspmd-multi-block-dispatch) |
+| `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | Split hint applies to the inner InCore (both forms) |
+| `for i in pl.spmd(N, optimizations=[pl.auto_chunk])` | `Spmd(AutoInCore)` | for-form only — lifts inner InCore to AutoInCore |
 | `pl.manual_scope()` | `Runtime(manual=true)` | Orchestrator region where the user manages task ordering — see [Manual dependency primitives](#manual-dependency-primitives) |
 | `pl.incore()` *(deprecated)* | `InCore` | Use `pl.at(level=pl.Level.CORE_GROUP)` instead |
 | `pl.auto_incore(split=...)` *(deprecated)* | `AutoInCore` | Use `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(...)])` |
@@ -304,6 +307,20 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | `pl.at(..., split=...)` *(deprecated)* | `InCore` | Use `pl.at(..., optimizations=[pl.split(...)])` |
 
 See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples.
+
+#### `pl.spmd` multi-block dispatch
+
+`pl.spmd(N)` dispatches a kernel across `N` blocks. Two forms:
+
+- `with pl.spmd(N): kernel(...)` — body must be a single call to a pre-defined InCore kernel.
+- `for i in pl.spmd(N): ...` — loop variable binds the per-block index (`pl.tile.get_block_idx()`); the body is auto-outlined into a synthetic InCore region.
+
+Optional `optimizations=[...]` mirrors `pl.at`:
+
+| Entry | Form | Effect |
+| ----- | ---- | ------ |
+| `pl.split(MODE)` | both | Sets the inner InCore's `split_` field (cross-core transfer hint, consumed by `ExpandMixedKernel` / `LegalizePtoBufferReuse`). The with-form gains an inner `InCoreScopeStmt` wrapper around the call. |
+| `pl.auto_chunk` | for-form only | Lifts the auto-generated inner scope from `InCoreScopeStmt` to `AutoInCoreScopeStmt`, enabling `InterchangeChunkLoops` over chunked `pl.parallel(..., chunk=N)` loops in the body. The with-form rejects this entry — its body is a single call with no chunked loop to interchange. |
 
 ### Manual dependency primitives
 
