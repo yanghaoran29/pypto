@@ -332,30 +332,109 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
         lines.append("")
         var_names.append(param_name)
 
-    # Extract dynamic dimension values from tensor structs (shapes[] holds current view shape at runtime).
-    # Deduplicate by IR variable identity (same_as), not by name_hint, so that
-    # distinct Var objects sharing a cosmetic name are never incorrectly merged.
+    # Extract dynamic dimension values from tensor structs (shapes[] holds current
+    # view shape at runtime). Deduplicate by IR variable identity (same_as), not
+    # by name_hint, so that distinct Var objects sharing a cosmetic name are
+    # never incorrectly merged.
+    #
+    # NOTE:
+    # Tensor dims may be expressions (e.g. `batch_padded * 128`) rather than a
+    # bare Var. PTO codegen now collects Vars recursively from such expressions.
+    # For wrapper-side extraction we recover the Var value from the runtime shape
+    # using a small invertible subset (currently `Var` and `Var * ConstInt`).
+    # When inversion is not possible we still emit the dynamic arg (to match the
+    # MLIR signature) and fall back to the runtime shape at the source dim index.
     seen_dyn_vars: list[_ir_core.Var] = []
+    dyn_var_sources: dict[int, tuple[str, int, object]] = {}
     used_c_names: set[str] = set(var_names)
     used_c_names.update(f"{p.name_hint}_tensor" for p in tensor_params)
     used_c_names.update(f"{p.name_hint}_conv" for p in scalar_params)
+
+    def _collect_vars(expr: object) -> list[_ir_core.Var]:
+        if isinstance(expr, _ir_core.Var):
+            return [expr]
+        if isinstance(expr, _ir_core.BinaryExpr):
+            return _collect_vars(expr.left) + _collect_vars(expr.right)
+        if isinstance(expr, (_ir_core.UnaryExpr, _ir_core.Cast)):
+            return _collect_vars(expr.operand)
+        if isinstance(expr, _ir_core.Call):
+            out: list[_ir_core.Var] = []
+            for a in expr.args:
+                out.extend(_collect_vars(a))
+            return out
+        if isinstance(expr, _ir_core.TupleGetItemExpr):
+            return _collect_vars(expr.tuple)
+        return []
+
+    def _const_int_value(expr: object) -> int | None:
+        if isinstance(expr, _ir_core.ConstInt):
+            return int(expr.value)
+        return None
+
+    def _is_invertible_for_var(dim_expr: object, target_var: _ir_core.Var) -> bool:
+        if isinstance(dim_expr, _ir_core.Var) and dim_expr.same_as(target_var):
+            return True
+        if isinstance(dim_expr, _ir_core.Mul):
+            left, right = dim_expr.left, dim_expr.right
+            if isinstance(left, _ir_core.Var) and left.same_as(target_var):
+                c = _const_int_value(right)
+                return c is not None and c != 0
+            if isinstance(right, _ir_core.Var) and right.same_as(target_var):
+                c = _const_int_value(left)
+                return c is not None and c != 0
+        return False
+
+    def _extract_from_dim_expr(
+        dim_expr: object, target_var: _ir_core.Var, tensor_name: str, dim_idx: int
+    ) -> str | None:
+        shape_expr = f"static_cast<int64_t>({tensor_name}_tensor->shapes[{dim_idx}])"
+        # Direct mapping: dim is exactly the dynamic var.
+        if isinstance(dim_expr, _ir_core.Var) and dim_expr.same_as(target_var):
+            return shape_expr
+        # Invert common affine form: dim = var * C (or C * var).
+        if isinstance(dim_expr, _ir_core.Mul):
+            left, right = dim_expr.left, dim_expr.right
+            if isinstance(left, _ir_core.Var) and left.same_as(target_var):
+                c = _const_int_value(right)
+                if c is not None and c != 0:
+                    return f"({shape_expr} / {c})"
+            if isinstance(right, _ir_core.Var) and right.same_as(target_var):
+                c = _const_int_value(left)
+                if c is not None and c != 0:
+                    return f"({shape_expr} / {c})"
+        return None
+
     for param in tensor_params:
         assert isinstance(param.type, _ir_core.TensorType)
         for dim_idx, dim in enumerate(param.type.shape):
-            if isinstance(dim, _ir_core.Var) and not any(dim.same_as(v) for v in seen_dyn_vars):
-                seen_dyn_vars.append(dim)
-                var_name = dim.name_hint
+            for dyn_var in _collect_vars(dim):
+                existing = next((v for v in seen_dyn_vars if dyn_var.same_as(v)), None)
+                if existing is None:
+                    seen_dyn_vars.append(dyn_var)
+                    dyn_var_sources[id(dyn_var)] = (param.name_hint, dim_idx, dim)
+                    var_key = id(dyn_var)
+                else:
+                    var_key = id(existing)
+                    src_tensor, src_dim_idx, src_expr = dyn_var_sources[var_key]
+                    if (not _is_invertible_for_var(src_expr, existing)) and _is_invertible_for_var(
+                        dim, existing
+                    ):
+                        dyn_var_sources[var_key] = (param.name_hint, dim_idx, dim)
+                    continue
+
+                var_name = dyn_var.name_hint
                 if var_name in used_c_names:
                     suffix = 1
                     while f"{var_name}_{suffix}" in used_c_names:
                         suffix += 1
                     var_name = f"{var_name}_{suffix}"
                 used_c_names.add(var_name)
+                source_tensor, source_dim_idx, source_expr = dyn_var_sources[var_key]
+                value_expr = _extract_from_dim_expr(source_expr, dyn_var, source_tensor, source_dim_idx)
+                if value_expr is None:
+                    value_expr = f"static_cast<int64_t>({source_tensor}_tensor->shapes[{source_dim_idx}])"
                 lines.append(f"    // Extract dynamic dim: {var_name}")
-                lines.append(
-                    f"    int64_t {var_name} = static_cast<int64_t>"
-                    f"({param.name_hint}_tensor->shapes[{dim_idx}]);"
-                )
+                lines.append(f"    int64_t {var_name} = {value_expr};")
                 lines.append("")
                 var_names.append(var_name)
 

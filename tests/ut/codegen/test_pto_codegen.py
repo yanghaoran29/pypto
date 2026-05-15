@@ -44,6 +44,7 @@ PTOCodegen = codegen.PTOCodegen
 # pyright: reportUndefinedVariable=false
 _TH = pl.dynamic("TH")
 _TW = pl.dynamic("TW")
+_BATCH = pl.dynamic("BATCH")
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +80,26 @@ def _get_dyn_incore_func():
         if ir.is_incore_type(func.func_type):
             return func
     raise RuntimeError("No InCore function found in _DynKernel")
+
+
+def _get_dyn_expr_incore_func():
+    """Return transformed InCore function with shape dim expression (BATCH * 128)."""
+    span = ir.Span.unknown()
+    idx = DataType.INDEX
+    batch_var = ir.Var("BATCH", ir.ScalarType(idx), span)
+    dim_expr = ir.Mul(batch_var, ir.ConstInt(128, idx, span), idx, span)
+    tensor_ty = ir.TensorType([dim_expr, ir.ConstInt(128, idx, span)], DataType.BF16)
+
+    ib = IRBuilder()
+    with ib.function("dyn_expr_func", type=ir.FunctionType.InCore) as f:
+        q = f.param("q", tensor_ty)
+        out = f.param("out", tensor_ty)
+        q_tile = ib.let("q_tile", tile.load(q, [0, 0], [16, 128]))
+        ret = ib.let("ret", tile.store(q_tile, [0, 0], out))
+        f.return_type(tensor_ty)
+        ib.return_stmt(ret)
+
+    return f.get_result()
 
 
 def _get_mlir_code(result):
@@ -234,6 +255,19 @@ def test_pto_codegen_tensor_parameters():
     assert "shape = [%c64_index, %c64_index]" in mlir_code or "shape = [%c32_index, %c32_index]" in mlir_code
     assert "strides = " in mlir_code
     assert "!pto.tensor_view<?x?xf32>" in mlir_code
+
+
+def test_pto_codegen_collects_dynamic_var_from_shape_expr():
+    """Regression: dynamic var under shape expression must be appended as index arg."""
+    func = _get_dyn_expr_incore_func()
+    program = ir.Program([func], "dyn_expr_prog_checked", ir.Span.unknown())
+    mlir_code = _generate_mlir(program)
+
+    assert "func.func @dyn_expr_func(" in mlir_code
+    # q/out are tensor args (arg0/arg1); dynamic BATCH should be appended as arg2.
+    assert "%arg2: index" in mlir_code
+    # Shape's trailing static dim remains 128.
+    assert ", %c128_index]" in mlir_code
 
 
 def test_pto_codegen_alloc_tile():
@@ -830,6 +864,14 @@ class TestGenerateArgUnpacking:
         assert code.count("int64_t TH") == 1
         assert code.count("int64_t TW") == 1
 
+    def test_dynamic_tensor_expr_dim_extracts_base_var(self):
+        # Regression: for shape dim (BATCH * 128), wrapper should recover BATCH
+        # from runtime shape[0] as shapes[0] / 128.
+        func = _get_dyn_expr_incore_func()
+        code, names = _generate_arg_unpacking(func)
+        assert "int64_t BATCH = (static_cast<int64_t>(q_tensor->shapes[0]) / 128);" in code
+        assert names == ["q", "out", "BATCH"]
+
 
 class TestGenerateKernelWrapper:
     """Tests for _generate_kernel_wrapper."""
@@ -1094,6 +1136,75 @@ def test_pto_codegen_spmd_block_params_appended_with_named_ssas():
     spmd_idx_pos = signature_line.find("%__pypto_spmd_block_idx")
     assert arg0_pos != -1 and spmd_idx_pos != -1
     assert spmd_idx_pos > arg0_pos, f"SPMD param must come after user params: {signature_line}"
+
+
+_SPMD_BLOCK_ROWS = 128
+_ROWS = pl.dynamic("ROWS")
+
+
+@pl.program
+class _SpmdDynRowsProgram:
+    """pl.dynamic row dim with pl.spmd orchestration calling InCore (get_block_idx slice)."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def spmd_kernel(
+        self,
+        x: pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32],
+        out: pl.Out[pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32]],
+    ) -> pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32]:
+        bi = pl.tile.get_block_idx()
+        off = bi * _SPMD_BLOCK_ROWS
+        return pl.store(
+            pl.load(x, [off, 0], [_SPMD_BLOCK_ROWS, _SPMD_BLOCK_ROWS]),
+            [off, 0],
+            out,
+        )
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orch(
+        self,
+        x: pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32],
+        out: pl.Out[pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32]],
+    ) -> pl.Tensor[[_ROWS, _SPMD_BLOCK_ROWS], pl.FP32]:
+        with pl.spmd(4):
+            out = self.spmd_kernel(x, out)
+        return out
+
+
+def _get_spmd_dyn_expr_incore_func():
+    """InCore with rows=BATCH*128, get_block_idx, and SPMD block params after pl.spmd lowering."""
+    span = ir.Span.unknown()
+    idx = DataType.INDEX
+    batch = ir.Var("BATCH", ir.ScalarType(idx), span)
+    rows = ir.Mul(batch, ir.ConstInt(_SPMD_BLOCK_ROWS, idx, span), idx, span)
+    ty = ir.TensorType([rows, ir.ConstInt(_SPMD_BLOCK_ROWS, idx, span)], DataType.FP32)
+    ib = IRBuilder()
+    with ib.function("spmd_dyn_expr_k", type=ir.FunctionType.InCore) as f:
+        x = f.param("x", ty)
+        out = f.param("out", ty)
+        bi = f.param("__pypto_spmd_block_idx", ir.ScalarType(DataType.INT32))
+        _bn = f.param("__pypto_spmd_block_num", ir.ScalarType(DataType.INT32))
+        off = ib.let("off", ir.Cast(bi, DataType.INDEX, span) * _SPMD_BLOCK_ROWS)
+        xt = ib.let("xt", tile.load(x, [off, 0], [_SPMD_BLOCK_ROWS, _SPMD_BLOCK_ROWS]))
+        ret = ib.let("ret", tile.store(xt, [off, 0], out))
+        f.return_type(ty)
+        ib.return_stmt(ret)
+    return f.get_result()
+
+
+def test_pto_codegen_spmd_pl_dynamic_rows_unpack():
+    """pl.spmd + pl.dynamic rows: wrapper must recover BATCH via shapes[0]/128.
+
+    Fails on main (direct shapes[0] only); passes after spmd12 shape-expr fix.
+    """
+    spmd_func = _run_default_passes(_SpmdDynRowsProgram).get_function("spmd_kernel")
+    assert spmd_func is not None
+
+    code, names = _generate_arg_unpacking(_get_spmd_dyn_expr_incore_func())
+    assert "int64_t BATCH = (static_cast<int64_t>(x_tensor->shapes[0]) / 128);" in code, (
+        f"expected BATCH from shapes[0]/128, got:\n{code}"
+    )
+    assert names == ["x", "out", "__pypto_spmd_block_idx", "__pypto_spmd_block_num", "BATCH"]
 
 
 class TestGenerateSkipPtoas:

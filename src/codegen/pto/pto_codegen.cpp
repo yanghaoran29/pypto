@@ -115,6 +115,45 @@ bool HasDynamicTileValidShape(const std::shared_ptr<const ir::TileType>& tile_ty
   return valid_row_expr || valid_col_expr;
 }
 
+// Collect Vars referenced by an expression tree in first-seen order.
+// Needed for dynamic tensor-shape dims like `batch_padded__ssa_v0 * 128`,
+// where the Var is nested under arithmetic nodes rather than appearing as
+// the top-level dim expression.
+void CollectVarsFromExpr(const ExprPtr& expr, std::set<const ir::Var*>& seen, std::vector<VarPtr>& out) {
+  if (!expr) {
+    return;
+  }
+  if (auto var = As<ir::Var>(expr)) {
+    if (seen.insert(var.get()).second) {
+      out.push_back(var);
+    }
+    return;
+  }
+  if (auto binary = As<ir::BinaryExpr>(expr)) {
+    CollectVarsFromExpr(binary->left_, seen, out);
+    CollectVarsFromExpr(binary->right_, seen, out);
+    return;
+  }
+  if (auto unary = As<ir::UnaryExpr>(expr)) {
+    CollectVarsFromExpr(unary->operand_, seen, out);
+    return;
+  }
+  if (auto cast = As<ir::Cast>(expr)) {
+    CollectVarsFromExpr(cast->operand_, seen, out);
+    return;
+  }
+  if (auto call = As<ir::Call>(expr)) {
+    for (const auto& arg : call->args_) {
+      CollectVarsFromExpr(arg, seen, out);
+    }
+    return;
+  }
+  if (auto tget = As<ir::TupleGetItemExpr>(expr)) {
+    CollectVarsFromExpr(tget->tuple_, seen, out);
+    return;
+  }
+}
+
 int GetGMPipeSlotCount(int dir_mask) {
   const int bidirectional = ir::core_affinity::kDirMaskC2V | ir::core_affinity::kDirMaskV2C;
   if (dir_mask == bidirectional) {
@@ -352,20 +391,16 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
   // Also reserve extra %argN for dynamic dimension parameters
   {
-    size_t extra = 0;
+    std::set<const ir::Var*> seen;
+    std::vector<VarPtr> reserved_dyn_vars;
     for (const auto& param : func->params_) {
       if (auto tensor_type = As<TensorType>(param->GetType())) {
-        std::set<const ir::Var*> seen;
         for (const auto& dim : tensor_type->shape_) {
-          if (auto var = As<ir::Var>(dim)) {
-            if (seen.insert(GetVarKey(var)).second) {
-              extra++;
-            }
-          }
+          CollectVarsFromExpr(dim, seen, reserved_dyn_vars);
         }
       }
     }
-    for (size_t i = 0; i < extra; i++) {
+    for (size_t i = 0; i < reserved_dyn_vars.size(); i++) {
       fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + i));
     }
   }
@@ -418,11 +453,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     for (const auto& param : func->params_) {
       if (auto tensor_type = As<TensorType>(param->GetType())) {
         for (const auto& dim : tensor_type->shape_) {
-          if (auto var = As<ir::Var>(dim)) {
-            if (seen_dyn_vars.insert(GetVarKey(var)).second) {
-              dyn_vars.push_back(var);
-            }
-          }
+          CollectVarsFromExpr(dim, seen_dyn_vars, dyn_vars);
         }
       }
     }
