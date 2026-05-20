@@ -594,5 +594,322 @@ class TestSpmdForLoop:
         parse_program(printed)  # round-trips cleanly
 
 
+class TestSpmdOptimizations:
+    """Test ``pl.spmd(..., optimizations=[...])`` lowering.
+
+    Mirrors ``pl.at(..., optimizations=[...])``: ``pl.split(mode)`` lands on
+    the inner InCore/AutoInCore ``split_`` field; ``pl.auto_chunk`` lifts the
+    inner scope from ``InCoreScopeStmt`` to ``AutoInCoreScopeStmt``.
+    """
+
+    @staticmethod
+    def _unique_descendant(node, cls):
+        found = []
+
+        def walk(n):
+            if isinstance(n, cls):
+                found.append(n)
+            if isinstance(n, ir.SeqStmts):
+                for s in n.stmts:
+                    walk(s)
+            elif hasattr(n, "body") and n.body is not None:
+                walk(n.body)
+
+        walk(node)
+        assert len(found) == 1, f"expected exactly one {cls.__name__}, got {len(found)}"
+        return found[0]
+
+    def test_for_spmd_split_sets_inner_incore_split(self):
+        """``optimizations=[pl.split(mode)]`` on the for-form sets ``split_``
+        on the auto-generated inner ``InCoreScopeStmt``."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+                    offset = i * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        incore = self._unique_descendant(spmd.body, ir.InCoreScopeStmt)
+        assert incore.split == ir.SplitMode.UP_DOWN
+        body = incore.body
+        first_stmt = body.stmts[0] if isinstance(body, ir.SeqStmts) else body
+        assert isinstance(first_stmt, ir.AssignStmt)
+        call = first_stmt.value
+        assert isinstance(call, ir.Call) and isinstance(call.op, ir.Op)
+        assert call.op.name == "tile.get_block_idx"
+
+    def test_for_spmd_qualified_split_sets_inner_incore_split(self):
+        """``pl.optimizations.split(...)`` is accepted on the for-form."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(
+                    4,
+                    optimizations=[pl.optimizations.split(pl.SplitMode.LEFT_RIGHT)],
+                ):
+                    offset = i * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        incore = self._unique_descendant(spmd.body, ir.InCoreScopeStmt)
+        assert incore.split == ir.SplitMode.LEFT_RIGHT
+
+    def test_for_spmd_auto_chunk_lifts_inner_to_auto_incore(self):
+        """``optimizations=[pl.auto_chunk]`` lifts the inner scope from
+        ``InCoreScopeStmt`` to ``AutoInCoreScopeStmt``."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[pl.auto_chunk]):
+                    offset = i * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        auto_incore = self._unique_descendant(spmd.body, ir.AutoInCoreScopeStmt)
+        assert auto_incore.split is None
+
+    def test_for_spmd_auto_chunk_with_split_combines(self):
+        """``[pl.auto_chunk, pl.split(mode)]`` produces ``AutoInCoreScopeStmt``
+        with ``split_`` set."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(
+                    4,
+                    optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.LEFT_RIGHT)],
+                ):
+                    offset = i * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        auto_incore = self._unique_descendant(spmd.body, ir.AutoInCoreScopeStmt)
+        assert auto_incore.split == ir.SplitMode.LEFT_RIGHT
+
+    def test_for_spmd_empty_optimizations_matches_no_kwarg(self):
+        """``optimizations=[]`` is equivalent to omitting the kwarg — inner
+        scope is plain ``InCoreScopeStmt`` with ``split_=None``."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[]):
+                    offset = i * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(t, [offset, 0], out)
+                return out
+
+        main_func = list(Prog.functions.values())[0]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        incore = self._unique_descendant(spmd.body, ir.InCoreScopeStmt)
+        assert incore.split is None
+
+    def test_with_spmd_split_wraps_call_in_incore(self):
+        """``with pl.spmd(N, optimizations=[pl.split(mode)]):`` wraps the
+        single call in an ``InCoreScopeStmt(split_=mode)`` under the spmd."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    out = pl.add(a, a)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+                    out = self.kernel(a, out)
+                return out
+
+        main_func = list(Prog.functions.values())[-1]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        incore = self._unique_descendant(spmd.body, ir.InCoreScopeStmt)
+        assert incore.split == ir.SplitMode.UP_DOWN
+
+    def test_with_spmd_auto_chunk_rejected(self):
+        """``pl.auto_chunk`` is for-form only; with-form must reject it."""
+        with pytest.raises(ParserSyntaxError, match="auto_chunk is only valid for the for-form"):
+
+            @pl.program
+            class _Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    a: pl.Tensor[[64], pl.FP32],
+                    out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                ) -> pl.Tensor[[64], pl.FP32]:
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        out = pl.add(a, a)
+                    return out
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(
+                    self,
+                    a: pl.Tensor[[64], pl.FP32],
+                    out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                ) -> pl.Tensor[[64], pl.FP32]:
+                    with pl.spmd(4, optimizations=[pl.auto_chunk]):
+                        out = self.kernel(a, out)
+                    return out
+
+    def test_with_spmd_no_optimizations_preserves_ir_shape(self):
+        """Regression: omitting optimizations keeps the historical IR shape
+        (no implicit InCore wrapper around the single call)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    out = pl.add(a, a)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.spmd(4):
+                    out = self.kernel(a, out)
+                return out
+
+        main_func = list(Prog.functions.values())[-1]
+        spmd = self._unique_descendant(main_func.body, ir.SpmdScopeStmt)
+        found_incore = []
+
+        def walk(n):
+            if isinstance(n, ir.InCoreScopeStmt):
+                found_incore.append(n)
+            if isinstance(n, ir.SeqStmts):
+                for s in n.stmts:
+                    walk(s)
+            elif hasattr(n, "body") and n.body is not None:
+                walk(n.body)
+
+        walk(spmd.body)
+        assert not found_incore, "with-form without optimizations must not insert an InCoreScopeStmt"
+
+    def test_spmd_rejects_unknown_optimization_entry(self):
+        """Entries other than ``pl.auto_chunk`` / ``pl.split(...)`` are rejected."""
+        with pytest.raises(ParserSyntaxError, match="Unsupported entry"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[pl.range]):  # type: ignore[list-item]
+                    _ = i
+                return a
+
+    def test_spmd_rejects_duplicate_auto_chunk(self):
+        """Duplicate ``pl.auto_chunk`` in the list is rejected."""
+        with pytest.raises(ParserSyntaxError, match=r"Duplicate.*auto_chunk"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[pl.auto_chunk, pl.auto_chunk]):
+                    _ = i
+                return a
+
+    def test_spmd_rejects_duplicate_split(self):
+        """Duplicate ``pl.split(...)`` in the list is rejected."""
+        with pytest.raises(ParserSyntaxError, match=r"Duplicate 'pl\.split"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(
+                    4,
+                    optimizations=[
+                        pl.split(pl.SplitMode.UP_DOWN),
+                        pl.split(pl.SplitMode.LEFT_RIGHT),
+                    ],
+                ):
+                    _ = i
+                return a
+
+    def test_spmd_rejects_non_list_optimizations(self):
+        """``optimizations=`` must be a list literal."""
+        with pytest.raises(ParserSyntaxError, match="must be a list literal"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(4, optimizations=pl.auto_chunk):  # type: ignore[arg-type]
+                    _ = i
+                return a
+
+    def test_spmd_non_list_optimizations_error_names_api(self):
+        """Invalid ``pl.spmd`` optimizations errors mention ``pl.spmd``, not ``pl.at``."""
+        with pytest.raises(ParserSyntaxError, match=r"pl\.spmd\(optimizations"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(4, optimizations=pl.auto_chunk):  # type: ignore[arg-type]
+                    _ = i
+                return a
+
+    def test_spmd_unsupported_entry_error_names_api(self):
+        """Unknown ``pl.spmd`` optimization entries mention ``pl.spmd``."""
+        with pytest.raises(ParserSyntaxError, match=r"Unsupported entry in pl\.spmd"):
+
+            @pl.function
+            def bad(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.spmd(4, optimizations=[42]):  # type: ignore[list-item]
+                    _ = i
+                return a
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
