@@ -255,6 +255,7 @@ _COL_EXPAND_OPS = [
     ("col_expand_mul", tensor_ops.col_expand_mul, tile_ops.col_expand_mul),
     ("col_expand_div", tensor_ops.col_expand_div, tile_ops.col_expand_div),
     ("col_expand_sub", tensor_ops.col_expand_sub, tile_ops.col_expand_sub),
+    ("col_expand_add", tensor_ops.col_expand_add, tile_ops.col_expand_add),
     ("col_expand", tensor_ops.col_expand, tile_ops.col_expand),
 ]
 
