@@ -384,10 +384,17 @@ class TestAllocCleanup:
 
 
 class TestDtype:
-    """Tests that tiles with different dtypes do NOT reuse each other's memory."""
+    """Tiles with different dtypes CAN reuse each other's memory.
 
-    def test_cross_dtype_no_reuse_same_dtype_reuse(self):
-        """Cross-dtype reuse forbidden; same-dtype tiles reuse within their group."""
+    PTO codegen binds a per-var alloc_tile to each tile, so a BF16 tile may
+    alias the buffer of a now-dead FP32 tile (each alloc_tile carries its own
+    dtype/shape at the shared base). The former dtype-match reuse gate has
+    been removed; in-place read-while-write hazards are handled by
+    not_inplace_safe()/forbid_output_alias() instead.
+    """
+
+    def test_cross_dtype_can_reuse(self):
+        """All tiles collapse onto one buffer regardless of FP32/BF16 dtype."""
 
         @pl.program
         class Before:
@@ -407,8 +414,9 @@ class TestDtype:
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_e, [0, 0], output)
                 return result
 
-        # FP32 group (tile_a, tile_b) shares mem_vec_2 (16384 bytes).
-        # BF16 group (tile_cast, tile_d, tile_e) shares mem_vec_4 (8192 bytes).
+        # With the dtype gate removed, all tiles chain-reuse one buffer:
+        # tile_a/tile_b (FP32) and tile_cast/tile_d/tile_e (BF16) all share
+        # mem_vec_2 (16384 bytes — sized for the largest, FP32, occupant).
         @pl.program
         class Expected:
             @pl.function
@@ -418,20 +426,19 @@ class TestDtype:
                 output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
                     input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
                 )
-                tile_cast: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
+                tile_cast: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.cast(tile_b, target_type=pl.BF16, mode="round")
                 )
-                tile_d: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = pl.tile.add(
+                tile_d: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_cast, tile_cast
                 )
-                tile_e: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = pl.tile.add(
+                tile_e: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_d, tile_d
                 )
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
@@ -444,10 +451,18 @@ class TestDtype:
 
 
 class TestFillpad:
-    """Tests that fillpad output does NOT reuse input due to TileView differences."""
+    """fillpad outputs CAN reuse memory across differing TileView attributes.
 
-    def test_fillpad_output_incompatible_with_input(self):
-        """fillpad changes valid_shape and pad: output cannot reuse input."""
+    fillpad is a view/in-place-safe op (tile.fillpad aliases its input MemRef),
+    so its padded output may share the input tile's buffer, and two padded
+    tiles with different pad values may share one buffer too — differing
+    TileView fields no longer block reuse now that the storage-attribute gate
+    is gone. Each tile keeps its own view on its own alloc_tile at the shared
+    base.
+    """
+
+    def test_fillpad_output_can_reuse_input(self):
+        """fillpad output (pad view) reuses the input tile's buffer."""
 
         @pl.program
         class Before:
@@ -466,8 +481,9 @@ class TestFillpad:
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(padded, [0, 0], output)
                 return result
 
-        # tile_a uses mem_vec_2 (valid_shape=[48, 64]); padded uses mem_vec_3
-        # because the TileView changes from valid_shape=[48,64] to a padded view.
+        # tile_a (valid_shape=[48, 64]) and padded (pad view) both bind to
+        # mem_vec_2: the differing TileView no longer blocks reuse, and fillpad
+        # is in-place-safe so the output may alias its consumed input's buffer.
         @pl.program
         class Expected:
             @pl.function
@@ -477,7 +493,6 @@ class TestFillpad:
                 output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -490,7 +505,7 @@ class TestFillpad:
                 padded: pl.Tile[
                     [64, 64],
                     pl.FP32,
-                    pl.MemRef(mem_vec_3, 0, 16384),
+                    pl.MemRef(mem_vec_2, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(pad=pl.PadValue.max),
                 ] = pl.tile.fillpad(tile_a, pad_value=pl.PadValue.max)
@@ -502,8 +517,8 @@ class TestFillpad:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
 
-    def test_fillpad_different_pad_no_reuse(self):
-        """Two fillpad outputs with different pad values cannot reuse each other."""
+    def test_fillpad_different_pad_can_reuse(self):
+        """Two fillpad outputs with different pad values share one buffer."""
 
         @pl.program
         class Before:
@@ -530,9 +545,9 @@ class TestFillpad:
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(padded_min, [0, 0], output_b)
                 return result
 
-        # tile_a/tile_b share mem_vec_3 (same valid_shape view).
-        # padded_max uses mem_vec_4 (PadValue.max). padded_min uses mem_vec_6
-        # (PadValue.min) — different padding views can't share.
+        # All four tiles chain-reuse mem_vec_3: tile_a/tile_b (valid_shape view)
+        # and padded_max/padded_min (different pad views) have non-overlapping
+        # lifetimes, and the differing TileView no longer blocks sharing.
         @pl.program
         class Expected:
             @pl.function
@@ -543,8 +558,6 @@ class TestFillpad:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -557,7 +570,7 @@ class TestFillpad:
                 padded_max: pl.Tile[
                     [64, 64],
                     pl.FP32,
-                    pl.MemRef(mem_vec_4, 0, 16384),
+                    pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(pad=pl.PadValue.max),
                 ] = pl.tile.fillpad(tile_a, pad_value=pl.PadValue.max)
@@ -576,7 +589,7 @@ class TestFillpad:
                 padded_min: pl.Tile[
                     [64, 64],
                     pl.FP32,
-                    pl.MemRef(mem_vec_6, 0, 16384),
+                    pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(pad=pl.PadValue.min),
                 ] = pl.tile.fillpad(tile_b, pad_value=pl.PadValue.min)
@@ -616,8 +629,8 @@ class TestFillpad:
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(padded_b, [0, 0], output_b)
                 return result
 
-        # tile_a/tile_b share mem_vec_3 (same view).
-        # padded_a/padded_b share mem_vec_4 (same PadValue.max view).
+        # All four tiles share mem_vec_3: tile_a/tile_b (valid_shape view) and
+        # padded_a/padded_b (identical PadValue.max view) chain-reuse one buffer.
         @pl.program
         class Expected:
             @pl.function
@@ -628,7 +641,6 @@ class TestFillpad:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -641,7 +653,7 @@ class TestFillpad:
                 padded_a: pl.Tile[
                     [64, 64],
                     pl.FP32,
-                    pl.MemRef(mem_vec_4, 0, 16384),
+                    pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(pad=pl.PadValue.max),
                 ] = pl.tile.fillpad(tile_a, pad_value=pl.PadValue.max)
@@ -660,7 +672,7 @@ class TestFillpad:
                 padded_b: pl.Tile[
                     [64, 64],
                     pl.FP32,
-                    pl.MemRef(mem_vec_4, 0, 16384),
+                    pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(pad=pl.PadValue.max),
                 ] = pl.tile.fillpad(tile_b, pad_value=pl.PadValue.max)
@@ -743,8 +755,8 @@ class TestValidShapeDivergence:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
 
-    def test_non_2d_divergent_valid_shape_blocks_reuse(self):
-        """3D tiles with divergent ``valid_shape`` must NOT reuse (set_validshape is 2D-only)."""
+    def test_non_2d_divergent_valid_shape_can_reuse(self):
+        """3D tiles with divergent ``valid_shape`` share a MemRef (gate removed)."""
 
         @pl.program
         class Before:
@@ -767,16 +779,18 @@ class TestValidShapeDivergence:
 
         After = _run_pipeline(Before)
         # Collect base_ptr names from every tile AssignStmt in the After IR.
-        # 3D tiles with divergent valid_shape must NOT share a MemRef — the
-        # compatibility check's 2D guard keeps them on the strict path.
+        # With the reuse-compatibility gate removed, 3D tiles with divergent
+        # valid_shape share a MemRef: each keeps its own valid_shape on its own
+        # alloc_tile at the shared base (per-use metadata, not storage identity).
         bases = _collect_tile_memref_bases(After)
         tile_a_base = bases.get("tile_a")
         tile_b_base = bases.get("tile_b")
         assert tile_a_base is not None and tile_b_base is not None, (
             f"Expected tile_a and tile_b in After IR; got bases: {bases}"
         )
-        assert tile_a_base != tile_b_base, (
-            f"3D divergent-valid_shape tiles should NOT share a MemRef, but both bind to {tile_a_base}"
+        assert tile_a_base == tile_b_base, (
+            f"3D divergent-valid_shape tiles should share a MemRef, but bind to "
+            f"{tile_a_base} and {tile_b_base}"
         )
 
     def test_view_present_vs_absent_can_reuse(self):
@@ -3055,6 +3069,235 @@ class TestAscend910BLoadTpopHazard:
             "Ascend950 has no load+tpop hazard, so MemoryReuse should in-place-reuse the "
             f"load buffer for the tile.add output; got down_next={bases['down_next']} "
             f"down_prev={bases['down_prev']}"
+        )
+
+
+class TestForbidOutputAlias:
+    """A tile.sel output must not alias its mask (arg 0) or tmp (arg 3) buffer.
+
+    The TSEL intrinsic reads the predicate mask and the tmp scratch while
+    writing dst, so an in-place write onto either would corrupt the op
+    mid-flight (wrong select results on Ascend a2a3). tile.sel declares these
+    via OpRegistryEntry::forbid_output_alias(); MemoryReuse honours the marker
+    even when shape/dtype would otherwise permit the reuse.
+    """
+
+    def test_sel_output_does_not_alias_mask_or_tmp(self):
+        """dst skips the mask buffer (large enough to hold it) and reuses a value operand."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[1, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                # t1 (FP32 16x16, 1024B) dies at the cmp, so its buffer is free
+                # and large enough for the sel output. The mask reuses it; the
+                # forbid_output_alias marker is the only thing keeping dst off it.
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                t1: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                t2: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmp(t1, t2, cmp_type=0)
+                tmp: pl.Tile[[1, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [1, 32])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sel(mask, t2, t2, tmp)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+
+        # The mask reuses the dead 1024B FP32 buffer — big enough to hold dst —
+        # so without the marker the greedy allocator would place dst there.
+        assert bases["dst"] != bases["mask"], (
+            f"tile.sel output must not alias its mask buffer, but both bind to {bases['dst']}"
+        )
+        assert bases["dst"] != bases["tmp"], (
+            f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
+        )
+
+    def test_row_sum_output_does_not_alias_input_or_tmp(self):
+        """A row reduction output must not share a buffer with its input or tmp.
+
+        ``tile.row_sum`` reads the full input row and the tmp scratch while
+        writing the reduced ``[M, 1]`` output, so it is ``not_inplace_safe``.
+        Here ``sq`` (the squared input, reusing ``t0``) and ``tmp`` both die at
+        the reduction and are large enough to hold the small output, so without
+        the marker the greedy allocator would place ``s`` on one of them.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                sq: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.mul(t0, t0)
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                s: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.row_sum(sq, tmp)
+                res: pl.Tensor[[16, 1], pl.FP32] = pl.store(s, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("s", "sq", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["s"] != bases["sq"], (
+            f"row_sum output must not alias its input buffer, but both bind to {bases['s']}"
+        )
+        assert bases["s"] != bases["tmp"], (
+            f"row_sum output must not alias its tmp buffer, but both bind to {bases['s']}"
+        )
+
+    def test_forbidden_input_reached_through_view_is_honored(self):
+        """A not_inplace_safe op reading a VIEW of its input must still not alias it.
+
+        ``tile.recip`` is ``not_inplace_safe``. Its input ``v`` is a reshape
+        *view* of ``t0`` (sharing ``t0``'s MemRef base), and ``t0`` dies at the
+        recip, so the recip output ``r`` is the same size and would greedily
+        reuse ``t0``'s buffer. A Var-identity-only guard misses this (``v`` is a
+        view with no reuse-map entry); the guard must resolve the operand to its
+        physical base and keep ``r`` off it. Mirrors the on-device gather /
+        qk_recip corruption the gate removal exposed.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[8, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+            ) -> pl.Tensor[[8, 8], pl.FP32]:
+                t0: pl.Tile[[8, 8], pl.FP32, pl.MemorySpace.Vec] = pl.load(x, [0, 0], [8, 8])
+                v: pl.Tile[[64, 1], pl.FP32, pl.MemorySpace.Vec] = pl.reshape(t0, [64, 1])
+                r: pl.Tile[[64, 1], pl.FP32, pl.MemorySpace.Vec] = pl.recip(v)
+                r2: pl.Tile[[8, 8], pl.FP32, pl.MemorySpace.Vec] = pl.reshape(r, [8, 8])
+                res: pl.Tensor[[8, 8], pl.FP32] = pl.store(r2, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("r", "t0", "v"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        # ``v`` shares ``t0``'s base (it is a view); the recip output must not
+        # land on that physical buffer even though ``v`` itself is the operand.
+        assert bases["r"] != bases["t0"], (
+            f"recip output must not alias its (viewed) input's buffer, but both bind to {bases['r']}"
+        )
+
+    def test_widening_cast_output_does_not_alias_input(self):
+        """A dtype-widening cast output must not alias its (narrower) input.
+
+        Element i is read at ``i*in_bytes`` but written at ``i*out_bytes``; with
+        the output wider, the write cursor outruns the read cursor and clobbers
+        input elements not yet converted. The bf16 input here reuses a dead FP32
+        buffer (cross-dtype reuse) so it is large enough to hold the FP32 output,
+        making the in-place upcast reachable — the guard must forbid it.
+        Narrowing / same-width casts stay in-place-safe.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[8, 16], pl.FP32],
+                b: pl.Tensor[[8, 16], pl.BF16],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                t0: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [8, 16])
+                _dead: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                bf: pl.Tile[[8, 16], pl.BF16, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [8, 16])
+                r: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.cast(bf, target_type=pl.FP32)
+                res: pl.Tensor[[8, 16], pl.FP32] = pl.store(r, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("r", "bf"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["r"] != bases["bf"], (
+            f"widening cast output must not alias its input buffer, but both bind to {bases['r']}"
+        )
+
+    def test_col_expand_mul_output_does_not_alias_col_vector(self):
+        """col_expand_mul output must not alias its broadcast column vector.
+
+        ``out[i, j] = target[i, j] * col[0, j]`` re-reads the column vector for
+        every output row, so an output that aliases the column buffer overwrites
+        it after row 0 and multiplies later rows by garbage. ``col`` here is a
+        view of a dead [8, 16] tile, so its buffer is large enough for the output
+        to greedily reuse — the forbid_output_alias(1) marker must prevent it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[8, 16], pl.FP32],
+                c: pl.Tensor[[8, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                t0: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [8, 16])
+                tgt: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                cbig: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(c, [0, 0], [8, 16])
+                col_src: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(cbig, cbig)
+                col: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.slice(col_src, [1, 16], [0, 0])
+                r: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.col_expand_mul(tgt, col)
+                res: pl.Tensor[[8, 16], pl.FP32] = pl.store(r, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("r", "col", "col_src"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        # ``col`` is a view of ``col_src``; the expand output must not land on
+        # that physical buffer (it re-reads the column for every row).
+        assert bases["r"] != bases["col_src"], (
+            f"col_expand_mul output must not alias its column vector's buffer, but both bind to {bases['r']}"
+        )
+
+    def test_rsqrt_output_does_not_alias_input(self):
+        """tile.rsqrt output must not alias its input (``not_inplace_safe``).
+
+        Like ``tile.recip``, ``rsqrt``'s high-precision lowering reads the input
+        while writing the output, so it is marked ``not_inplace_safe`` (the tmp
+        scratch is injected by a later pass, so at MemoryReuse the only operand
+        is the input). ``sq`` (reusing ``t0``) dies at the rsqrt and is the same
+        size as the output, so without the marker the output would reuse it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                sq: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.mul(t0, t0)
+                r: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.rsqrt(sq)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(r, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("r", "sq"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["r"] != bases["sq"], (
+            f"rsqrt output must not alias its input buffer, but both bind to {bases['r']}"
         )
 
 
