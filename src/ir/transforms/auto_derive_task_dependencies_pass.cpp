@@ -1333,9 +1333,8 @@ class AutoDepMutator : public IRMutator {
       }
       return VisitStmt(body);
     }
-    return AnalyzeRuntimeScopeBody(body, /*manual=*/false, /*name_hint=*/"", body->span_,
-                                   /*is_virtual_whole_body=*/true, /*original_scope=*/nullptr,
-                                   std::vector<std::string>{},
+    return AnalyzeRuntimeScopeBody(body, /*name_hint=*/"", body->span_, /*is_virtual_whole_body=*/true,
+                                   /*original_scope=*/nullptr, std::vector<std::string>{},
                                    std::vector<std::pair<std::string, std::any>>{});
   }
 
@@ -1395,13 +1394,11 @@ class AutoDepMutator : public IRMutator {
 
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
     MarkCurrentScopeLayerUnsupported();
-    // Manual scopes still inspect user-covered read-only inputs for NoDep,
-    // but never synthesize compiler dependency edges for the scope.
-    if (!op->manual_ && !analyze_auto_scopes_) {
+    if (op->manual_ || !analyze_auto_scopes_) {
       return op;
     }
-    return AnalyzeRuntimeScopeBody(op->body_, op->manual_, op->name_hint_, op->span_,
-                                   /*is_virtual_whole_body=*/false, op, op->leading_comments_, op->attrs_);
+    return AnalyzeRuntimeScopeBody(op->body_, op->name_hint_, op->span_, /*is_virtual_whole_body=*/false, op,
+                                   op->leading_comments_, op->attrs_);
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
@@ -1412,13 +1409,12 @@ class AutoDepMutator : public IRMutator {
     return result;
   }
 
-  StmtPtr AnalyzeRuntimeScopeBody(const StmtPtr& body, bool manual, const std::string& name_hint,
-                                  const Span& span, bool is_virtual_whole_body,
-                                  const RuntimeScopeStmtPtr& original_scope,
+  StmtPtr AnalyzeRuntimeScopeBody(const StmtPtr& body, const std::string& name_hint, const Span& span,
+                                  bool is_virtual_whole_body, const RuntimeScopeStmtPtr& original_scope,
                                   std::vector<std::string> leading_comments,
                                   std::vector<std::pair<std::string, std::any>> attrs) {
     prior_stack_.emplace_back();
-    scope_manual_stack_.push_back(manual);
+    active_scope_stack_.push_back(true);
     fallback_stack_.push_back(false);
     auto_no_dep_candidate_count_stack_.push_back(0);
     layer_task_call_count_stack_.push_back(0);
@@ -1435,7 +1431,7 @@ class AutoDepMutator : public IRMutator {
     layer_task_call_count_stack_.pop_back();
     auto_no_dep_candidate_count_stack_.pop_back();
     fallback_stack_.pop_back();
-    scope_manual_stack_.pop_back();
+    active_scope_stack_.pop_back();
     prior_stack_.pop_back();
     if (is_virtual_whole_body) {
       whole_body_manual_candidate_ = !fallback && !layer_unsupported && layer_task_call_count > 0;
@@ -1465,7 +1461,7 @@ class AutoDepMutator : public IRMutator {
     }
     if (is_virtual_whole_body) return new_body;
     if (new_body.get() != body.get()) {
-      return std::make_shared<const RuntimeScopeStmt>(manual, name_hint, std::move(new_body), span,
+      return std::make_shared<const RuntimeScopeStmt>(false, name_hint, std::move(new_body), span,
                                                       std::move(leading_comments), std::move(attrs));
     }
     return original_scope ? original_scope : body;
@@ -1622,7 +1618,7 @@ class AutoDepMutator : public IRMutator {
 
   ExprPtr AnalyzeCallLike(const CallPtr& call, const Expr* identity_key,
                           const std::vector<std::pair<std::string, std::any>>& output_attrs) {
-    if (prior_stack_.empty() || scope_manual_stack_.empty()) return call;
+    if (prior_stack_.empty() || active_scope_stack_.empty()) return call;
     if (IsBuiltinOp(call->op_->name_)) return call;
     if (!layer_task_call_count_stack_.empty()) {
       ++layer_task_call_count_stack_.back();
@@ -1632,18 +1628,14 @@ class AutoDepMutator : public IRMutator {
     }
 
     VarPtr task_id = LookupTaskId(identity_key);
-    const bool in_manual_scope = !scope_manual_stack_.empty() && scope_manual_stack_.back();
     if (!task_id) {
-      if (!in_manual_scope || IsTaskIdVar(current_assign_lhs_)) {
-        task_id = current_assign_lhs_;
-      }
+      task_id = current_assign_lhs_;
     }
     bool needs_fallback = false;
     auto raw_user_edges = GetDepAttr(call, kAttrManualDepEdges);
     auto user_edges = CanonicalizeTaskIds(raw_user_edges);
     auto summary = SummarizeAccesses(call, user_edges, &needs_fallback);
     if (needs_fallback) {
-      if (in_manual_scope) return call;
       MarkCurrentScopeFallback();
       return call;
     }
@@ -1660,8 +1652,8 @@ class AutoDepMutator : public IRMutator {
              IsPreciseNoDepRegion(access.location.region);
     };
     auto can_consider_auto_output_existing = [&](const StorageAccess& access) {
-      return !in_manual_scope && access.kind == AccessKind::ReadWrite &&
-             access.arg_index != kInvalidArgIndex && access.arg_index < arg_directions.size() &&
+      return access.kind == AccessKind::ReadWrite && access.arg_index != kInvalidArgIndex &&
+             access.arg_index < arg_directions.size() &&
              arg_directions[access.arg_index] == ArgDirection::InOut &&
              IsPreciseNoDepRegion(access.location.region);
     };
@@ -1749,11 +1741,6 @@ class AutoDepMutator : public IRMutator {
             mark_auto_output_existing_covered(access);
             continue;
           }
-          if (in_manual_scope) {
-            mark_auto_no_dep_blocked(access);
-            mark_auto_output_existing_blocked(access);
-            continue;
-          }
           if (inactive_dynamic_prior) {
             DebugNoDepBucket(
                 call->op_->name_, access.arg_index, "fallback",
@@ -1813,8 +1800,7 @@ class AutoDepMutator : public IRMutator {
     std::sort(auto_output_existing_indices.begin(), auto_output_existing_indices.end());
 
     for (auto& access : accesses) {
-      access.task_id_var =
-          task_id ? task_id : (in_manual_scope ? nullptr : ProducerTaskIdForAccess(call, access));
+      access.task_id_var = task_id ? task_id : ProducerTaskIdForAccess(call, access);
       access.task_id_var_is_direct = access.task_id_var && IsTaskIdVar(access.task_id_var);
       access.dynamic_producer = loop_depth_ > 0;
       access.innermost_dynamic_loop_depth =
@@ -1830,9 +1816,7 @@ class AutoDepMutator : public IRMutator {
     auto new_attrs = output_attrs;
     if (!compiler_edges.empty()) {
       new_attrs = WithCompilerManualDepEdgesAttr(std::move(new_attrs), std::move(compiler_edges));
-      if (!in_manual_scope) {
-        new_attrs = WithBoolAttr(std::move(new_attrs), kAttrCompilerAutoManualScopeCandidate, true);
-      }
+      new_attrs = WithBoolAttr(std::move(new_attrs), kAttrCompilerAutoManualScopeCandidate, true);
     }
     if (!auto_no_dep_indices.empty()) {
       if (!auto_no_dep_candidate_count_stack_.empty()) {
@@ -2247,7 +2231,7 @@ class AutoDepMutator : public IRMutator {
   bool analyze_whole_body_as_auto_scope_ = false;
   bool whole_body_manual_candidate_ = false;
   std::vector<std::vector<StorageAccess>> prior_stack_;
-  std::vector<bool> scope_manual_stack_;
+  std::vector<bool> active_scope_stack_;
   std::vector<bool> fallback_stack_;
   std::vector<size_t> auto_no_dep_candidate_count_stack_;
   std::vector<size_t> layer_task_call_count_stack_;

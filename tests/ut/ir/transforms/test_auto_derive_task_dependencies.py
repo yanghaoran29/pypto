@@ -587,6 +587,10 @@ class TestAutoDeriveTaskDependencies:
         scopes = _runtime_scopes(out)
         assert len(scopes) == 1
         assert scopes[0].manual is True
+        consume_call = _user_calls(out, "consumer")[0]
+        assert [edge.name_hint for edge in _user_edges(consume_call)] == ["producer_tid"]
+        assert _compiler_edges(consume_call) == []
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input]
 
     def test_static_disjoint_slices_do_not_add_compiler_edge(self):
         @pl.program
@@ -1598,6 +1602,7 @@ class TestAutoDeriveTaskDependencies:
         user_edges = _user_edges(consume_call)
         assert [edge.name_hint for edge in user_edges] == ["producer_tid"]
         assert _compiler_edges(consume_call) == []
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input]
 
     def test_loop_carried_last_tid_dep_behavior(self):
         @pl.program
@@ -1637,6 +1642,7 @@ class TestAutoDeriveTaskDependencies:
         user_edges = _user_edges(consume_call)
         assert [edge.name_hint for edge in user_edges] == ["last_tid"]
         assert _compiler_edges(consume_call) == []
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input]
 
     def test_loop_task_id_array_deps_keep_manual_scope(self):
         @pl.program
@@ -1669,7 +1675,7 @@ class TestAutoDeriveTaskDependencies:
 
         consume_call = _user_calls(out, "consume")[0]
         assert _compiler_edges(consume_call) == []
-        assert _arg_directions(consume_call) == [ir.ArgDirection.NoDep]
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input]
 
     def test_complete_task_id_array_deps_allow_auto_no_dep_for_fan_in_input(self):
         @pl.program
@@ -1739,7 +1745,7 @@ class TestAutoDeriveTaskDependencies:
 
         consume_call = _user_calls(out, "consume")[0]
         assert _compiler_edges(consume_call) == []
-        assert _arg_directions(consume_call) == [ir.ArgDirection.NoDep]
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input]
 
     def test_partial_loop_task_id_array_slot_temp_deps_do_not_allow_no_dep(self):
         @pl.program
@@ -2162,41 +2168,44 @@ class TestAutoDeriveTaskDependencies:
         consume_call = _user_calls(out, "consume")[0]
         assert _compiler_edges(consume_call) == []
 
-    def test_manual_scope_missing_task_id_keeps_later_auto_scope_conservative(self):
+    def test_manual_scope_missing_task_id_does_not_block_later_auto_scope(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
             def fill(
                 self,
-                out: pl.Out[pl.Tensor[[64], pl.FP32]],
-            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
                 return out
 
             @pl.function(type=pl.FunctionType.InCore)
             def consume_pair(
                 self,
-                manual_value: pl.Tensor[[64], pl.FP32],
-                local_value: pl.Tensor[[64], pl.FP32],
-            ) -> pl.Tensor[[64], pl.FP32]:
+                manual_value: pl.Tensor[[32], pl.FP32],
+                local_value: pl.Tensor[[32], pl.FP32],
+            ) -> pl.Tensor[[32], pl.FP32]:
                 return local_value
 
             @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
-                manual_scratch: pl.Tensor[[64], pl.FP32],
-                local_scratch: pl.Tensor[[64], pl.FP32],
-            ) -> pl.Tensor[[64], pl.FP32]:
+                scratch: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[32], pl.FP32]:
                 with pl.manual_scope():
-                    manual_produced = self.fill(manual_scratch)
+                    manual_view = scratch[0:32]
+                    manual_produced = self.fill(manual_view)
                 with pl.scope():
-                    local_produced, _local_tid = pl.submit(self.fill, local_scratch)
+                    local_view = scratch[32:64]
+                    local_produced, _local_tid = pl.submit(self.fill, local_view)
                     out, _ = pl.submit(self.consume_pair, manual_produced, local_produced)
                 return out
 
         out = _run_auto_deps(Prog, analyze_auto_scopes=True)
         consume_call = _user_calls(out, "consume_pair")[0]
-        assert _compiler_edges(consume_call) == []
-        assert _arg_directions(consume_call) == [ir.ArgDirection.Input, ir.ArgDirection.Input]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "_local_tid"
+        assert _arg_directions(consume_call) == [ir.ArgDirection.Input, ir.ArgDirection.NoDep]
 
     def test_single_trip_loop_producer_exports_scalar_task_id(self):
         @pl.program

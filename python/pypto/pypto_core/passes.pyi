@@ -570,9 +570,9 @@ def auto_derive_task_dependencies(analyze_auto_scopes: bool = False) -> Pass:
 
     Runs after :func:`derive_call_directions` and writes
     ``Call.attrs['compiler_manual_dep_edges']`` for RAW/WAR/WAW hazards inside
-    analyzed AUTO runtime scopes. User-written manual runtime scopes do not get
-    compiler deps, but user-covered read-only tensor inputs may still be
-    rewritten to ``NoDep``.
+    analyzed AUTO runtime scopes. User-written manual runtime scopes are
+    skipped: they do not get compiler deps or automatic ``NoDep`` /
+    ``OutputExisting`` direction rewrites.
     AUTO scopes are skipped by default; pass ``analyze_auto_scopes=True`` to
     analyze them without changing their runtime scope mode. Unanalyzable hazards
     keep AUTO tracking with partial compiler deps stripped. User-written

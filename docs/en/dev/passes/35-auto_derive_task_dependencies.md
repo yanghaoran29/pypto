@@ -31,9 +31,8 @@ them immediately before emitting `Arg::set_dependencies(...)`.
 
 User-written MANUAL regions keep their scheduling contract: explicit
 `deps=[...]` remain the only task dependency edges, and the pass never adds
-compiler deps or demotes the scope. The pass may still inspect those explicit
-deps to rewrite covered read-only tensor inputs to `NoDep`. AUTO regions are
-analyzed only when the compile-time
+compiler deps, demotes the scope, or rewrites call-site directions to `NoDep`
+or `OutputExisting`. AUTO regions are analyzed only when the compile-time
 `analyze_auto_scopes_for_deps` switch is enabled. Hand-placed AUTO
 `RuntimeScopeStmt` nodes keep `manual=false` in the output IR. For default
 `auto_scope=True` orchestration functions, the pass runs before
@@ -89,12 +88,11 @@ For each function body:
    a compiler edge from any prior producer TaskId when RAW, WAR, or WAW hazards
    exist. Read-read pairs do not produce edges. User-written edges are respected
    and not duplicated.
-10. For read-only `Input` arguments whose precise static region (`Full` or
-    `Box`) or known-root conservative region has RAW hazards covered by user or
-    compiler explicit deps inside the same successfully analyzed runtime scope,
-    rewrite the call-site direction to `NoDep` so codegen emits
-    `add_no_dep(...)`. In MANUAL scopes this only uses user-written deps; no
-    compiler edges are synthesized.
+10. For read-only `Input` arguments in analyzed AUTO scopes whose precise
+    static region (`Full` or `Box`) or known-root conservative region has RAW
+    hazards covered by user or compiler explicit deps inside the same
+    successfully analyzed runtime scope, rewrite the call-site direction to
+    `NoDep` so codegen emits `add_no_dep(...)`.
 11. For `InOut` arguments in analyzed AUTO scopes, if every overlapping RAW,
     WAR, or WAW hazard for that slot is covered by user or compiler explicit
     deps, rewrite the call-site direction to `OutputExisting`. This skips the
@@ -120,17 +118,14 @@ Implemented fallback triggers include:
 
 This leaves the entire AUTO region on runtime OverlapMap/TensorMap tracking
 instead of mixing partial compiler deps with runtime state at scope boundaries.
-The fallback does not apply to user-written MANUAL scopes because the pass does
-not synthesize compiler deps there; unresolved manual-scope hazards only block
-`NoDep` for the affected input.
+User-written MANUAL scopes are skipped by this pass, so AUTO fallback handling
+does not apply inside them.
 
 ## Default-Path Changes
 
-- MANUAL scopes do not get compiler-derived dependency edges. User-written
-  `deps=[...]` remain the only dependency source inside `pl.manual_scope()`,
-  and the scope stays MANUAL. When those deps completely cover a full read-only
-  input's producer fan-in, the input can still be rewritten to `NoDep`.
-  `InOut -> OutputExisting` is intentionally not applied in MANUAL scopes.
+- MANUAL scopes do not get compiler-derived dependency edges or automatic
+  direction rewrites. User-written `deps=[...]` remain the only dependency
+  source inside `pl.manual_scope()`, and the scope stays MANUAL.
 - AUTO-scope analysis is opt-in. With the default switch value, AUTO runtime
   scope mode and TensorMap/OverlapMap tracking remain unchanged.
 - Dead scalar assignment elimination preserves TaskId tuple-element extracts in
@@ -146,9 +141,9 @@ not synthesize compiler deps there; unresolved manual-scope hazards only block
 
 The pass preserves `CallDirectionsResolved`: it does not rewrite call arguments,
 and any `arg_directions` changes remain verifier-legal direction demotions for
-tensor slots whose explicit dependencies are already present: `Input -> NoDep`
-for covered read-only inputs and `InOut -> OutputExisting` for covered AUTO
-read-write slots.
+tensor slots whose explicit dependencies are already present in analyzed AUTO
+scopes: `Input -> NoDep` for covered read-only inputs and
+`InOut -> OutputExisting` for covered read-write slots.
 
 ## API
 
