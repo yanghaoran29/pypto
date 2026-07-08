@@ -16,7 +16,7 @@ setup helpers vs. ``_dispatch`` run.
 """
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -31,8 +31,10 @@ from pypto.runtime.distributed_runner import (
     DistributedWorker,
     _assemble_chip_callables,
     _clear_dfx_dispatch_dirs,
+    _make_call_config,
     _submit_chip,
 )
+from pypto.runtime.runner import RunConfig
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -1161,6 +1163,86 @@ class TestClearDfxDispatchDirs:
     def test_missing_base_is_noop(self, tmp_path):
         # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
         _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
+
+
+class _BoolStrictCallConfig:
+    """Fake ``CallConfig`` whose ``enable_dep_gen`` mirrors simpler's pybind setter.
+
+    The real ``CallConfig.enable_dep_gen`` pybind overload accepts only ``bool``
+    and raises ``TypeError`` on an ``int`` — exactly the crash issue #1952
+    reproduces when the int ``enable_l2_swimlane`` CLI flag (0/1/2) leaks through
+    the ``and``/``or`` chain unwrapped. ``bool`` is a subclass of ``int``, so
+    ``isinstance(value, bool)`` matches the pybind behavior (rejects ``1``/``0``).
+    """
+
+    def __init__(self) -> None:
+        self.block_dim: Any = None
+        self.aicpu_thread_num = 0
+        self.enable_dump_tensor = 0
+        self.enable_pmu = 0
+        self.enable_scope_stats = False
+        self.enable_l2_swimlane: Any = 0
+        self.output_prefix = ""
+        self.runtime_env = SimpleNamespace(ring_task_window=0, ring_heap=0, ring_dep_pool=0)
+        self._enable_dep_gen = False
+
+    @property
+    def enable_dep_gen(self) -> bool:
+        return self._enable_dep_gen
+
+    @enable_dep_gen.setter
+    def enable_dep_gen(self, value: object) -> None:
+        if not isinstance(value, bool):
+            raise TypeError(
+                f"incompatible function arguments: enable_dep_gen expects bool, got {type(value).__name__}"
+            )
+        self._enable_dep_gen = value
+
+
+@pytest.fixture
+def fake_simpler_task_interface(monkeypatch):
+    """Register a fake ``simpler.task_interface`` exposing a bool-strict ``CallConfig``.
+
+    Lets ``_make_call_config`` run without the real (optional) ``simpler`` runtime
+    package while still enforcing the pybind ``bool``-only contract on
+    ``enable_dep_gen``.
+    """
+    pkg = ModuleType("simpler")
+    mod = ModuleType("simpler.task_interface")
+    mod.CallConfig = _BoolStrictCallConfig  # pyright: ignore[reportAttributeAccessIssue]
+    pkg.task_interface = mod  # pyright: ignore[reportAttributeAccessIssue]
+    monkeypatch.setitem(sys.modules, "simpler", pkg)
+    monkeypatch.setitem(sys.modules, "simpler.task_interface", mod)
+    return mod
+
+
+class TestMakeCallConfigDepGenType:
+    """``_make_call_config`` must assign a ``bool`` to ``enable_dep_gen``.
+
+    Regression for issue #1952: ``enable_l2_swimlane`` is an int (0/1/2), so the
+    ``dfx.enable_dep_gen or (co_enable_swimlane_dep_gen and dfx.enable_l2_swimlane)``
+    chain can yield an int, which the ``bool``-only pybind setter rejects.
+    """
+
+    # The pypto-lib CLI wires ``--enable-l2-swimlane`` as ``type=int,
+    # choices=(0, 1, 2)``, so ``RunConfig`` receives an ``int`` here even though
+    # the field is annotated ``bool`` — that int is precisely the crash trigger
+    # under test, hence the deliberate ``pyright: ignore[reportArgumentType]``.
+
+    def test_int_swimlane_flag_yields_bool_dep_gen(self, tmp_path, fake_simpler_task_interface):
+        # ``--enable-l2-swimlane 1`` reaches RunConfig as the int ``1``; the
+        # co-enable path must still hand ``enable_dep_gen`` a genuine ``bool``.
+        run_config = RunConfig(enable_l2_swimlane=1)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
+        assert cfg.enable_dep_gen is True
+        assert cfg.enable_l2_swimlane == 1
+
+    def test_int_zero_swimlane_yields_bool_false_dep_gen(self, tmp_path, fake_simpler_task_interface):
+        # Another DFX flag opens the block while swimlane is the int ``0``; the
+        # ``and``/``or`` chain would otherwise assign int ``0`` and still crash.
+        run_config = RunConfig(enable_dump_tensor=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
+        assert cfg.enable_dep_gen is False
 
 
 if __name__ == "__main__":
