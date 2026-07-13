@@ -1148,16 +1148,47 @@ def _infer_return_type(
             return_node = node
             break
 
-    # Multi-return: `return a, b, ...` -> emit `tuple[T_a, T_b, ...]`
+    # Multi-return: `return a, b, ...` -> emit `tuple[T_a, T_b, ...]`.
+    # Tensor elements are specialized from runtime metadata. Non-tensor elements
+    # (for example a TASK_ID captured by ``with pl.spmd(...) as tid``) must be
+    # supplied by a matching explicit tuple return annotation because they have
+    # no TensorMeta entry.
     if return_node is not None and isinstance(return_node.value, ast.Tuple):
-        elt_annotations: list[str] = []
-        for elt in return_node.value.elts:
-            if not isinstance(elt, ast.Name) or elt.id not in tensor_meta:
-                return None  # Can't infer this element — drop the annotation
-            elt_annotations.append(
-                _build_tensor_annotation(tensor_meta[elt.id], is_out=False, is_distributed=elt.id in dist_set)
+        explicit_elements: list[ast.expr] | None = None
+        if isinstance(func_def.returns, ast.Subscript) and _is_tuple_annotation(func_def.returns.value):
+            annotation_slice = func_def.returns.slice
+            explicit_elements = (
+                annotation_slice.elts if isinstance(annotation_slice, ast.Tuple) else [annotation_slice]
             )
+            if len(explicit_elements) != len(return_node.value.elts):
+                explicit_elements = None
+
+        elt_annotations: list[str] = []
+        for index, elt in enumerate(return_node.value.elts):
+            if isinstance(elt, ast.Name) and elt.id in tensor_meta:
+                elt_annotations.append(
+                    _build_tensor_annotation(
+                        tensor_meta[elt.id],
+                        is_out=False,
+                        is_distributed=elt.id in dist_set,
+                    )
+                )
+            elif explicit_elements is not None:
+                elt_annotations.append(ast.unparse(explicit_elements[index]))
+            else:
+                return None  # Can't infer this element — drop the annotation
         return f"tuple[{', '.join(elt_annotations)}]"
+
+    # A TASK_ID (or another explicit Scalar) has no TensorMeta entry. Preserve
+    # its declared type for any scalar expression so an inline helper can
+    # return a task ID, constant, or computed scalar to its caller rather than
+    # being treated as a void function.
+    if (
+        return_node is not None
+        and isinstance(func_def.returns, ast.Subscript)
+        and _is_scalar_annotation(func_def.returns.value)
+    ):
+        return ast.unparse(func_def.returns)
 
     # `return f(...)`: the result type depends on f's declared return types,
     # which we don't have here. Emit no annotation rather than wrongly assuming
@@ -1294,6 +1325,15 @@ def _is_scalar_annotation(node: ast.expr) -> bool:
         return node.id == "Scalar"
     if isinstance(node, ast.Attribute):
         return node.attr == "Scalar"
+    return False
+
+
+def _is_tuple_annotation(node: ast.expr) -> bool:
+    """Return True if the AST node represents tuple, Tuple, or typing.Tuple."""
+    if isinstance(node, ast.Name):
+        return node.id in ("tuple", "Tuple")
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("tuple", "Tuple")
     return False
 
 
