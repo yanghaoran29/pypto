@@ -32,7 +32,12 @@ namespace return_lineage {
 /// ``tensor.set_validshape``), TupleGetItem of a user-call result, and
 /// user calls (single- and tuple-result) — recursing into callees with
 /// memoization and a cycle guard. Group/Spmd wrappers with no top-level
-/// ReturnStmt resolve through their unique returning inner call.
+/// ReturnStmt resolve through their unique returning inner call; a wrapper that
+/// *does* return, but returns the forwarded tuple of a multi-result inner call
+/// (``result = self.inner(...); return result``), is expanded position-by-
+/// position through that call — only when the wrapper declares that many flat
+/// return positions, so a single ``pl.Tuple[...]`` return (one TupleType in
+/// ``return_types_``) keeps its 1-arity map.
 ///
 /// @return index into ``func->params_``, or nullopt when not a param writeback.
 std::optional<size_t> ReturnedParamIndex(const FunctionPtr& func, const ProgramPtr& program);
