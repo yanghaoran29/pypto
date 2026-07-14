@@ -30,6 +30,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/buffer_root_collector.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -37,9 +38,10 @@ namespace ir {
 
 namespace {
 
-using ::pypto::codegen::BufferRootCollector;
 using ::pypto::codegen::ComputeGroupEffectiveDirections;
 using ::pypto::codegen::IsBuiltinOp;
+using ::pypto::ir::buffer_root::AmbiguousRootPolicy;
+using ::pypto::ir::buffer_root::BufferRootCollector;
 
 /// Decide whether an argument expression refers to a tensor (not a scalar/index).
 bool IsTensorTypedArg(const ExprPtr& arg) {
@@ -523,7 +525,11 @@ Pass DeriveCallDirections() {
     for (auto& [gvar, func] : new_functions) {
       if (!func || !func->body_) continue;
 
-      BufferRootCollector br_collector(program);
+      // kFirstOutput: direction derivation must keep *some* root for an
+      // ambiguous single-return call, else a later write to the returned var
+      // skips the R-prior / enclosing-param InOut promotion and silently drops
+      // the WAW/InOut dependency. Preserves the naive pre-dedup behavior.
+      BufferRootCollector br_collector(program, AmbiguousRootPolicy::kFirstOutput);
       br_collector.Initialize(func->params_);
       br_collector.VisitStmt(func->body_);
 
