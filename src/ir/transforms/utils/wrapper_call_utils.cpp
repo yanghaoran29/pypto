@@ -11,7 +11,11 @@
 
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 
+#include <cstddef>
+#include <deque>
 #include <functional>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -113,6 +117,112 @@ std::vector<WrapperCallInfo> CollectInnerCalls(const FunctionPtr& wrapper, const
   });
   visitor.VisitStmt(wrapper->body_);
   return result;
+}
+
+namespace {
+
+/// The function's own `param_directions_`, padded to `params_.size()` so the
+/// result is always positionally indexable.
+std::vector<ParamDirection> DeclaredDirections(const FunctionPtr& func) {
+  std::vector<ParamDirection> declared = func->param_directions_;
+  declared.resize(func->params_.size(), ParamDirection::In);
+  return declared;
+}
+
+}  // namespace
+
+std::unordered_map<const Function*, std::vector<ParamDirection>> ComputeWrapperEffectiveDirections(
+    const ProgramPtr& program) {
+  std::unordered_map<const Function*, std::vector<ParamDirection>> effective;
+  if (!program) return effective;
+
+  // Index every wrapper and walk each body exactly once.
+  std::vector<FunctionPtr> wrappers;
+  std::unordered_map<const Function*, FunctionPtr> by_ptr;
+  std::unordered_map<const Function*, std::vector<WrapperCallInfo>> inner_calls;
+  for (const auto& [gvar, func] : program->functions_) {
+    if (!func || !IsWrapperType(func->func_type_)) continue;
+    wrappers.push_back(func);
+    by_ptr.emplace(func.get(), func);
+    // Seed at the declaration: the transfer below only ever promotes, so the
+    // solution is the least fixed point *above* what each signature declares.
+    // A wrapper that writes a param through a builtin rather than an inner
+    // call — or that has no body, or no inner calls at all — therefore keeps
+    // what it declares instead of collapsing to a bogus all-In vector.
+    effective.emplace(func.get(), DeclaredDirections(func));
+    inner_calls.emplace(func.get(), CollectInnerCalls(func, program));
+  }
+  if (wrappers.empty()) return effective;
+
+  // Reverse edges: wrapper callee -> the wrappers that call it. When a callee's
+  // directions grow, only its callers can grow as a result.
+  std::unordered_map<const Function*, std::vector<const Function*>> callers;
+  for (const auto& wrapper : wrappers) {
+    for (const auto& info : inner_calls.at(wrapper.get())) {
+      const Function* callee = info.inner_callee.get();
+      if (by_ptr.count(callee) != 0) callers[callee].push_back(wrapper.get());
+    }
+  }
+
+  // Merge every inner call's directions onto @p wrapper's params. Returns true
+  // when at least one param was promoted.
+  auto merge_once = [&](const FunctionPtr& wrapper) -> bool {
+    std::vector<ParamDirection>& directions = effective.at(wrapper.get());
+    bool promoted = false;
+    for (const auto& [inner_call, inner_callee] : inner_calls.at(wrapper.get())) {
+      // Copy: for a self-recursive wrapper this would otherwise alias
+      // `directions` while we mutate it.
+      const std::vector<ParamDirection> inner_dirs = IsWrapperType(inner_callee->func_type_)
+                                                         ? effective.at(inner_callee.get())
+                                                         : inner_callee->param_directions_;
+      const auto& inner_args = inner_call->args_;
+      for (size_t arg_idx = 0; arg_idx < inner_args.size() && arg_idx < inner_dirs.size(); ++arg_idx) {
+        auto var = AsVarLike(inner_args[arg_idx]);
+        if (!var) continue;
+        // Params are few (single digits); a linear scan beats hashing here.
+        for (size_t p = 0; p < wrapper->params_.size(); ++p) {
+          if (wrapper->params_[p].get() != var.get()) continue;
+          const ParamDirection d = inner_dirs[arg_idx];
+          ParamDirection& merged = directions[p];
+          // Promote one step up the In < Out < InOut lattice: InOut over
+          // anything weaker, Out over In. Both promotions do the same thing.
+          const bool promote = (d == ParamDirection::InOut && merged != ParamDirection::InOut) ||
+                               (d == ParamDirection::Out && merged == ParamDirection::In);
+          if (promote) {
+            merged = d;
+            promoted = true;
+          }
+          break;
+        }
+      }
+    }
+    return promoted;
+  };
+
+  // Monotone worklist to the least fixed point. Unlike a recursive walk with a
+  // cycle guard, this is independent of the order wrappers are visited in: a
+  // mutually recursive pair (A -> B -> A) converges to the same directions
+  // whichever one is seeded first. Each promotion moves one param one step up
+  // the In < Out < InOut lattice, so the loop runs at most
+  // 2 * (total wrapper params) times.
+  std::deque<const Function*> work;
+  std::unordered_set<const Function*> queued;
+  for (const auto& wrapper : wrappers) {
+    work.push_back(wrapper.get());
+    queued.insert(wrapper.get());
+  }
+  while (!work.empty()) {
+    const Function* func = work.front();
+    work.pop_front();
+    queued.erase(func);
+    if (!merge_once(by_ptr.at(func))) continue;
+    auto it = callers.find(func);
+    if (it == callers.end()) continue;
+    for (const Function* caller : it->second) {
+      if (queued.insert(caller).second) work.push_back(caller);
+    }
+  }
+  return effective;
 }
 
 }  // namespace ir
