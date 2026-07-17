@@ -305,29 +305,27 @@ def allgather(
     *,
     span: Span | None = None,
 ) -> Call:
-    """Build a ``pld.tensor.allgather(...)`` Call.
+    """Build a ``pld.tensor.allgather(input, target, signal)`` Call.
 
-    Unified 3-arg API for both HOST builtin and InCore composite paths.
-
-    Unified arg roles for both paths:
-      arg[0] = local_data — Tensor [1, SIZE]
+    Unified 3-arg push-based form for both paths.  Arg roles:
+      arg[0] = local_data — this rank's single chunk, Tensor [1, SIZE]
+                            (InCore) or [1, SIZE] staging window (HOST)
       arg[1] = target     — DistributedTensor [NR, SIZE] result window
       arg[2] = signal     — DistributedTensor INT32 barrier
 
-    **InCore composite:** push-based: each rank pushes its chunk into every
-    peer's window via ``pld.tile.put``, then notify/wait barrier; the window
-    itself becomes the gathered [NR, SIZE] result (window-as-result). Lowered
-    by LowerCompositeOps into tile.create(stage) + pld.tile.put loop +
-    notify/wait.
+    **InCore composite:** each rank pushes its chunk into every peer's
+    ``target`` row ``my_rank`` via ``pld.tile.put``, then notify/wait barrier;
+    ``target`` becomes the gathered [NR, SIZE] result (window-as-result).
+    Lowered by LowerCompositeOps into a push decomposition.
 
-    **HOST builtin:** data is pre-staged in the window by per-chip dispatch;
-    the host lowering emits ``builtin.tensor.barrier`` per chip to synchronise.
+    **HOST builtin:** distinct input/target windows; lowered to
+    ``builtin.tensor.allgather`` per chip (in-kernel TPUT push + barrier).
 
     Args:
-        local_data: InCore: Tensor [1, SIZE] with this rank's chunk.
-            HOST: Tensor [1, SIZE].
-        target: DistributedTensor [NR, SIZE] staging window / result.
-        signal: INT32 DistributedTensor barrier.
+        local_data: This rank's single chunk — Tensor [1, SIZE] (InCore) or
+            [1, SIZE] DistributedTensor staging window (HOST).
+        target: DistributedTensor [NR, SIZE] result window (window-as-result).
+        signal: Window-bound INT32 barrier tensor.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     _args: list[Expr] = [local_data, target, signal]

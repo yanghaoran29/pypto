@@ -24,15 +24,15 @@
  *   - pld.tensor.broadcast(target, signal, root)                   -> DistributedTensorType
  *   - pld.tensor.allgather(local_data, target, signal) (unified 3-arg)  -> DistributedTensorType
  *   - pld.tensor.reduce_scatter(target, signal, op)                -> DistributedTensorType
+ *   - pld.tensor.all_to_all(input, target, signal)                 -> DistributedTensorType
  *
- * The five builtin.tensor.* ops are internal chip-dispatch targets emitted by the
+ * The six builtin.tensor.* ops are internal chip-dispatch targets emitted by the
  * host-orchestrator lowering pass (LowerHostTensorCollectives):
  * builtin.tensor.{allreduce,barrier,broadcast,reduce_scatter,allgather}.
  */
 
 #include <any>
 #include <cstddef>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -224,48 +224,91 @@ REGISTER_OP("pld.tensor.broadcast")
 
 namespace {
 
+// Dimension pairs that must agree at runtime (e.g. two windows' NR extents)
+// may be two structurally distinct IR nodes for the same value — each
+// commonly sourced from its own pld.world_size() call in the HOST builtin
+// path. Enforce equality only when both are statically known (ConstInt);
+// otherwise trust the runtime rather than comparing structurally.
+void CheckDimAgreesIfStatic(const ExprPtr& lhs, const ExprPtr& rhs, const std::string& op_name,
+                            const char* lhs_desc, const char* rhs_desc) {
+  auto lhs_const = As<ConstInt>(lhs);
+  auto rhs_const = As<ConstInt>(rhs);
+  if (lhs_const && rhs_const) {
+    CHECK(lhs_const->value_ == rhs_const->value_)
+        << op_name << " " << lhs_desc << " first dimension (" << lhs_const->value_ << ") must equal "
+        << rhs_desc << " first dimension (" << rhs_const->value_ << ")";
+  }
+}
+
 TypePtr DeduceTensorAllGatherType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
   (void)kwargs;
-  CHECK(args.size() == 3) << "pld.tensor.allgather requires 3 args (local_data, target, signal); "
-                             "use pld.tensor.allgather(local_data, target, signal) for both HOST builtin and "
-                             "InCore composite paths, "
-                             "but got "
+  CHECK(args.size() == 3) << "pld.tensor.allgather requires exactly 3 args (input, target, signal), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.allgather positional argument #" << i << " must not be null";
   }
 
-  // Unified arg roles for both paths:
-  //   arg[0] = local_data — Tensor [1, SIZE]
-  //   arg[1] = target     — DistributedTensor [NR, SIZE] result window (both paths)
-  //   arg[2] = signal     — DistributedTensor INT32 barrier (both paths)
-  // local_data type is validated by the lowering passes per their context
-  // (LowerCompositeOps for InCore, LowerHostTensorCollectives for HOST).
+  // Unified 3-arg contract for both paths: allgather(input, target, signal).
+  //   arg[0] input  — this rank's single chunk, always [1, SIZE]. InCore: plain
+  //                   Tensor. HOST: a [1, SIZE] DistributedTensor staging window.
+  //                   HOST vs InCore is a function-context property, not an
+  //                   arg[0]-type property, so the deducer accepts either kind
+  //                   and defers path-specific validation to the lowering passes.
+  //   arg[1] target — DistributedTensor [NR, SIZE] window (push target + result).
+  //   arg[2] signal — DistributedTensor INT32 cross-rank barrier.
+  // input and target must be different buffers — aliasing them is a
+  // cross-process data race (same constraint as all_to_all).
+  CHECK(args[0].get() != args[1].get())
+      << "pld.tensor.allgather input and target must be different buffers, but the same "
+         "expression was passed for both";
+
+  auto input_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(input_type) << "pld.tensor.allgather input must be a Tensor or DistributedTensor, got "
+                    << args[0]->GetType()->TypeName();
+  CHECK(input_type->shape_.size() == 2)
+      << "pld.tensor.allgather input must be 2D [1, SIZE] (this rank's single chunk), got "
+      << input_type->shape_.size() << " dims";
+  if (auto input_rows = As<ConstInt>(input_type->shape_[0])) {
+    CHECK(input_rows->value_ == 1)
+        << "pld.tensor.allgather input must be [1, SIZE] (this rank's single chunk), got first dim "
+        << input_rows->value_;
+  }
+
   auto target_type = As<DistributedTensorType>(args[1]->GetType());
-  CHECK(target_type)
-      << "pld.tensor.allgather target (arg[1]) must be a DistributedTensor (window-bound), got "
-      << args[1]->GetType()->TypeName();
+  CHECK(target_type) << "pld.tensor.allgather target must be a DistributedTensor (window-bound), got "
+                     << args[1]->GetType()->TypeName();
   CHECK(target_type->shape_.size() == 2)
       << "pld.tensor.allgather target must be 2D [NR, SIZE], got " << target_type->shape_.size() << " dims";
+  CHECK(target_type->dtype_ == input_type->dtype_)
+      << "pld.tensor.allgather target dtype " << target_type->dtype_.ToString() << " must match input dtype "
+      << input_type->dtype_.ToString();
+  // Dim 1 (SIZE) is always a plain literal shared by input and target.
+  CHECK(AreExprsEqual(target_type->shape_[1], input_type->shape_[1]))
+      << "pld.tensor.allgather target SIZE must equal input SIZE";
 
   auto signal_type = As<DistributedTensorType>(args[2]->GetType());
-  CHECK(signal_type)
-      << "pld.tensor.allgather signal (arg[2]) must be a DistributedTensor (window-bound), got "
-      << args[2]->GetType()->TypeName();
+  CHECK(signal_type) << "pld.tensor.allgather signal must be a DistributedTensor (window-bound), got "
+                     << args[2]->GetType()->TypeName();
   CHECK(signal_type->dtype_ == DataType::INT32)
       << "pld.tensor.allgather signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
-
+  CHECK(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2)
+      << "pld.tensor.allgather signal must be 1D [NR] or 2D [NR, 1], got " << signal_type->shape_.size()
+      << " dims";
+  if (signal_type->shape_.size() == 2) {
+    auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
+    CHECK(signal_dim1 && signal_dim1->value_ == 1)
+        << "pld.tensor.allgather signal second dimension must be 1, got "
+        << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
+  }
   // The notify/wait barrier indexes `signal` per rank (0..NR-1), so its first
-  // dimension must equal target's NR.  Without this guard an undersized signal
-  // passes type deduction and only faults at runtime inside EmitNotifyAll /
-  // EmitWaitAll (InCore path has no other static check on the barrier size).
-  CHECK(AreExprsEqual(signal_type->shape_[0], target_type->shape_[0]))
-      << "pld.tensor.allgather signal first dimension must equal target first "
-         "dimension (NR)";
+  // dimension must equal target's NR.  Two windows commonly source NR from
+  // separate pld.world_size() nodes, so only enforce when both are static.
+  CheckDimAgreesIfStatic(signal_type->shape_[0], target_type->shape_[0], "pld.tensor.allgather", "signal",
+                         "target");
 
-  // Both paths return target's DistributedTensorType (window-as-result).
+  // Return target in-place (window-as-result).
   return target_type;
 }
 
@@ -273,22 +316,24 @@ TypePtr DeduceTensorAllGatherType(const std::vector<ExprPtr>& args,
 
 REGISTER_OP("pld.tensor.allgather")
     .set_description(
-        "All-gather: gather data from all ranks.  Unified 3-arg API: "
-        "`pld.tensor.allgather(local_data, target, signal)` for both HOST builtin and InCore composite. "
-        "HOST builtin: `local_data` is the rank's chunk or pre-staged window "
-        "(Tensor [1, SIZE] or DistributedTensor [NR, SIZE]), "
-        "`target` is the DistributedTensor [NR, SIZE] result window, "
-        "`signal` is the INT32 DistributedTensor barrier; lowered to "
-        "builtin.tensor.barrier per chip. "
-        "InCore composite: `local_data` is the rank's chunk (Tensor [1, SIZE]), "
-        "`target` is the window-bound DistributedTensor [NR, SIZE] staging area and result, "
-        "`signal` is the INT32 DistributedTensor barrier; push-based lowering: "
-        "pld.tile.put loop + notify-all/wait-all; "
-        "this Call never survives past that pass.")
+        "All-gather: gather data from all ranks.  Unified 3-arg push-based API "
+        "`pld.tensor.allgather(input, target, signal)`.  `input` is this rank's "
+        "single [1, SIZE] chunk (plain Tensor on the InCore path, a [1, SIZE] "
+        "staging window on the HOST path); `target` is a window-bound "
+        "DistributedTensor[NR, SIZE] that receives the gathered result in-place "
+        "— after the barrier `target[src, :]` holds the chunk from rank `src`; "
+        "`signal` is a window-bound INT32 barrier tensor.  "
+        "InCore is lowered by LowerCompositeOps into a push decomposition "
+        "(pld.tile.put this rank's chunk into every peer's `target` + "
+        "notify-all/wait-all); HOST is lowered by LowerHostTensorCollectives to "
+        "builtin.tensor.allgather per chip (in-kernel TPUT push + barrier).  "
+        "Returns `target` in-place; the composite Call never survives lowering.")
     .set_op_category("DistributedOp")
-    .add_argument("local_data", "InCore: Tensor [1, SIZE]; HOST: Tensor [1, SIZE] (Input)")
-    .add_argument("target", "DistributedTensor [NR, SIZE] result window (InOut)")
-    .add_argument("signal", "INT32 DistributedTensor barrier (InOut)")
+    .add_argument("input",
+                  "This rank's single chunk — [1, SIZE] Tensor (InCore) or [1, SIZE] staging "
+                  "window (HOST) (Input)")
+    .add_argument("target", "Window-bound DistributedTensor[NR, SIZE] — gathered result in-place (InOut)")
+    .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .no_memory_spec()
     .f_deduce_type(DeduceTensorAllGatherType);
 
@@ -307,10 +352,20 @@ TypePtr DeduceTensorAllToAllType(const std::vector<ExprPtr>& args,
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.all_to_all positional argument #" << i << " must not be null";
   }
+  // input and target must be different windows — aliasing them is a
+  // cross-process data race (see kernel.cpp.in for the full explanation).
+  // This catches the same-expression case; two distinct pld.window(...)
+  // calls over the same underlying alloc aren't detectable here (window
+  // identity isn't materialized until MaterializeCommDomainScopes).
+  CHECK(args[0].get() != args[1].get())
+      << "pld.tensor.all_to_all input and target must be different windows, but the same "
+         "expression was passed for both";
 
-  // 3-arg push-based InCore composite path
-  auto input_type = As<TensorType>(args[0]->GetType());
-  CHECK(input_type) << "pld.tensor.all_to_all input must be a Tensor, got " << args[0]->GetType()->TypeName();
+  // 3-arg push-based composite or HOST builtin path.
+  // input may be plain Tensor (InCore) or DistributedTensor (HOST window-sourced).
+  auto input_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(input_type) << "pld.tensor.all_to_all input must be a Tensor or DistributedTensor, got "
+                    << args[0]->GetType()->TypeName();
   CHECK(input_type->shape_.size() == 2)
       << "pld.tensor.all_to_all input must be 2D [NR, SIZE], got " << input_type->shape_.size() << " dims";
 
@@ -322,8 +377,13 @@ TypePtr DeduceTensorAllToAllType(const std::vector<ExprPtr>& args,
   CHECK(target_type->shape_.size() == input_type->shape_.size())
       << "pld.tensor.all_to_all target rank must match input rank, got " << target_type->shape_.size()
       << " vs " << input_type->shape_.size();
-  CHECK(AreExprsEqual(target_type->shape_[0], input_type->shape_[0]) &&
-        AreExprsEqual(target_type->shape_[1], input_type->shape_[1]))
+  // Dim 0 (NR): input and target are two separate windows (the HOST builtin
+  // path requires different buffers — see kernel.cpp.in), so their NR extent
+  // is commonly two distinct pld.world_size() IR nodes. Dim 1 (SIZE) is
+  // always a plain literal, so keep it a strict structural check.
+  CheckDimAgreesIfStatic(target_type->shape_[0], input_type->shape_[0], "pld.tensor.all_to_all", "target",
+                         "input");
+  CHECK(AreExprsEqual(target_type->shape_[1], input_type->shape_[1]))
       << "pld.tensor.all_to_all target shape must equal input shape";
   CHECK(target_type->dtype_ == input_type->dtype_)
       << "pld.tensor.all_to_all target dtype " << target_type->dtype_.ToString() << " must match input dtype "
@@ -335,16 +395,17 @@ TypePtr DeduceTensorAllToAllType(const std::vector<ExprPtr>& args,
   CHECK(signal_type->dtype_ == DataType::INT32)
       << "pld.tensor.all_to_all signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
-  CHECK(signal_type->shape_.size() == 2)
-      << "pld.tensor.all_to_all signal must be 2D [NR, 1], got " << signal_type->shape_.size() << " dims";
-  {
+  CHECK(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2)
+      << "pld.tensor.all_to_all signal must be 1D [NR] or 2D [NR, 1], got " << signal_type->shape_.size()
+      << " dims";
+  if (signal_type->shape_.size() == 2) {
     auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
     CHECK(signal_dim1 && signal_dim1->value_ == 1)
         << "pld.tensor.all_to_all signal second dimension must be 1, got "
         << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
   }
-  CHECK(AreExprsEqual(signal_type->shape_[0], input_type->shape_[0]))
-      << "pld.tensor.all_to_all signal first dimension must equal input first dimension (NR)";
+  CheckDimAgreesIfStatic(signal_type->shape_[0], input_type->shape_[0], "pld.tensor.all_to_all", "signal",
+                         "input");
 
   // Return target in-place (window-as-result, same idiom as reduce_scatter / broadcast).
   return target_type;
@@ -545,10 +606,6 @@ REGISTER_OP("builtin.tensor.reduce_scatter")
 
 // ============================================================================
 // builtin.tensor.allgather — host dispatch for pld.tensor.allgather
-//
-// NOT YET WIRED: reserved for future concurrent-dispatch lowering.
-// Currently the HOST allgather path lowers to builtin.tensor.barrier instead;
-// this builtin will be used when the concurrent-dispatch lowering lands.
 // ============================================================================
 
 namespace {
@@ -556,34 +613,58 @@ namespace {
 TypePtr DeduceBuiltinTensorAllGatherType(const std::vector<ExprPtr>& args,
                                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
   constexpr const char* kOpName = "builtin.tensor.allgather";
-  CHECK(args.size() == 3) << kOpName << " requires 3 args (local_data, target, signal), but got "
-                          << args.size();
+  CHECK(args.size() == 3) << kOpName << " requires 3 args (input, target, signal), but got " << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << kOpName << " positional argument #" << i << " must not be null";
   }
-
-  // Unified 3-arg — mirrors pld.tensor.allgather.
-  //   arg[0] = local_data — Tile (InCore) or DistributedTensor (HOST)
-  //   arg[1] = target     — DistributedTensor [NR, SIZE] result window
-  //   arg[2] = signal     — DistributedTensor INT32 barrier
-  auto local_type = As<TileType>(args[0]->GetType());
-  CHECK(local_type) << kOpName << " local_data must be a Tile, got " << args[0]->GetType()->TypeName();
-
+  CHECK(args[0].get() != args[1].get())
+      << kOpName
+      << " input and target must be different windows, but the same expression was passed for both";
+  auto input_type = As<DistributedTensorType>(args[0]->GetType());
+  CHECK(input_type) << kOpName << " input must be a DistributedTensor (window-bound), got "
+                    << args[0]->GetType()->TypeName();
+  CHECK(input_type->shape_.size() == 2)
+      << kOpName << " input must be 2D [1, SIZE] (this rank's single chunk), got "
+      << input_type->shape_.size() << " dims";
+  if (auto input_rows = As<ConstInt>(input_type->shape_[0])) {
+    CHECK(input_rows->value_ == 1) << kOpName
+                                   << " input must be [1, SIZE] (this rank's single chunk), got first dim "
+                                   << input_rows->value_;
+  }
   auto target_type = As<DistributedTensorType>(args[1]->GetType());
-  CHECK(target_type) << kOpName << " target (arg[1]) must be a DistributedTensor, got "
+  CHECK(target_type) << kOpName << " target must be a DistributedTensor, got "
                      << args[1]->GetType()->TypeName();
   CHECK(target_type->shape_.size() == 2)
       << kOpName << " target must be 2D [NR, SIZE], got " << target_type->shape_.size() << " dims";
-
-  CheckSignalDistributedTensor(As<DistributedTensorType>(args[2]->GetType()), kOpName);
-
+  CHECK(target_type->dtype_ == input_type->dtype_)
+      << kOpName << " target dtype " << target_type->dtype_.ToString() << " must match input dtype "
+      << input_type->dtype_.ToString();
+  // input is [1, SIZE]; only the SIZE dimension (dim 1) must match target.
+  CHECK(AreExprsEqual(target_type->shape_[1], input_type->shape_[1]))
+      << kOpName << " input SIZE must equal target SIZE";
+  // Accept both 1D and 2D signals (matching DeduceTensorAllGatherType / all_to_all)
+  // so the builtin deducer is consistent with the user-facing op.
+  auto signal_type = As<DistributedTensorType>(args[2]->GetType());
+  CHECK(signal_type) << kOpName << " signal must be a DistributedTensor, got "
+                     << args[2]->GetType()->TypeName();
+  CHECK(signal_type->dtype_ == DataType::INT32)
+      << kOpName << " signal dtype must be INT32, got " << signal_type->dtype_.ToString();
+  CHECK(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2)
+      << kOpName << " signal must be rank-1 [world_size] or rank-2 [world_size, 1], got rank "
+      << signal_type->shape_.size();
+  if (signal_type->shape_.size() == 2) {
+    auto second_extent = As<ConstInt>(signal_type->shape_[1]);
+    CHECK(second_extent) << kOpName << " rank-2 signal shape[1] must be the constant 1";
+    CHECK(second_extent->value_ == 1)
+        << kOpName << " rank-2 signal shape[1] must be 1, got " << second_extent->value_;
+  }
   auto dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
   CHECK(dtype == target_type->dtype_)
       << kOpName << " dtype kwarg (" << dtype.ToString() << ") must match target dtype ("
       << target_type->dtype_.ToString() << ")";
   CheckSupportedFp32BuiltinVariant(dtype, kOpName);
-
-  return std::make_shared<TileType>(target_type->shape_, target_type->dtype_);
+  // 3-arg HOST builtin (input, target, signal): return target in-place.
+  return args[1]->GetType();
 }
 
 }  // namespace
@@ -591,14 +672,100 @@ TypePtr DeduceBuiltinTensorAllGatherType(const std::vector<ExprPtr>& args,
 REGISTER_OP("builtin.tensor.allgather")
     .set_description("Internal chip-dispatch builtin for pld.tensor.allgather.")
     .set_op_category("DistributedOp")
-    .add_argument("local_data", "Local tile chunk to stage")
-    .add_argument("target", "Window-bound DistributedTensor[NR, SIZE] staging window")
+    .add_argument("input",
+                  "Window-bound DistributedTensor[1, SIZE] — this rank's staging window (TPUT source)")
+    .add_argument("target", "Window-bound DistributedTensor[NR, SIZE] result window (TPUT destination)")
     .add_argument("signal", "Window-bound INT32 DistributedTensor signal buffer")
     .set_attr<DataType>("dtype")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.allgather")
     .f_deduce_type(DeduceBuiltinTensorAllGatherType);
+
+// ============================================================================
+// builtin.tensor.all_to_all — host dispatch for pld.tensor.all_to_all
+// ============================================================================
+
+namespace {
+
+TypePtr DeduceBuiltinTensorAllToAllType(const std::vector<ExprPtr>& args,
+                                        const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "builtin.tensor.all_to_all";
+  CHECK(args.size() == 3) << kOpName
+                          << " requires exactly 3 positional arguments (input, target, signal), but got "
+                          << args.size();
+  for (size_t i = 0; i < args.size(); ++i) {
+    CHECK(args[i]) << kOpName << " positional argument #" << i << " must not be null";
+  }
+  // input: a SEPARATE window, distinct from target, holding this rank's
+  // per-destination outgoing chunks. Never a destination for any incoming
+  // TPUT. This catches the same-expression case; two distinct windows over
+  // the same underlying alloc aren't detectable here.
+  CHECK(args[0].get() != args[1].get())
+      << kOpName
+      << " input and target must be different windows, but the same expression was "
+         "passed for both";
+  auto input_type = As<DistributedTensorType>(args[0]->GetType());
+  CHECK(input_type) << kOpName << " input must be a DistributedTensor (window-bound), got "
+                    << args[0]->GetType()->TypeName();
+  CHECK(input_type->shape_.size() == 2)
+      << kOpName << " input must be 2D [NR, SIZE], got " << input_type->shape_.size() << " dims";
+
+  auto target_type = As<DistributedTensorType>(args[1]->GetType());
+  CHECK(target_type) << kOpName << " target must be a DistributedTensor, got "
+                     << args[1]->GetType()->TypeName();
+  CHECK(target_type->shape_.size() == 2)
+      << kOpName << " target must be 2D [NR, SIZE], got " << target_type->shape_.size() << " dims";
+  // Dim 0 (NR): input and target are two separate windows, each typically
+  // sourced from its own pld.world_size() call. Dim 1 (SIZE) is always a
+  // plain literal, so keep it a strict structural check.
+  CheckDimAgreesIfStatic(target_type->shape_[0], input_type->shape_[0], kOpName, "target", "input");
+  CHECK(AreExprsEqual(target_type->shape_[1], input_type->shape_[1]))
+      << kOpName << " target shape must equal input shape";
+  CHECK(target_type->dtype_ == input_type->dtype_)
+      << kOpName << " target dtype " << target_type->dtype_.ToString() << " must match input dtype "
+      << input_type->dtype_.ToString();
+  // Accept both 1D and 2D signals (matching DeduceTensorAllToAllType) so that
+  // the builtin deducer is consistent with the user-facing op.  The lowering
+  // pass (LowerHostTensorCollectives::CheckStaticSignalCapacity) also handles
+  // both shapes.
+  auto signal_type = As<DistributedTensorType>(args[2]->GetType());
+  CHECK(signal_type) << kOpName << " signal must be a DistributedTensor, got "
+                     << args[2]->GetType()->TypeName();
+  CHECK(signal_type->dtype_ == DataType::INT32)
+      << kOpName << " signal dtype must be INT32, got " << signal_type->dtype_.ToString();
+  CHECK(signal_type->shape_.size() == 1 || signal_type->shape_.size() == 2)
+      << kOpName << " signal must be rank-1 [world_size] or rank-2 [world_size, 1], got rank "
+      << signal_type->shape_.size();
+  if (signal_type->shape_.size() == 2) {
+    auto second_extent = As<ConstInt>(signal_type->shape_[1]);
+    CHECK(second_extent) << kOpName << " rank-2 signal shape[1] must be the constant 1";
+    CHECK(second_extent->value_ == 1)
+        << kOpName << " rank-2 signal shape[1] must be 1, got " << second_extent->value_;
+  }
+  auto dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
+  CHECK(dtype == target_type->dtype_)
+      << kOpName << " dtype kwarg (" << dtype.ToString() << ") must match target dtype ("
+      << target_type->dtype_.ToString() << ")";
+  CheckSupportedFp32BuiltinVariant(dtype, kOpName);
+  return args[1]->GetType();
+}
+
+}  // namespace
+
+REGISTER_OP("builtin.tensor.all_to_all")
+    .set_description("Internal chip-dispatch builtin for pld.tensor.all_to_all.")
+    .set_op_category("DistributedOp")
+    .add_argument("input",
+                  "Window-bound DistributedTensor[NR, SIZE] — this rank's outgoing staging window "
+                  "(TPUT source only, never an incoming-push destination)")
+    .add_argument("target", "Window-bound DistributedTensor[NR, SIZE] result window (TPUT destination)")
+    .add_argument("signal", "Window-bound INT32 DistributedTensor signal buffer")
+    .set_attr<DataType>("dtype")
+    .no_memory_spec()
+    .set_internal_only(true)
+    .set_template_dir(":pypto.runtime.builtins.collectives.all_to_all")
+    .f_deduce_type(DeduceBuiltinTensorAllToAllType);
 
 }  // namespace ir
 }  // namespace pypto

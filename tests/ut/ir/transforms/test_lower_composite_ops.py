@@ -563,7 +563,7 @@ def test_allreduce_in_host_orchestrator_is_left_for_host_collective_lowering():
 
 
 def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_lowering():
-    """barrier/broadcast/allgather/reduce_scatter skipped by LowerCompositeOps in HOST orch."""
+    """HOST collectives are skipped by LowerCompositeOps (left for host lower)."""
     SIZE = 64
     NR = 2
 
@@ -572,12 +572,15 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
             self,
+            ag_stage: pld.DistributedTensor[[1, SIZE], pl.FP32],
+            stage: pld.DistributedTensor[[NR, SIZE], pl.FP32],
             data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
             signal: pld.DistributedTensor[[NR, 1], pl.INT32],
         ):
             pld.tensor.barrier(signal)
             data = pld.tensor.broadcast(data, signal, root=0)
-            pld.tensor.allgather(data, data, signal)
+            data = pld.tensor.allgather(ag_stage, data, signal)
+            data = pld.tensor.all_to_all(stage, data, signal)
             data = pld.tensor.reduce_scatter(data, signal)
             return 0
 
@@ -588,6 +591,7 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
         "pld.tensor.barrier",
         "pld.tensor.broadcast",
         "pld.tensor.allgather",
+        "pld.tensor.all_to_all",
         "pld.tensor.reduce_scatter",
     ):
         assert op_name in op_names, f"HOST collective {op_name!r} should survive LowerCompositeOps"

@@ -554,44 +554,37 @@ def allgather(
     target: DistributedTensor,
     signal: DistributedTensor,
 ) -> DistributedTensor:
-    """Gather data from all ranks (InCore composite or HOST builtin).
+    """All-gather: gather data from all ranks (push-based).
 
-    Unified 3-arg API: ``pld.tensor.allgather(local_data, target, signal)``
-    with the same arg roles for both paths.
+    Unified 3-arg form: ``pld.tensor.allgather(input, target, signal)``.
+    ``input`` is this rank's single ``[1, SIZE]`` chunk; every rank pushes it
+    into every peer's ``target`` row ``my_rank`` via TPUT, then synchronises
+    with a notify/wait barrier.  Returns ``target`` in-place (window-as-result
+    — same idiom as ``all_to_all`` / ``reduce_scatter`` / ``broadcast``).
 
-    **InCore composite:** push-based: each rank pushes its chunk into every
-    peer's window slot at ``target[my_rank, :]`` via ``pld.tile.put``, then
-    notify/wait barrier; the window itself becomes the gathered ``[NR, SIZE]``
-    result (window-as-result).
-
-    **HOST builtin:** ``local_data`` is the already-staged
-    :class:`pld.DistributedTensor` [NR, SIZE] window (staged by per-chip
-    dispatch before the call), ``target`` is the same (or aliased) DT window,
-    ``signal`` is the barrier.  The host lowering emits
-    ``builtin.tensor.barrier`` per chip to synchronise the pre-staged data.
-
-    The C++ deducer validates ``target`` and ``signal`` by type. The InCore
-    composite path requires ``local_data`` to be a plain ``Tensor [1, SIZE]``;
-    the HOST builtin path accepts either ``Tensor [1, SIZE]`` or
-    ``DistributedTensor [NR, SIZE]`` (pre-staged by per-chip dispatch). The
-    lowering passes handle this path-specific validation per their context.
+    ``input`` must be a DIFFERENT buffer from ``target`` — never pass the same
+    window for both.  On the HOST path ``input`` is a ``[1, SIZE]`` staging
+    window populated by an earlier publish step; on the InCore path it is a
+    plain :class:`pl.Tensor` ``[1, SIZE]`` — both are accepted.  HOST vs InCore
+    is a function-context property resolved by the lowering passes.
 
     Args:
-        local_data: InCore: :class:`pl.Tensor` [1, SIZE] with this rank's
-            chunk.  HOST: :class:`pl.Tensor` [1, SIZE].
-        target: :class:`pld.DistributedTensor` [NR, SIZE] result window
-            (window-as-result for both paths).
-        signal: INT32 :class:`pld.DistributedTensor` barrier tensor.
+        local_data: This rank's single chunk — ``[1, SIZE]`` :class:`pl.Tensor`
+            (InCore) or ``[1, SIZE]`` :class:`pld.DistributedTensor` staging
+            window (HOST).  Must differ from ``target``.
+        target: :class:`pld.DistributedTensor` ``[NR, SIZE]`` result window.
+            After the call, ``target[src, :]`` holds the chunk from rank
+            ``src``.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
 
     Returns:
-        :class:`pld.DistributedTensor` — the ``target`` window holding the
-        gathered ``[NR, SIZE]`` result.
+        The ``target`` :class:`pld.DistributedTensor` (window-as-result).
     """
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allgather", target=target, signal=signal
     )
-    local_data_expr = _unwrap(local_data)
-    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr)
+    input_expr = _unwrap(local_data)
+    call = _ir_tensor.allgather(input_expr, target_expr, signal_expr)
     return DistributedTensor(expr=call)
 
 
@@ -631,21 +624,28 @@ def reduce_scatter(
 
 
 def all_to_all(
-    input: Tensor,
+    input: Tensor | DistributedTensor,
     target: DistributedTensor,
     signal: DistributedTensor,
 ) -> DistributedTensor:
     """All-to-all: symmetric personalized exchange (push-based).
 
-    3-arg InCore composite: ``pld.tensor.all_to_all(input, target, signal)``
+    3-arg form: ``pld.tensor.all_to_all(input, target, signal)``.
     Every rank pushes its per-destination chunks directly to every peer's
-    window via ``pld.tensor.put`` (TPUT), then synchronises with a notify/wait
+    ``target`` window via TPUT, then synchronises with a notify/wait
     barrier.  Returns ``target`` in-place (window-as-result — same idiom as
     ``reduce_scatter`` / ``broadcast``).
 
+    ``input`` must be a DIFFERENT buffer from ``target`` — never pass the same
+    window for both.  For the HOST-level builtin dispatch, ``input`` is
+    typically a second window (e.g. a :class:`pld.DistributedTensor` staged
+    by an earlier InCore step) rather than the InCore composite's plain
+    :class:`pl.Tensor` — both are accepted.
+
     Args:
-        input: :class:`pl.Tensor` [NR, SIZE] with per-destination chunks.
-            ``input[dest, :]`` is the chunk destined for rank ``dest``.
+        input: [NR, SIZE] Tensor or DistributedTensor with per-destination
+            chunks, distinct from ``target``.  ``input[dest, :]`` is the
+            chunk destined for rank ``dest``.
         target: :class:`pld.DistributedTensor` [NR, SIZE] window that receives
             the result in-place.  After the call,
             ``target[src, :]`` holds the chunk received from rank ``src``.

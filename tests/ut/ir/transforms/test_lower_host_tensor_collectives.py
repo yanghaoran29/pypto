@@ -15,7 +15,7 @@ from typing import cast
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto.pypto_core import ir, passes
+from pypto.pypto_core import DataType, ir, passes
 
 
 @pytest.fixture(autouse=True)
@@ -598,24 +598,33 @@ def test_host_reduce_scatter_lowers_to_builtin_world_size_loop():
     assert call.kwargs["op"] == int(pld.ReduceOp.Sum)
 
 
-def test_host_allgather_lowers_to_builtin_world_size_loop():
+def test_host_allgather_lowers_to_namesake_builtin():
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch(
-            self, data: pld.DistributedTensor[[4, 256], pl.FP32], sig: pld.DistributedTensor[[4], pl.INT32]
+            self,
+            stage: pld.DistributedTensor[[1, 256], pl.FP32],
+            data: pld.DistributedTensor[[4, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4], pl.INT32],
         ):
             return data
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(self):
+            # `stage_buf` ([1, SIZE] TPUT source, this rank's chunk) and
+            # `data_buf` ([NR, SIZE] TPUT destination / result) must be two
+            # DISTINCT windows — same constraint as all_to_all (see allgather
+            # kernel.cpp.in).
+            stage_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
             data_buf = pld.alloc_window_buffer(4 * 256 * pl.FP32.get_byte())
             signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            stage = pld.window(stage_buf, [1, 256], dtype=pl.FP32)
             data = pld.window(data_buf, [4, 256], dtype=pl.FP32)
             signal = pld.window(signal_buf, [4], dtype=pl.INT32)
             for r in pl.range(pld.world_size()):
-                self.chip_orch(data, signal, device=r)
-            pld.tensor.allgather(data, data, signal)
+                self.chip_orch(stage, data, signal, device=r)
+            data = pld.tensor.allgather(stage, data, signal)
             return 0
 
     program = passes.materialize_comm_domain_scopes()(P)
@@ -627,11 +636,132 @@ def test_host_allgather_lowers_to_builtin_world_size_loop():
         for loop in loops
         if isinstance(loop.body, ir.EvalStmt)
         and isinstance(loop.body.expr, ir.Call)
-        and loop.body.expr.op.name == "builtin.tensor.barrier"
+        and loop.body.expr.op.name == "builtin.tensor.allgather"
     ]
     assert len(builtin_loops) == 1
     body = builtin_loops[0].body
     assert isinstance(body, ir.EvalStmt)
     call = body.expr
     assert isinstance(call, ir.Call)
-    assert list(call.arg_directions) == [ir.ArgDirection.InOut]
+    assert list(call.arg_directions) == [
+        ir.ArgDirection.Input,
+        ir.ArgDirection.InOut,
+        ir.ArgDirection.InOut,
+    ]
+    assert call.kwargs["dtype"] == DataType.FP32
+
+
+def test_host_allgather_rejects_aliased_input_target_windows():
+    """Two pld.window views over one alloc must fail at host lowering."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[1, 256], pl.FP32],
+            data: pld.DistributedTensor[[4, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            buf = pld.alloc_window_buffer(4 * 256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            stage = pld.window(buf, [1, 256], dtype=pl.FP32)
+            data = pld.window(buf, [4, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(stage, data, signal, device=r)
+            data = pld.tensor.allgather(stage, data, signal)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(Exception, match=r"different window allocations"):
+        passes.lower_host_tensor_collectives()(program)
+
+
+def test_host_all_to_all_rejects_aliased_input_target_windows():
+    """Two pld.window views over one alloc must fail at host lowering."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[4, 256], pl.FP32],
+            data: pld.DistributedTensor[[4, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            buf = pld.alloc_window_buffer(4 * 256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            stage = pld.window(buf, [4, 256], dtype=pl.FP32)
+            data = pld.window(buf, [4, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(stage, data, signal, device=r)
+            data = pld.tensor.all_to_all(stage, data, signal)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(Exception, match=r"different window allocations"):
+        passes.lower_host_tensor_collectives()(program)
+
+
+def test_host_all_to_all_lowers_to_namesake_builtin():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[4, 256], pl.FP32],
+            data: pld.DistributedTensor[[4, 256], pl.FP32],
+            sig: pld.DistributedTensor[[4], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            # `stage_buf` (TPUT source) and `data_buf` (TPUT destination /
+            # result) must be two DISTINCT windows — reusing one buffer for
+            # both is a genuine cross-process data race (see
+            # python/pypto/runtime/builtins/collectives/all_to_all/templates
+            # /kernel.cpp.in for the full explanation).
+            stage_buf = pld.alloc_window_buffer(4 * 256 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(4 * 256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            stage = pld.window(stage_buf, [4, 256], dtype=pl.FP32)
+            data = pld.window(data_buf, [4, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(stage, data, signal, device=r)
+            data = pld.tensor.all_to_all(stage, data, signal)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    result = passes.lower_host_tensor_collectives()(program)
+    host = _get_func(result, "host_orch")
+    loops = _collect_for_stmts(host.body)
+    builtin_loops = [
+        loop
+        for loop in loops
+        if isinstance(loop.body, ir.EvalStmt)
+        and isinstance(loop.body.expr, ir.Call)
+        and loop.body.expr.op.name == "builtin.tensor.all_to_all"
+    ]
+    assert len(builtin_loops) == 1
+    body = builtin_loops[0].body
+    assert isinstance(body, ir.EvalStmt)
+    call = body.expr
+    assert isinstance(call, ir.Call)
+    assert list(call.arg_directions) == [
+        ir.ArgDirection.Input,
+        ir.ArgDirection.InOut,
+        ir.ArgDirection.InOut,
+    ]
+    assert call.kwargs["dtype"] == DataType.FP32
