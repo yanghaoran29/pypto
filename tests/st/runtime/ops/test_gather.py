@@ -43,6 +43,7 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
 
 # --- Shared init helpers ---
@@ -226,6 +227,55 @@ class GatherRank2SwapProgram:
     ) -> pl.Tensor[[4, 64], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP):
             out = pl.tensor.gather(inp, dim=-1, index=idx)
+            output = pl.assemble(output, out, [0, 0])
+        return output
+
+
+@pl.program
+class GatherRank2Swap16RowProgram:
+    """Rank-2 swap gather with 16 source rows (j^1 indices).
+
+    16 rows spans two A5 FP32 vector boxes, so this exercises the A5 full-tile
+    flat-index gather beyond the one-box (<=8-row) case that the 4-row variant
+    covers. Regression for the A5 ``pto.tgather`` >8-row index-tile corruption.
+    """
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def main(
+        self,
+        inp: pl.Tensor[[16, 64], pl.FP32],
+        idx: pl.Tensor[[16, 64], pl.INT32],
+        output: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+    ) -> pl.Tensor[[16, 64], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            out = pl.tensor.gather(inp, dim=-1, index=idx)
+            output = pl.assemble(output, out, [0, 0])
+        return output
+
+
+@pl.program
+class GatherRank2Swap16RowStridedProgram:
+    """Rank-2 swap gather over a STRIDED column slice of a wider tile.
+
+    Mirrors DeepSeek sparse_attn inverse-RoPE exactly: the source is a [16, 128]
+    tile whose columns [64:128] (ROPE_DIM=64) are gathered, so the gather source
+    is a non-contiguous column slice with row stride 128, not 64. With a [16, 64]
+    swap index this is the shape that corrupted on A5. The contiguous [16, 64]
+    variant (GatherRank2Swap16RowProgram) does NOT reproduce it.
+    """
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def main(
+        self,
+        inp: pl.Tensor[[16, 128], pl.FP32],
+        idx: pl.Tensor[[16, 64], pl.INT32],
+        output: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+    ) -> pl.Tensor[[16, 64], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            local = pl.create_tensor([16, 128], dtype=pl.FP32)
+            local = pl.assemble(local, inp, [0, 0])
+            rope = local[:, 64:128]
+            out = pl.tensor.gather(rope, dim=-1, index=idx)
             output = pl.assemble(output, out, [0, 0])
         return output
 
@@ -581,6 +631,12 @@ def _swap_indices_4x64() -> torch.Tensor:
     return (j ^ 1).unsqueeze(0).expand(4, -1).contiguous()
 
 
+def _swap_indices_16x64() -> torch.Tensor:
+    """Per-row adjacent swap over 16 rows: ``idx[r, j] = j ^ 1``."""
+    j = torch.arange(64, dtype=torch.int32)
+    return (j ^ 1).unsqueeze(0).expand(16, -1).contiguous()
+
+
 class GatherRank2ExpandTestCase(_GatherBaseTestCase):
     def get_name(self) -> str:
         return "gather_rank2_expand"
@@ -619,6 +675,46 @@ class GatherRank2SwapTestCase(_GatherBaseTestCase):
         inp = tensors["inp"]
         idx = tensors["idx"].to(torch.int64)
         tensors["output"][:] = torch.gather(inp, dim=-1, index=idx)
+
+
+class GatherRank2Swap16RowTestCase(_GatherBaseTestCase):
+    def get_name(self) -> str:
+        return "gather_rank2_swap_16row"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("inp", [16, 64], DataType.FP32, init_value=torch.randn),
+            TensorSpec("idx", [16, 64], DataType.INT32, init_value=_swap_indices_16x64),
+            TensorSpec("output", [16, 64], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return GatherRank2Swap16RowProgram
+
+    def compute_expected(self, tensors, params=None):
+        inp = tensors["inp"]
+        idx = tensors["idx"].to(torch.int64)
+        tensors["output"][:] = torch.gather(inp, dim=-1, index=idx)
+
+
+class GatherRank2Swap16RowStridedTestCase(_GatherBaseTestCase):
+    def get_name(self) -> str:
+        return "gather_rank2_swap_16row_strided"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("inp", [16, 128], DataType.FP32, init_value=torch.randn),
+            TensorSpec("idx", [16, 64], DataType.INT32, init_value=_swap_indices_16x64),
+            TensorSpec("output", [16, 64], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return GatherRank2Swap16RowStridedProgram
+
+    def compute_expected(self, tensors, params=None):
+        rope = tensors["inp"][:, 64:128]
+        idx = tensors["idx"].to(torch.int64)
+        tensors["output"][:] = torch.gather(rope, dim=-1, index=idx)
 
 
 class GatherRank3LastDimTestCase(_GatherBaseTestCase):
@@ -873,6 +969,20 @@ class TestGatherIndex:
     def test_gather_rank2_swap(self, test_runner, platform):
         """A5-focused swap gather (j^1) — rope-style adjacent swap."""
         result = test_runner.run(GatherRank2SwapTestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.platforms("a5", "a5sim")
+    @pytest.mark.parametrize("platform", [pytest.param("a5sim", id="a5sim"), pytest.param("a5", id="a5")])
+    def test_gather_rank2_swap_16row(self, test_runner, platform):
+        """A5 swap gather over 16 rows (>8) — regression for tgather >8-row corruption."""
+        result = test_runner.run(GatherRank2Swap16RowTestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.platforms("a5", "a5sim")
+    @pytest.mark.parametrize("platform", [pytest.param("a5sim", id="a5sim"), pytest.param("a5", id="a5")])
+    def test_gather_rank2_swap_16row_strided(self, test_runner, platform):
+        """A5 swap gather over a strided column slice — mirrors sparse_attn inverse-RoPE."""
+        result = test_runner.run(GatherRank2Swap16RowStridedTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)

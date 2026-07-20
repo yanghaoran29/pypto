@@ -3113,6 +3113,53 @@ class TestConvertGatherOp:
         assert "pl.tile.slice(" in after_src
         assert "pl.range(" not in after_src
 
+    def test_gather_conversion_strided_tile_source_materializes(self):
+        """A5 flat-index gather materializes a strided tile.slice source.
+
+        Regression for the strided-source corruption (DeepSeek sparse_attn
+        inverse-RoPE): flat[i,j] = i*src_cols + idx assumes the source is stored
+        row-major with stride == src_cols, but a tile.slice view of a wider tile
+        (rope = full[:, nope:head]) keeps the parent's wider stride, so every row
+        past the first is misaddressed. The converter now copies the TileType
+        source into a fresh contiguous tile (tile.create + tile.assemble) before
+        the flat-index tile.gather. The contiguous TensorType path
+        (test_gather_conversion) already materializes via tile.load and is not
+        copied.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                full: pl.Tensor[[4, 16], pl.FP32] = pl.create_tensor([4, 16], dtype=pl.FP32)
+                full_1: pl.Tensor[[4, 16], pl.FP32] = pl.assemble(full, src, [0, 0])
+                rope = full_1[:, 8:16]
+                out: pl.Tensor[[4, 8], pl.FP32] = pl.tensor.gather(rope, dim=-1, index=idx)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                out: pl.Tensor[[4, 8], pl.FP32] = self.main_incore_0(src, idx)
+                return out
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        after_src = After.as_python()
+
+        assert after_src.count("pl.tile.gather(") == 1
+        # The strided tile.slice source (rope = full[:, 8:16], row stride 16 not
+        # 8) is copied into a fresh contiguous tile that feeds the flat-index
+        # gather, instead of being gathered directly.
+        assert "pl.tile.assemble(gather_src_alloc, gather_inp" in after_src
+        assert "pl.tile.gather(gather_src_copy," in after_src
+
     def test_gather_mask_conversion(self):
         """tensor.gather(mask_pattern=...) -> tile.load + tile.gather_mask + tile.store."""
         before, expected = _make_pair(

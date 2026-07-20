@@ -1368,6 +1368,25 @@ void OpConversionRegistry::RegisterGatherOps() {
           return flat;
         };
 
+        // A5 flat-index gather addresses the source as a flat 1D array
+        // (flat[i,j] = i * src_cols + index[i,j]), which assumes the source is
+        // stored row-major with stride == src_cols. A tile.slice *view* of a
+        // wider tile keeps the parent's stride (e.g. rope = full[:, nope:head]
+        // has stride HEAD_DIM, not ROPE_DIM), so the flat offset misaddresses
+        // every row past the first — only row 0 survives. tile.load already
+        // materializes TensorType sources to a fresh contiguous tile; only
+        // TileType sources — lowered to a view-only tile.slice by
+        // emit_load_or_slice — need this copy into a fresh contiguous tile.
+        auto materialize_src_contig = [&](const VarPtr& src, int64_t rows, int64_t cols,
+                                          DataType dtype, const std::string& name) -> VarPtr {
+          auto sh = MakeShapeTuple({make_idx(rows), make_idx(cols)}, span);
+          std::vector<std::pair<std::string, std::any>> alloc_kw = {
+              {"dtype", dtype}, {"target_memory", MemorySpace::Vec}};
+          auto contig = emit_to(prologue, "tile.create", {sh}, alloc_kw, name + "_alloc");
+          auto ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero}, span);
+          return emit_to(prologue, "tile.assemble", {contig, src, ofs}, {}, name + "_copy");
+        };
+
         // ================================================================
         // Case 1  rank==2, dim==1 (last dim)
         // A5: full-tile gather with flat indices (mirrors tensor.scatter).
@@ -1391,13 +1410,20 @@ void OpConversionRegistry::RegisterGatherOps() {
             auto zero_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero}, span);
             auto inp_sh = MakeShapeTuple({make_idx(I0), make_idx(S1)}, span);
             auto inp_full = emit_load_or_slice(prologue, input, zero_ofs, inp_sh, "gather_inp");
+            // Materialize a possibly-strided TileType source (see comment on
+            // materialize_src_contig) so the flat-index gather addresses it
+            // correctly. TensorType sources are already contiguous (tile.load).
+            VarPtr gather_src = inp_full;
+            if (As<TileType>(input->GetType())) {
+              gather_src = materialize_src_contig(inp_full, I0, S1, input_dtype, "gather_src");
+            }
             auto idx_sh = MakeShapeTuple({make_idx(I0), make_idx(K)}, span);
             auto idx_full = emit_load_or_slice(prologue, index, zero_ofs, idx_sh, "gather_idx");
 
             auto flat_idx = emit_a5_flat_idx(prologue, idx_full, I0, S1, K, "gather");
             auto tmp_sh = MakeShapeTuple({make_idx(I0), make_idx(K)}, span);
             auto tmp = emit("tile.create", {tmp_sh}, tmp_create_kwargs, "gather_tmp");
-            auto result = emit("tile.gather", {inp_full, flat_idx, tmp}, {}, "gather");
+            auto result = emit("tile.gather", {gather_src, flat_idx, tmp}, {}, "gather");
             return ConversionResult{std::move(prologue), result};
           }
 
@@ -1441,6 +1467,13 @@ void OpConversionRegistry::RegisterGatherOps() {
             auto inp_sh = MakeShapeTuple({make_idx(I0), make_idx(I1), make_idx(S2)}, span);
             auto inp_raw = emit_load_or_slice(prologue, input, zero_ofs, inp_sh, "gather_inp_raw");
             auto inp_2d = reshape_to(prologue, inp_raw, {make_idx(I0I1), make_idx(S2)}, "gather_inp");
+            // Materialize a possibly-strided TileType source (see comment on
+            // materialize_src_contig); the reshape above preserves a strided
+            // 3D slice's wider stride, which would break the flat-index gather.
+            VarPtr gather_src = inp_2d;
+            if (As<TileType>(input->GetType())) {
+              gather_src = materialize_src_contig(inp_2d, I0I1, S2, input_dtype, "gather_src");
+            }
             auto idx_sh = MakeShapeTuple({make_idx(I0), make_idx(I1), make_idx(K)}, span);
             auto idx_raw = emit_load_or_slice(prologue, index, zero_ofs, idx_sh, "gather_idx_raw");
             auto idx_2d = reshape_to(prologue, idx_raw, {make_idx(I0I1), make_idx(K)}, "gather_idx");
@@ -1448,7 +1481,7 @@ void OpConversionRegistry::RegisterGatherOps() {
             auto flat_idx = emit_a5_flat_idx(prologue, idx_2d, I0I1, S2, K, "gather");
             auto tmp_sh = MakeShapeTuple({make_idx(I0I1), make_idx(K)}, span);
             auto tmp = emit("tile.create", {tmp_sh}, tmp_create_kwargs, "gather_tmp");
-            auto result = emit("tile.gather", {inp_2d, flat_idx, tmp}, {}, "gather");
+            auto result = emit("tile.gather", {gather_src, flat_idx, tmp}, {}, "gather");
             // Trailing reshape keeps Phase 3 off (same as the legacy path).
             auto out_2d = reshape_to(prologue, result, {make_idx(I0I1), make_idx(K)}, "gather_out");
             return ConversionResult{std::move(prologue), out_2d};
