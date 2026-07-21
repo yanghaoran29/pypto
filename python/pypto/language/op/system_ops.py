@@ -30,9 +30,9 @@ from pypto.ir.op.system_ops import (
 )
 from pypto.ir.utils import _get_span_or_capture
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Call, ConstInt, MemorySpace, Span
+from pypto.pypto_core.ir import Call, ConstInt, MemorySpace, PipeType, Span
 
-from ..typing import Array, Scalar, Tensor, Tile
+from ..typing import Array, IntLike, Scalar, Tensor, Tile
 
 # pto::SYNCALL soft barrier reserves 8 int32 slots per participating core.
 _SYNCALL_SOFT_SLOT_INT32 = 8
@@ -41,6 +41,9 @@ __all__ = [
     "AUTO",
     "sync_src",
     "sync_dst",
+    "sync_set",
+    "sync_wait",
+    "set_ffts",
     "bar_v",
     "bar_m",
     "bar_all",
@@ -60,6 +63,44 @@ __all__ = [
     "task_invalid",
     "task_dummy",
 ]
+
+
+def sync_set(
+    event_id: IntLike,
+    *,
+    pipe: PipeType,
+    ffts_mode: int | None = None,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Set a Cube/Vector cross-core event using a static or dynamic event id.
+
+    Set ``core_type`` to ``"aic"`` or ``"aiv"`` inside a mixed InCore kernel.
+    """
+    event_expr = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.sync_set(event_expr, pipe=pipe, ffts_mode=ffts_mode, core_type=core_type, span=span)
+
+
+def sync_wait(
+    event_id: IntLike,
+    *,
+    pipe: PipeType,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Wait for a Cube/Vector cross-core event using a static or dynamic event id.
+
+    Set ``core_type`` to ``"aic"`` or ``"aiv"`` inside a mixed InCore kernel.
+    """
+    event_expr = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.sync_wait(event_expr, pipe=pipe, core_type=core_type, span=span)
+
+
+def set_ffts(workspace: Tensor, *, span: Span | None = None) -> Call:
+    """Declare the A3 FFTS setup operand for explicit cross-core synchronization."""
+    if not isinstance(workspace, Tensor):
+        raise TypeError(f"set_ffts workspace must be a Tensor, got {type(workspace).__name__}")
+    return _ir_ops.set_ffts(workspace.unwrap(), span=span)
 
 
 _SYNCALL_SOFT_CORE_TYPES = ("aiv_only", "aic_only", "mix")

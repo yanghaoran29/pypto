@@ -11,6 +11,7 @@
 
 System operations handle hardware synchronization and cross-core communication:
 - sync_src / sync_dst: Set/Wait flag-based synchronization between pipes
+- set_ffts / sync_set / sync_wait: Explicit Cube/Vector cross-core event synchronization
 - bar_v / bar_m / bar_all: Barrier synchronization for vector, matrix, or all units
 - tpush_to_aiv / tpush_to_aic: Push tile data across cores
 - tpop_from_aic / tpop_from_aiv: Pop tile data from cross-core pipe
@@ -19,7 +20,7 @@ System operations handle hardware synchronization and cross-core communication:
 """
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
@@ -117,6 +118,94 @@ def sync_dst(
     """
     return _create_sync_op(
         "system.sync_dst", set_pipe=set_pipe, wait_pipe=wait_pipe, event_id=event_id, span=span
+    )
+
+
+_MIN_FFTS_WORKSPACE_ELEMENTS = 256
+
+
+def set_ffts(workspace: Expr, *, span: Span | None = None) -> Call:
+    """Declare the A3 FFTS setup operand for explicit cross-core synchronization."""
+    workspace_type = workspace.type
+    if not isinstance(workspace_type, TensorType):
+        raise TypeError(f"system.set_ffts workspace must be a Tensor, got {workspace_type}")
+    if workspace_type.dtype != DataType.INT64:
+        raise TypeError(f"system.set_ffts workspace must have INT64 dtype, got {workspace_type.dtype}")
+    if len(workspace_type.shape) != 1:
+        raise ValueError(f"system.set_ffts workspace must be 1-D, got rank {len(workspace_type.shape)}")
+    workspace_size = workspace_type.shape[0]
+    if not isinstance(workspace_size, ConstInt) or workspace_size.value < _MIN_FFTS_WORKSPACE_ELEMENTS:
+        raise ValueError(
+            "system.set_ffts workspace must have a static length of at least "
+            f"{_MIN_FFTS_WORKSPACE_ELEMENTS} INT64 elements"
+        )
+
+    actual_span = _get_span_or_capture(span, frame_offset=2)
+    return _ir_core.create_op_call("system.set_ffts", [workspace], {}, actual_span)
+
+
+def _create_cross_core_sync_op(
+    op_name: str,
+    event_id: int | Expr,
+    *,
+    pipe: PipeType,
+    ffts_mode: int | None,
+    core_type: str | None,
+    span: Span | None,
+) -> Call:
+    """Create a PTO cross-core sync set/wait operation."""
+    args: list[Expr] = []
+    kwargs: dict[str, Any] = {"pipe": pipe}
+    if isinstance(event_id, int) and not isinstance(event_id, bool):
+        kwargs["event_id"] = event_id
+    elif isinstance(event_id, Expr):
+        args.append(event_id)
+    else:
+        raise TypeError(f"{op_name} event_id must be int or Expr, got {type(event_id).__name__}")
+
+    if ffts_mode is not None:
+        kwargs["ffts_mode"] = ffts_mode
+    if core_type is not None:
+        if core_type not in ("aic", "aiv"):
+            raise ValueError(f"{op_name} core_type must be 'aic' or 'aiv', got {core_type!r}")
+        kwargs["core_type"] = core_type
+
+    actual_span = _get_span_or_capture(span, frame_offset=2)
+    return _ir_core.create_op_call(op_name, args, kwargs, actual_span)
+
+
+def sync_set(
+    event_id: int | Expr,
+    *,
+    pipe: PipeType,
+    ffts_mode: int | None = None,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Set an explicit Cube/Vector cross-core synchronization event.
+
+    ``core_type`` targets the operation to one lane when expanding a mixed
+    InCore kernel. It may be omitted in an explicitly typed AIC/AIV function.
+    """
+    return _create_cross_core_sync_op(
+        "system.sync_set", event_id, pipe=pipe, ffts_mode=ffts_mode, core_type=core_type, span=span
+    )
+
+
+def sync_wait(
+    event_id: int | Expr,
+    *,
+    pipe: PipeType,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Wait for an explicit Cube/Vector cross-core synchronization event.
+
+    ``core_type`` targets the operation to one lane when expanding a mixed
+    InCore kernel. It may be omitted in an explicitly typed AIC/AIV function.
+    """
+    return _create_cross_core_sync_op(
+        "system.sync_wait", event_id, pipe=pipe, ffts_mode=None, core_type=core_type, span=span
     )
 
 
