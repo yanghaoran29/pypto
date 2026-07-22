@@ -20,13 +20,10 @@ jobs:
     # consumed via `needs.toolchain.outputs.*`. Bumping the runtime submodule
     # moves pypto's pto-isa in lockstep.
     #
-    # Runs on the same self-hosted arm64 CPU runner + container as clang-tidy so
-    # the whole pipeline stays on in-house infra (no GitHub-hosted minutes) and
-    # every job sees the same base image. This job only greps/reads pinned files,
-    # so it needs no pip cache mount.
-    runs-on: [self-hosted, linux, arm64, cpu]
-    container:
-      image: localhost:5000/ci-py310:latest
+    # Only greps/reads pinned files (no build, no pip), so it runs on a
+    # GitHub-hosted runner — the same as daily_ci.yml's toolchain job — instead of
+    # occupying an in-house self-hosted slot behind a container.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -81,39 +78,83 @@ jobs:
         extra_args: --all-files
 
   clang-tidy:
+    # De-containered: runs host-native on the in-house arm64 CPU runner (same
+    # infra as before, minus the localhost:5000/ci-py310 image). clang_tidy.py
+    # generates compile_commands.json via a CMake configure (needs cmake / ninja /
+    # nanobind and a C++ compiler) and pip-installs the pinned clang-tidy, so it
+    # borrows the runner's conda py310 env for the toolchain. It never builds the
+    # full extension or goes on-board, so it does NOT use setup-ci-job (no ptoas /
+    # pto-isa / simpler / device) — just the conda env + a per-job venv.
+    #
+    # Checks out under ./clang-tidy-checkout so its `git clean` never wipes the
+    # sibling codegen-checkout tree (both jobs share the arm64 cpu runner pool).
     runs-on: [self-hosted, linux, arm64, cpu]
-    container:
-      image: localhost:5000/ci-py310:latest
-      options: >-
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pip:/root/.cache/pip
-
+    defaults:
+      run:
+        working-directory: clang-tidy-checkout
     steps:
     - name: Checkout
       uses: actions/checkout@v4
       with:
         submodules: true
+        path: clang-tidy-checkout
+        # Host-native on a persistent self-hosted runner now: don't leave the
+        # token in the reused .git/config between runs (zizmor artipacked), same
+        # as every setup-ci-job / action-defs checkout in these workflows.
+        persist-credentials: false
 
     - name: Fetch base branch for diff
       if: github.event_name == 'pull_request'
       run: git fetch origin ${{ github.base_ref }} --depth=1
 
-    # The runner image ships Ubuntu's clang-tidy 14, which predates checks the
-    # project enables (misc-include-cleaner needs LLVM 17+) and skips them
-    # silently.  Install the version clang_tidy.py requires, reading it from the
-    # script so the pin has a single source of truth.
-    - name: Install pinned clang-tidy
-      env:
-        # The job mounts the runner's pip cache at /root/.cache/pip, but Actions
-        # sets HOME=/github/home, so pip never looks there and re-fetches the
-        # 39 MB wheel on every run — which is what makes this step flaky.
-        PIP_CACHE_DIR: /root/.cache/pip
+    - name: Derive pip cache dir from runner config
+      # Read the host layout from the runner's .env (no absolute path in git); the
+      # pip cache lives under CI_CACHE_ROOT like every other job's.
+      shell: bash
       run: |
+        set -uo pipefail
+        for key in CONDA_ROOT CI_CACHE_ROOT; do
+          if [ -z "${!key:-}" ]; then
+            echo "::error::$key is not set — add it to this runner's .env"
+            exit 1
+          fi
+        done
+        mkdir -p "$CI_CACHE_ROOT"
+        echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/pip-clang-tidy" >> "$GITHUB_ENV"
+
+    # The system image used to ship Ubuntu's clang-tidy 14, which predates checks
+    # the project enables (misc-include-cleaner needs LLVM 17+) and skips them
+    # silently. Install the version clang_tidy.py requires (single source of truth)
+    # into a per-job venv layered on the conda env.
+    - name: Bootstrap venv + install pinned clang-tidy
+      shell: bash
+      env:
+        CONDA_ENV: py310
+      run: |
+        source "$CONDA_ROOT/etc/profile.d/conda.sh"
+        if ! conda activate "$CONDA_ENV"; then
+          echo "::error::conda env '$CONDA_ENV' not found under $CONDA_ROOT"
+          exit 1
+        fi
+        rm -rf venv
+        python -m venv venv --system-site-packages
+        source venv/bin/activate
+        python -m pip install --upgrade pip
+        # cmake / ninja / nanobind: clang_tidy.py configures CMake with
+        # -DCMAKE_EXPORT_COMPILE_COMMANDS=ON and reads nanobind's cmake dir.
+        pip install cmake ninja nanobind
         VERSION=$(python -c "import sys; sys.path.insert(0, 'tests/lint'); from clang_tidy import REQUIRED_VERSION; print(REQUIRED_VERSION)")
-        python -m pip install --retries 5 --timeout 60 "clang-tidy==${VERSION}"
+        pip install --retries 5 --timeout 60 "clang-tidy==${VERSION}"
         clang-tidy --version
 
     - name: Run clang-tidy
+      shell: bash
+      env:
+        CONDA_ENV: py310
       run: |
+        source "$CONDA_ROOT/etc/profile.d/conda.sh"
+        conda activate "$CONDA_ENV"
+        source venv/bin/activate
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           python tests/lint/clang_tidy.py --strict-version --jobs=$(nproc) --diff-base=origin/${{ github.base_ref }}
         else
@@ -170,51 +211,59 @@ jobs:
     # on-board. --codegen-only skips assembly (ptoas), pto-isa, simpler and
     # device execution (see tests/st/harness/core/test_runner.py), so this
     # runs on a CPU runner and never competes for NPU cards.
+    #
+    # No container: it used to run as root in localhost:5000/ci-py310, which
+    # forced the root/ci-runner umask split on the shared ccache. Now it runs
+    # host-native as ci-runner through the same setup-ci-job as the device jobs,
+    # with needs-device:false (no NPU, no CANN) and install-toolchain:false (no
+    # ptoas / pto-isa / simpler — codegen-only needs none). Checkout / install
+    # land under ./codegen-checkout so they don't collide with other jobs' trees
+    # on the shared self-hosted host.
     runs-on: [self-hosted, linux, arm64, cpu]
+    defaults:
+      run:
+        working-directory: codegen-checkout
     env:
+      # No PTOAS_ROOT / PTO_ISA_ROOT: install-toolchain:false means setup-ci-job
+      # never assembles or clones pto-isa, so codegen-only needs neither.
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /root/.cache/ccache
       CCACHE_MAXSIZE: 30G
-      # This job (root, in-container) shares the host ci-cache/ccache dir with the
-      # de-dockerized device jobs (ci-runner). 000 keeps root-written cache files
-      # group/world-writable so ci-runner can update / LRU-evict them, and vice
-      # versa — same rationale as pypto-lib's sim/a2a3 cache sharing.
+      # Shared ci-cache/ccache dir. Every job now runs as ci-runner (no container
+      # root), but the dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* are derived by setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      PIP_CACHE_DIR: /root/.cache/pip
-    container:
-      image: localhost:5000/ci-py310:latest
-      options: >-
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pip:/root/.cache/pip
-        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache:/root/.cache/ccache
     steps:
-      - uses: actions/checkout@v4
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
         with:
-          submodules: true
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
 
-      - name: Show ccache stats (before)
-        run: ccache -s || true
-
-      - name: Install project and dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install scikit-build-core nanobind cmake ninja
-          rm -rf ./build ./_skbuild
-          test ! -e ./build && test ! -e ./_skbuild && echo "OK: pypto build removed"
-          pip install --no-build-isolation .[dev]
-
-      - name: Show ccache stats (after)
-        run: ccache -s || true
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: codegen-checkout
+          needs-device: 'false'
+          install-toolchain: 'false'
+          pip-cache-name: pip-codegen
 
       - name: Test codegen (codegen-only, no device)
         # test_torch_codegen_paged_attention does a numeric golden compare whose
         # bf16/fp16 accumulation is sensitive to the host torch/BLAS build; it
-        # drifts past tolerance on this CPU container, so it runs in the npu
+        # drifts past tolerance on this CPU host, so it runs in the npu
         # system-tests job instead (it needs no device, only that environment).
-        run: >-
-          pytest tests/st/codegen -v --codegen-only
-          --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
+        # `python -m pytest`, not bare `pytest`: the per-job venv is layered on
+        # conda py310 with --system-site-packages, so pip leaves pytest's entry
+        # point in the base env (already satisfied) and a bare `pytest` would run
+        # under the base interpreter, which cannot see the venv-installed pypto.
+        run: |
+          source activate.sh
+          python -m pytest tests/st/codegen -v --codegen-only \
+            --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
 
   system-tests:
     # Batched shard A (mechanism A): the HEAVY device_batch directories — all of
@@ -260,7 +309,6 @@ jobs:
       run:
         working-directory: st-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/st-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/st-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -268,15 +316,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
-      # CCACHE_NAMESPACE is set by the "Scope ccache to pto-isa version" step.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-st
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -291,10 +337,12 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: st-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-st
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
 
       - name: Test system tests (batched shard A — heavy dirs, all but ops/cross_core)
@@ -371,7 +419,6 @@ jobs:
       run:
         working-directory: st-direct-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/st-direct-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/st-direct-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -379,15 +426,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
-      # CCACHE_NAMESPACE is set by the "Scope ccache to pto-isa version" step.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-st-direct
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -402,10 +447,12 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: st-direct-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-st-direct
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
 
       - name: Test system tests (batched shard B — ops + cross_core, cheap compiles)
@@ -510,7 +557,6 @@ jobs:
       run:
         working-directory: dist-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -518,14 +564,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-dist
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -540,10 +585,12 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: dist-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-dist
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
           unset-ring: 'true'
 
@@ -584,7 +631,6 @@ jobs:
       run:
         working-directory: lib-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/lib-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/lib-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -592,14 +638,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-lib
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -614,10 +659,12 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: lib-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-lib
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
 
       - name: Clone pypto-lib (Qwen3-14B + DeepSeek-V4 models)

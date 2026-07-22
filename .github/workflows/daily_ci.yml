@@ -131,7 +131,6 @@ jobs:
       run:
         working-directory: perf-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/perf-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/perf-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -139,14 +138,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-perf
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -161,10 +159,12 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: perf-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-perf
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
 
       - name: Clone pypto-lib (Qwen3-14B decode)
