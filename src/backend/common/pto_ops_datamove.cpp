@@ -1192,6 +1192,48 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       return std::string("");
     }
 
+    // !pto.f8E8M0 is not a legal pto.treshape dtype. Same-byte reinterpret onto
+    // an addressed tile must be an alloc_tile alias at the shared MemRef addr.
+    const bool involves_f8e8m0 =
+        result_type.find("f8E8M0") != std::string::npos ||
+        codegen.GetExprTypeAnnotation(op->args_[0]).find("f8E8M0") != std::string::npos;
+    if (involves_f8e8m0 && codegen.EmitTileAddr()) {
+      std::optional<int64_t> alias_off;
+      if (result_has_memref) {
+        if (auto off = ir::As<ir::ConstInt>((*result_tile->memref_)->byte_offset_)) {
+          alias_off = off->value_;
+        }
+      } else if (source_tile->memref_.has_value()) {
+        if (auto off = ir::As<ir::ConstInt>((*source_tile->memref_)->byte_offset_)) {
+          alias_off = off->value_;
+        }
+      } else {
+        // Cross-core tpop Mat lives in the reserved V2C Mat slot (base=0).
+        alias_off = 0;
+      }
+      INTERNAL_CHECK_SPAN(alias_off.has_value(), op->span_)
+          << "Internal error: tile.reinterpret_view to/from FP8E8M0 requires a Mat "
+             "byte offset for alloc-tile aliasing";
+      // MemRef-less results only register a type string without emitting alloc_tile;
+      // always emit a typed alias SSA here (do not trust existing_type alone).
+      if (!(result_has_memref && !existing_type.empty() && existing_type == result_type)) {
+        auto shape = result_tile->shape_;
+        INTERNAL_CHECK_SPAN(shape.size() >= 2, op->span_);
+        auto r = ir::As<ir::ConstInt>(shape[0]);
+        auto c = ir::As<ir::ConstInt>(shape[1]);
+        INTERNAL_CHECK_SPAN(r && c, op->span_);
+        std::string addr = codegen.GetOrEmitConstant(*alias_off, DataType::INT64);
+        std::string vr = codegen.GetOrEmitConstant(r->value_, DataType::INDEX);
+        std::string vc = codegen.GetOrEmitConstant(c->value_, DataType::INDEX);
+        std::string view = codegen.NewNamedTemp("reinterpret_view_buf");
+        codegen.Emit(view + " = pto.alloc_tile addr = " + addr + " valid_row = " + vr + " valid_col = " + vc +
+                     " : " + result_type);
+        codegen.RegisterTileBufType(view, result_type);
+        codegen.SetCurrentResultBuf(view);
+      }
+      return std::string("");
+    }
+
     // PTOAS treshape is the byte-preserving dtype/shape reinterpret primitive.
     // Use it even when the shape is unchanged: pto.bitcast does not preserve the
     // source tile payload on current A2/A3 runtimes.
@@ -1281,6 +1323,13 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
 
     codegen.RegisterTileBufType(tile_buf, tile_buf_type);
     codegen.SetCurrentResultBuf(tile_buf);
+    // Canonical MX path: move(..., LeftScale) registers a pending fill that
+    // flushes only at tget_scale_addr. Defer set_validshape until after that
+    // fill so TMov / matmul see runtime valid on the L0-bound Scale tile.
+    if (codegen.HasPendingScaleFill(tile_buf)) {
+      codegen.RegisterPendingSetValidShape(tile_buf, {vr, vc, tile_buf_type});
+      return std::string("");
+    }
     codegen.Emit("pto.set_validshape " + tile_buf + ", " + vr + ", " + vc + " : " + tile_buf_type);
     return std::string("");
   });

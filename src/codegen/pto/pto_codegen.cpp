@@ -871,6 +871,13 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
 
   indent_level_--;
   stream_ << "  }\n";
+
+  // Deferred Mat→LeftScale/RightScale fills must be flushed by the bind-then-fill
+  // sequence before the function ends; an unflushed fill would leave the scale
+  // tile allocated but unwritten.
+  INTERNAL_CHECK(!HasPendingScaleFills())
+      << "Internal error: unflushed deferred scale fill at end of function — a "
+         "tile.move to LeftScale/RightScale requires a matching tget_scale_addr";
 }
 
 void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
@@ -1329,6 +1336,20 @@ const PTOCodegen::SubviewMaterializationInfo* PTOCodegen::GetSubviewMaterializat
   auto it = fs_.subview_materializations.find(subview_ssa);
   return it != fs_.subview_materializations.end() ? &it->second : nullptr;
 }
+
+void PTOCodegen::RegisterPendingScaleFill(const std::string& dst_ssa, PendingScaleFill fill) {
+  fs_.pending_scale_fills[dst_ssa] = std::move(fill);
+}
+
+bool PTOCodegen::HasPendingScaleFill(const std::string& dst_ssa) const {
+  return fs_.pending_scale_fills.find(dst_ssa) != fs_.pending_scale_fills.end();
+}
+
+void PTOCodegen::RegisterPendingSetValidShape(const std::string& dst_ssa, PendingSetValidShape pending) {
+  fs_.pending_set_validshapes[dst_ssa] = std::move(pending);
+}
+
+bool PTOCodegen::HasPendingScaleFills() const { return !fs_.pending_scale_fills.empty(); }
 
 void PTOCodegen::RecordGMSlotBufferSSA(const std::string& ssa, const DataType& dtype) {
   CHECK(dtype == DataType::FP32) << "__gm_pipe_buffer must use FP32 elements, got " << dtype.ToString();

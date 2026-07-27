@@ -409,6 +409,36 @@ class PTOCodegen : public CodegenBase {
   SubviewMaterializationInfo* GetSubviewMaterialization(const std::string& subview_ssa);
   const SubviewMaterializationInfo* GetSubviewMaterialization(const std::string& subview_ssa) const;
 
+  /// Deferred Mat→LeftScale/RightScale fill: tmov must run AFTER tget_scale_addr
+  /// rebinds the Scale tile to GetScaleAddr(Left/Right), otherwise the extract
+  /// lands at the provisional alloc address and is orphaned. Matches ptoas
+  /// PTOA5NormalizeTMovPass (tget before matching mat→scaling tmov) and ISA
+  /// sidecar bind-then-fill.
+  struct PendingScaleFill {
+    std::string src_ssa;
+    std::string src_ty;
+  };
+  void RegisterPendingScaleFill(const std::string& dst_ssa, PendingScaleFill fill);
+  [[nodiscard]] bool HasPendingScaleFill(const std::string& dst_ssa) const;
+  /// Deferred set_validshape on a Scale tile that still has a pending fill:
+  /// apply after tget + fill so TMov/GetValid* and matmul see the runtime M.
+  /// NOTE: the flush path (consume pending_set_validshapes on tget_scale_addr)
+  /// is not yet implemented — the entry is registered but never read until the
+  /// tget_scale_addr op lands in a follow-up PR.  tile_buf_type is retained for
+  /// that future flush and is intentionally not deduplicated against
+  /// ssa_to_tile_buf_type.
+  struct PendingSetValidShape {
+    std::string valid_row_ssa;
+    std::string valid_col_ssa;
+    std::string tile_buf_type;
+  };
+  void RegisterPendingSetValidShape(const std::string& dst_ssa, PendingSetValidShape pending);
+  /// True if any deferred Mat→LeftScale/RightScale fill is still pending — a
+  /// scale move registered a fill that the bind-then-fill sequence has not yet
+  /// flushed. GenerateFunction asserts this is false at function end so an
+  /// unflushed fill cannot silently emit an unwritten scale tile.
+  bool HasPendingScaleFills() const;
+
   /**
    * @brief Record the SSA name of the __gm_pipe_buffer function parameter
    *
@@ -785,6 +815,8 @@ class PTOCodegen : public CodegenBase {
     std::vector<ExtraAllocTile> extra_alloc_tiles;
     std::map<std::string, std::string> ssa_to_tile_buf_type;
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
+    std::map<std::string, PendingScaleFill> pending_scale_fills;
+    std::map<std::string, PendingSetValidShape> pending_set_validshapes;
 
     int temp_counter = 0;
     std::set<std::string> used_ssa_names;
@@ -863,6 +895,8 @@ class PTOCodegen : public CodegenBase {
       extra_alloc_tiles.clear();
       ssa_to_tile_buf_type.clear();
       subview_materializations.clear();
+      pending_scale_fills.clear();
+      pending_set_validshapes.clear();
 
       temp_counter = 0;
       used_ssa_names.clear();
