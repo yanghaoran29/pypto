@@ -840,9 +840,9 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 // Public group_axis=1 is the A-side [M,K] path. group_axis=0 is the B-side
 // [N,K] path: transpose to [K,N] first, then PTOAS axis0. Axis0 X-to-ZZ follows
 // pto-isa TMovDnTo2Zz (pin be5ccb76): DN [M̂,N] -> ZZ [N,M̂] row/row, then a
-// zero-copy tile.transpose_view yields the public [M̂,N] col/col scale. Same-
-// InCore mix with matmul_mx is not supported yet; stage through GM between AIV
-// and AIC (follow-up).
+// zero-copy tile.transpose_view yields the public [M̂,N] col/col scale. On
+// Ascend950, ExpandMixedKernel carries both public results directly from AIV to
+// matmul_mx on AIC in the same InCore mixed task.
 ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const auto& span = call->span_;
   auto& reg = OpRegistry::GetInstance();

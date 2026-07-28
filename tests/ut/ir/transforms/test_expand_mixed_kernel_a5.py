@@ -42,6 +42,9 @@ _AUTO_TFREE_OPS = {
     ir.get_op("system.tfree_to_aiv").name,
 }
 
+_TILE_MOVE = ir.get_op("tile.move").name
+_TILE_RESHAPE = ir.get_op("tile.reshape").name
+
 
 def _expand_raw(program):
     """Run convert_to_ssa, infer_tile_memory_space then expand_mixed_kernel."""
@@ -1466,6 +1469,154 @@ class TestCrossCoreBoundaries:
                 return out_0
 
         ir.assert_structural_equal(After, Expected)
+
+    @staticmethod
+    def _mx_scale_adapters(program):
+        """Return AIV layout-adapter assignments for FP8E8M0 V2C payloads."""
+        aiv = program.get_function("main_incore_0_aiv")
+        assert aiv is not None
+        result = []
+        for stmt in _flatten_top_level_stmts(aiv.body):
+            if not isinstance(stmt, ir.AssignStmt) or not isinstance(stmt.value, ir.Call):
+                continue
+            result_type = stmt.var.type
+            if (
+                isinstance(result_type, ir.TileType)
+                and result_type.dtype == pl.FP8E8M0
+                and result_type.memory_space == pl.Mem.Vec
+                and stmt.value.op.name in {_TILE_MOVE, _TILE_RESHAPE}
+            ):
+                result.append(stmt)
+        return result
+
+    @classmethod
+    def _mx_scale_adapter_ops(cls, program):
+        """Return the op names of MX-scale V2C layout adapters."""
+        return [stmt.value.op.name for stmt in cls._mx_scale_adapters(program)]
+
+    def test_matching_mx_scale_layout_uses_byte_preserving_alias(self):
+        """A matching row/row/32 scale crosses V2C without reordering its bytes."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                rhs: pl.Tensor[[64, 32], pl.FP8E4M3FN],
+                rhs_scale: pl.Tensor[[2, 32], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+                quant_mat = pl.move(
+                    quant,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                lhs = pl.move(quant_mat, target_memory=pl.Mem.Left)
+                scale_mat = pl.move(
+                    scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
+                rhs_mat = pl.load(rhs, [0, 0], [64, 32], target_memory=pl.Mem.Mat)
+                rhs_tile = pl.move(rhs_mat, target_memory=pl.Mem.Right)
+                rhs_scale_mat = pl.load(rhs_scale, [0, 0], [2, 32], target_memory=pl.Mem.Mat)
+                rhs_scale_tile = pl.move(rhs_scale_mat, target_memory=pl.Mem.RightScale)
+                result = pl.matmul_mx(lhs, lhs_scale, rhs_tile, rhs_scale_tile)
+                out = pl.store(result, [0, 0], out)
+                return out
+
+        After = _expand(Before)
+
+        assert self._mx_scale_adapter_ops(After) == [_TILE_RESHAPE]
+
+    def test_matching_col_major_mx_scale_uses_byte_preserving_alias(self):
+        """A group_axis=0 col/col/32 scale keeps its B-side logical layout."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[32, 64], pl.FP32],
+                lhs_data: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                lhs_scale_data: pl.Tensor[[16, 2], pl.FP8E8M0, pl.MX_A_ZZ],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [32, 64]), group_axis=0)
+                quant_mat = pl.move(
+                    quant,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                rhs = pl.move(quant_mat, target_memory=pl.Mem.Right)
+                scale_mat = pl.move(
+                    scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.col_major,
+                )
+                rhs_scale = pl.move(scale_mat, target_memory=pl.Mem.RightScale)
+                lhs_mat = pl.load(lhs_data, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+                lhs = pl.move(lhs_mat, target_memory=pl.Mem.Left)
+                lhs_scale_mat = pl.load(lhs_scale_data, [0, 0], [16, 2], target_memory=pl.Mem.Mat)
+                lhs_scale = pl.move(lhs_scale_mat, target_memory=pl.Mem.LeftScale)
+                result = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+                out = pl.store(result, [0, 0], out)
+                return out
+
+        After = _expand(Before)
+
+        assert self._mx_scale_adapter_ops(After) == [_TILE_RESHAPE]
+        (adapter,) = self._mx_scale_adapters(After)
+        adapter_type = adapter.var.type
+        assert isinstance(adapter_type, ir.TileType)
+        carrier_shape = []
+        for dim in adapter_type.shape:
+            assert isinstance(dim, ir.ConstInt)
+            carrier_shape.append(dim.value)
+        assert carrier_shape == [32, 2]
+
+    def test_mismatched_mx_scale_layout_keeps_physical_move(self):
+        """A row/row/32 to col/col/32 boundary must not become a byte alias."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[16, 1024], pl.FP32],
+                lhs_data: pl.Tensor[[16, 512], pl.FP8E4M3FN],
+                lhs_scale_data: pl.Tensor[[16, 16], pl.FP8E8M0, pl.MX_A_ZZ],
+                rhs_data: pl.Tensor[[512, 32], pl.FP8E4M3FN],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                _, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 1024]), group_axis=1)
+                scale_mat = pl.move(
+                    scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.col_major,
+                )
+                rhs_scale = pl.move(scale_mat, target_memory=pl.Mem.RightScale)
+                lhs_mat = pl.load(lhs_data, [0, 0], [16, 512], target_memory=pl.Mem.Mat)
+                lhs = pl.move(lhs_mat, target_memory=pl.Mem.Left)
+                lhs_scale_mat = pl.load(lhs_scale_data, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                lhs_scale = pl.move(lhs_scale_mat, target_memory=pl.Mem.LeftScale)
+                rhs_mat = pl.load(rhs_data, [0, 0], [512, 32], target_memory=pl.Mem.Mat)
+                rhs = pl.move(rhs_mat, target_memory=pl.Mem.Right)
+                result = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+                out = pl.store(result, [0, 0], out)
+                return out
+
+        After = _expand(Before)
+
+        assert self._mx_scale_adapter_ops(After) == [_TILE_MOVE]
 
 
 # ---------------------------------------------------------------------------

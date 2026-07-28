@@ -13,10 +13,9 @@
  * @file quant_mx.cpp
  * @brief MX quantization tile ops
  *
- * Public pl.quant_mx / tile.tquant_mx are not yet supported in the same InCore
- * mixed task as matmul_mx. Stage quantized data and FP8E8M0 scales through GM
- * between separate AIV and AIC kernels; automatic cross-core transport is a
- * follow-up.
+ * On Ascend950, pl.quant_mx / tile.tquant_mx results may feed matmul_mx in the
+ * same mixed task. ExpandMixedKernel carries the FP8 data and FP8E8M0 scale
+ * directly over V2C while preserving the scale's logical fractal-32 view.
  *
  * ``group_axis`` matches PTOAS ``grpAxis``: axis1 is the A-side [M,K] path;
  * axis0 is the B-side [N,K] path (LowerCompositeOps transposes to [K,N] first).

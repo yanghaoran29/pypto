@@ -623,6 +623,37 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
+// Retag an MX scale with the transfer layout while preserving its existing bytes.
+CallPtr CreateLayoutAlias(const ExprPtr& tile, const TypePtr& result_type, const Span& span) {
+  auto tile_type = As<TileType>(result_type);
+  INTERNAL_CHECK_SPAN(tile_type, span) << "Layout alias result must be a TileType";
+  auto shape = std::make_shared<MakeTuple>(tile_type->shape_, span);
+  auto op = OpRegistry::GetInstance().GetOp("tile.reshape");
+  return std::make_shared<Call>(op, std::vector<ExprPtr>{tile, shape},
+                                std::vector<std::pair<std::string, std::any>>{}, result_type, span);
+}
+
+// Restrict the layout-alias path to matching complete FP8E8M0 scale views crossing V2C.
+bool IsMxScaleBoundary(const CVBoundaryMove& boundary) {
+  if (boundary.op_driven || boundary.direction != CVDirection::VECTOR_TO_CUBE) return false;
+  auto source_type = As<TileType>(boundary.source_tile->GetType());
+  auto dest_type = As<TileType>(boundary.dest_var->GetType());
+  if (!source_type || !dest_type || source_type->dtype_ != DataType::FP8E8M0 ||
+      dest_type->dtype_ != DataType::FP8E8M0 ||
+      (source_type->memory_space_.has_value() && source_type->memory_space_ != MemorySpace::Vec) ||
+      dest_type->memory_space_ != MemorySpace::Mat) {
+    return false;
+  }
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*source_type);
+  const TileView dest_view = tile_view_semantics::GetEffectiveTileView(*dest_type);
+  auto is_scale_view = [](const TileView& view) {
+    return view.fractal == tile_view_semantics::kMXScaleFractal && view.blayout == view.slayout &&
+           (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major);
+  };
+  return is_scale_view(source_view) && is_scale_view(dest_view) && source_view.blayout == dest_view.blayout &&
+         source_view.slayout == dest_view.slayout;
+}
+
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
@@ -716,7 +747,17 @@ TypePtr BuildBoundaryTpopType(CoreSide side, const TypePtr& original_type) {
 bool NeedsPostTpopMove(CoreSide side, const TileType& dest_type) {
   INTERNAL_CHECK(dest_type.memory_space_.has_value())
       << "Boundary move destination must have inferred memory_space before ExpandMixedKernel";
-  return dest_type.memory_space_.value() != GetBoundaryTpopMemory(side);
+  const MemorySpace dest_ms = dest_type.memory_space_.value();
+  if (dest_ms != GetBoundaryTpopMemory(side)) return true;
+
+  // Even when the tpop and authored destination both live in Mat/Vec, the
+  // transport may use a different physical layout. Preserve that authored
+  // conversion with a post-tpop move instead of treating equal memory spaces
+  // as proof that the tpop is already the final destination tile.
+  const TileView dest_view = tile_view_semantics::GetEffectiveTileView(dest_type);
+  const TileView transfer_view =
+      PassContext::Current()->GetBackendHandler()->BuildCrossCoreTransferView(dest_ms, dest_view);
+  return transfer_view != dest_view;
 }
 
 std::string BuildBoundaryTpopName(CoreSide side, const std::string& dest_name) {
@@ -1040,6 +1081,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // transport carries the stride.
         const int op_lane_stride =
             (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
+        const bool is_mx_scale_boundary = IsMxScaleBoundary(bm);
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
@@ -1072,7 +1114,27 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
                   tile_view_semantics::GetEffectiveTileView(*push_dest_type));
             }
 
-            auto tmov_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
+            std::vector<ExprPtr> carrier_shape = src_type->shape_;
+            if (is_mx_scale_boundary) {
+              const TileView source_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+              if (source_view.blayout == TileLayout::col_major) {
+                // A public MX_B scale is a zero-copy transpose: logical
+                // [K/32,N] col/col aliases physical [N,K/32] row/row bytes.
+                // Use that physical shape for the NZ carrier so TINSERT sees
+                // an aligned Mat row extent; the consumer tpop keeps the
+                // public col/col shape and therefore restores the logical view.
+                INTERNAL_CHECK_SPAN(carrier_shape.size() == 2, stmt->span_)
+                    << "MX_B scale V2C carrier requires a rank-2 tile";
+                std::swap(carrier_shape[0], carrier_shape[1]);
+                if (!fractal_view.valid_shape.empty()) {
+                  INTERNAL_CHECK_SPAN(fractal_view.valid_shape.size() == 2, stmt->span_)
+                      << "MX_B scale V2C carrier requires a rank-2 valid shape";
+                  std::swap(fractal_view.valid_shape[0], fractal_view.valid_shape[1]);
+                }
+              }
+            }
+
+            auto tmov_type = std::make_shared<TileType>(carrier_shape, src_type->dtype_, std::nullopt,
                                                         fractal_view, MemorySpace::Vec);
             std::string src_name = "tile";
             if (auto sv = std::dynamic_pointer_cast<const Var>(bm.source_tile)) {
@@ -1080,7 +1142,9 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             }
             bool is_nz = (fractal_view.blayout == TileLayout::col_major);
             auto tmov_var = std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), tmov_type, stmt->span_);
-            auto tmov_call = CreateMove(bm.source_tile, MemorySpace::Vec, tmov_type, stmt->span_);
+            auto tmov_call = is_mx_scale_boundary
+                                 ? CreateLayoutAlias(bm.source_tile, tmov_type, stmt->span_)
+                                 : CreateMove(bm.source_tile, MemorySpace::Vec, tmov_type, stmt->span_);
             result.push_back(std::make_shared<AssignStmt>(tmov_var, tmov_call, stmt->span_));
             push_source = tmov_var;
           }
@@ -1103,7 +1167,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             INTERNAL_CHECK_SPAN(shape_tt->memory_space_.has_value(), stmt->span_)
                 << "Boundary move destination must have TileType and MemSpace";
             view_ms = shape_tt->memory_space_.value();  // NOLINT(bugprone-unchecked-optional-access)
-            needs_post_move = NeedsPostTpopMove(side, *shape_tt);
+            // The MX scale tpop already uses the consumer's final Mat view.
+            needs_post_move = !is_mx_scale_boundary && NeedsPostTpopMove(side, *shape_tt);
           }
           auto tpop_type = BuildBoundaryTpopType(side, shape_source);
           // Consumer-side transfer view. For op-driven boundaries the cross-core
@@ -1122,7 +1187,9 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           } else {
             boundary_view = tile_view_semantics::GetEffectiveTileView(*shape_tt);
           }
-          auto fractal_view = BuildCrossCoreTransferView(view_ms, boundary_view);
+          // Preserve the logical MX scale view; ordinary boundaries use the transfer view.
+          auto fractal_view = is_mx_scale_boundary ? tile_view_semantics::GetEffectiveTileView(*shape_tt)
+                                                   : BuildCrossCoreTransferView(view_ms, boundary_view);
           std::string tpop_name = needs_post_move ? BuildBoundaryTpopName(side, bm.dest_var->name_hint_)
                                                   : bm.dest_var->name_hint_;
           auto tt = std::dynamic_pointer_cast<const TileType>(tpop_type);

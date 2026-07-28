@@ -188,12 +188,24 @@ Setup is derived from the split bodies:
 
 When cross-core directions use different tile sizes, the pass picks `max(all observed tile byte sizes)` as the common `slot_size` for `initialize_pipe`. Smaller tiles leave unused bytes in each slot but hardware correctness is preserved. Explicit user-authored programs can still create multiple independent pipes by supplying different `id` values to `initialize_pipe` and matching `tpush` / `tpop` / `tfree` ops.
 
-### Known limitation: MX quantization followed by matmul
+### MX scale V2C transport
 
-The automatic setup does not yet support carrying both `quant_mx` data and its
-FP8E8M0 scale to `matmul_mx` inside one mixed task. Keep the operations in
-separate AIV and AIC kernels and stage both values through GM. Automatic paired
-data/scale pipes are deferred to a follow-up change.
+On Ascend950, `quant_mx` data and its FP8E8M0 scale can feed `matmul_mx` in the
+same mixed task. The normal V2C adapter presents the scale to `TINSERT` as an
+NZ carrier. On the AIC side,
+the pass types the MemRef-less `tpop` directly with the scale's logical
+row/row or col/col fractal-32 view. This preserves the bytes produced by
+`quant_mx` while avoiding an FP8E8M0 `pto.treshape`, which PTOAS v0.60 does not
+support. The byte-preserving alias is used only when the producer and Mat
+destination have the same complete FP8E8M0 MX-scale layout. A layout-changing
+boundary uses the normal transfer adapter and a consumer-side post-move. For a
+col/col B-side scale, the carrier uses the underlying transposed physical
+`[N, K/32]` shape so the Mat row extent remains byte-aligned; the AIC `tpop`
+restores the public `[K/32, N]` logical view.
+
+`test_quantized_matmul_mx.py` numerically checks direct A-side and B-side mixed
+pipelines. The A-side scale is `[64, 8]`, covering a 4 x 4 grid of `[16, 2]`
+scale boxes; the B-side case exercises the col/col carrier path.
 
 ### Overriding the slot count (`slot_num`)
 

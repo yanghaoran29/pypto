@@ -150,11 +150,22 @@ pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic
 
 当跨核方向使用了不同大小的 tile 时，Pass 会取所有观察到的 tile 字节大小的最大值作为 `initialize_pipe` 的公共 `slot_size`。较小 tile 写入时不会填满整个槽位，但不影响硬件正确性。用户手写程序仍然可以通过给 `initialize_pipe` 以及匹配的 `tpush` / `tpop` / `tfree` 传入不同 `id` 来创建多条独立 pipe。
 
-### 已知限制：MX 量化后接矩阵乘
+### MX scale 的 V2C 传输
 
-自动 setup 当前还不支持在同一个 mixed task 内同时把 `quant_mx` 的 data 和
-FP8E8M0 scale 传给 `matmul_mx`。请将两者拆成 AIV 与 AIC kernel，并通过 GM
-暂存这两个值。自动配对的 data/scale pipe 留待后续改动。
+在 Ascend950 上，`quant_mx` 的 data 与 FP8E8M0 scale 可以在同一个 mixed task
+内直接供 `matmul_mx` 使用。常规 V2C adapter 将 scale 以 NZ carrier 交给
+`TINSERT`；AIC 侧则直接把无 MemRef 的 `tpop`
+标成 scale 的逻辑 row/row 或 col/col fractal-32 view。这样既保持
+`quant_mx` 产生的字节，又避开 PTOAS v0.60 不支持的 FP8E8M0
+`pto.treshape`。只有 producer 与 Mat destination 的完整 FP8E8M0 MX-scale
+layout 相同时，才使用保留字节的 alias；需要改变 layout 的边界仍使用常规
+transfer adapter，并在 consumer 侧执行 post-move。对于 col/col 的 B 侧
+scale，carrier 使用底层转置后的物理 `[N, K/32]` shape，确保 Mat 的行范围
+满足字节对齐；AIC `tpop` 再恢复公开的 `[K/32, N]` 逻辑 view。
+
+`test_quantized_matmul_mx.py` 对 A 侧和 B 侧两条直接 mixed pipeline 做数值
+验证。A 侧 scale 为 `[64, 8]`，覆盖 4 x 4 个 `[16, 2]` scale box；B 侧
+用例覆盖 col/col carrier 路径。
 
 ### 覆盖槽位数（`slot_num`）
 
