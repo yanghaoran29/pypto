@@ -361,6 +361,7 @@ def load(
     valid_shapes: Sequence[IntLike] | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
     clamp: bool = False,
+    mx_layout: str = "none",
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
 
@@ -384,6 +385,8 @@ def load(
             load asserts ``offsets + valid_shapes`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
             to the source edge instead.
+        mx_layout: MX scale-load layout (``none`` or ``mx_a_zz`` / ``mx_b_nn``).
+            Non-``none`` requires ``target_memory=Mat`` (Vec is rejected).
 
     Returns:
         Tile wrapping the load operation
@@ -401,6 +404,7 @@ def load(
         _normalize_intlike(valid_shapes),
         target_memory,
         clamp=clamp,
+        mx_layout=mx_layout,
     )
     return Tile(expr=call_expr)
 
@@ -595,14 +599,20 @@ def move(
 
     Args:
         tile: Input tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right,
+            .LeftScale, .RightScale)
         blayout: Optional block layout for the destination tile
         slayout: Optional scatter layout for the destination tile
 
     Returns:
         Tile wrapping the move operation
     """
-    call_expr = _ir_ops.move(tile.unwrap(), target_memory, blayout=blayout, slayout=slayout)
+    call_expr = _ir_ops.move(
+        tile.unwrap(),
+        target_memory,
+        blayout=blayout,
+        slayout=slayout,
+    )
     return Tile(expr=call_expr)
 
 
@@ -1199,6 +1209,8 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
     """
     call_expr = _ir_ops.matmul_bias(lhs.unwrap(), rhs.unwrap(), bias.unwrap())
     return Tile(expr=call_expr)
+
+
 
 
 def gemv(lhs: Tile, rhs: Tile) -> Tile:

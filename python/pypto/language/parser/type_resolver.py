@@ -61,6 +61,16 @@ def _implicit_tile_view_defaults(
         default_blayout = ir.TileLayout.col_major
         default_slayout = ir.TileLayout.row_major
         default_fractal = 1024
+    elif memory_space == ir.MemorySpace.LeftScale:
+        # ISA TileLeftScale: RowMajor / RowMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.row_major
+        default_slayout = ir.TileLayout.row_major
+        default_fractal = 32
+    elif memory_space == ir.MemorySpace.RightScale:
+        # ISA TileRightScale: ColMajor / ColMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.col_major
+        default_slayout = ir.TileLayout.col_major
+        default_fractal = 32
     return default_blayout, default_slayout, default_fractal
 
 
@@ -174,6 +184,8 @@ class TypeResolver:
         "Right": ir.MemorySpace.Right,
         "Acc": ir.MemorySpace.Acc,
         "Bias": ir.MemorySpace.Bias,
+        "LeftScale": ir.MemorySpace.LeftScale,
+        "RightScale": ir.MemorySpace.RightScale,
     }
 
     def __init__(
