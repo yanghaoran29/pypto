@@ -70,6 +70,10 @@ __all__ = [
     "matmul_acc",
     "batch_matmul_acc",
     "matmul_bias",
+    "matmul_mx",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
+    "tget_scale_addr",
     "gemv",
     "gemv_acc",
     "gemv_bias",
@@ -1211,6 +1215,35 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+
+
+
+def matmul_mx(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
+    """MX block-scale matrix multiplication."""
+    call_expr = _ir_ops.matmul_mx(lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap())
+    return Tile(expr=call_expr)
+
+
+def matmul_mx_acc(acc: Tile, lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
+    """MX block-scale matmul with accumulation."""
+    call_expr = _ir_ops.matmul_mx_acc(
+        acc.unwrap(), lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap()
+    )
+    return Tile(expr=call_expr)
+
+
+def matmul_mx_bias(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile, bias: Tile) -> Tile:
+    """MX block-scale matmul with bias."""
+    call_expr = _ir_ops.matmul_mx_bias(
+        lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap(), bias.unwrap()
+    )
+    return Tile(expr=call_expr)
+
+
+def tget_scale_addr(dst_scale: Tile, src: Tile) -> Tile:
+    """Bind MX scale-tile address from a Left/Right data tile (A5)."""
+    call_expr = _ir_ops.tget_scale_addr(dst_scale.unwrap(), src.unwrap())
+    return Tile(expr=call_expr)
 
 
 def gemv(lhs: Tile, rhs: Tile) -> Tile:
