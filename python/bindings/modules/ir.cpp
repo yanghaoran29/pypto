@@ -359,6 +359,8 @@ void BindIR(nb::module_& m) {
       .value("ND", TensorLayout::ND, "ND layout")
       .value("DN", TensorLayout::DN, "DN layout")
       .value("NZ", TensorLayout::NZ, "NZ layout")
+      .value("MX_A_ZZ", TensorLayout::MX_A_ZZ, "MX Left/A scale GM pack (ZZ)")
+      .value("MX_B_NN", TensorLayout::MX_B_NN, "MX Right/B scale GM pack (NN)")
       .export_values();
 
   // PadValue enum - must be before both TensorView and TileView since both carry it
@@ -371,20 +373,25 @@ void BindIR(nb::module_& m) {
 
   // TensorView - struct for tensor view information - must be before TensorType
   nb::class_<TensorView>(ir, "TensorView",
-                         "Tensor view representation with stride, layout, valid shape, and pad mode")
+                         "Tensor view representation with stride, layout, valid shape, start offset, and pad "
+                         "mode")
       .def(nb::init<>(), "Create an empty tensor view")
-      .def(nb::init<const std::vector<ExprPtr>&, TensorLayout, const std::vector<ExprPtr>&, PadValue>(),
+      .def(nb::init<const std::vector<ExprPtr>&, TensorLayout, const std::vector<ExprPtr>&, PadValue,
+                    ExprPtr>(),
            nb::arg("stride"), nb::arg("layout"), nb::arg("valid_shape") = std::vector<ExprPtr>{},
-           nb::arg("pad") = PadValue::null,
-           "Create a tensor view with stride, layout, optional valid shape, and optional pad")
-      .def(nb::init<const std::vector<int64_t>&, TensorLayout, const std::vector<int64_t>&, PadValue>(),
+           nb::arg("pad") = PadValue::null, nb::arg("start_offset") = ExprPtr{},
+           "Create a tensor view with stride, layout, optional valid shape, pad, and start_offset")
+      .def(nb::init<const std::vector<int64_t>&, TensorLayout, const std::vector<int64_t>&, PadValue,
+                    ExprPtr>(),
            nb::arg("stride"), nb::arg("layout"), nb::arg("valid_shape") = std::vector<int64_t>{},
-           nb::arg("pad") = PadValue::null,
-           "Create a tensor view with integer stride, layout, optional integer valid shape, and optional pad")
+           nb::arg("pad") = PadValue::null, nb::arg("start_offset") = ExprPtr{},
+           "Create a tensor view with integer stride, layout, optional integer valid shape, pad, and "
+           "start_offset")
       .def_rw("stride", &TensorView::stride, "Stride for each dimension")
       .def_rw("layout", &TensorView::layout, "Tensor layout type")
       .def_rw("valid_shape", &TensorView::valid_shape, "Valid shape for each dimension")
-      .def_rw("pad", &TensorView::pad, "Pad mode for out-of-valid-shape accesses");
+      .def_rw("pad", &TensorView::pad, "Pad mode for out-of-valid-shape accesses")
+      .def_rw("start_offset", &TensorView::start_offset, "Linear element base offset (slice provenance)");
 
   // ---------------------------------------------------------------------------
   // tensor_view_semantics free functions (RFC #1300 §2.2/§2.3)
@@ -596,6 +603,8 @@ void BindIR(nb::module_& m) {
       .value("Right", MemorySpace::Right, "Right matrix operand buffer")
       .value("Acc", MemorySpace::Acc, "Accumulator buffer")
       .value("Bias", MemorySpace::Bias, "Bias buffer")
+      .value("LeftScale", MemorySpace::LeftScale, "L0A-side MX block-scale buffer (A5)")
+      .value("RightScale", MemorySpace::RightScale, "L0B-side MX block-scale buffer (A5)")
       .value("ScalarLocal", MemorySpace::ScalarLocal, "On-core scalar register file / C stack (ArrayType)")
       .export_values();
 

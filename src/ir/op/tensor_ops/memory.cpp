@@ -34,6 +34,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -271,18 +272,62 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   // A read view over padded bytes has to keep saying they are padded, so the
   // source pad mode carries through unless the caller overrides it. The
   // TensorType constructor drops the view again when valid_shape turns out to be
-  // the full shape and no other view field is set.
+  // the full shape and no other view field is set — but slice always stamps
+  // start_offset, so the view is retained as SSA-visible provenance.
   const PadValue source_pad = tensor_type->tensor_view_ ? tensor_type->tensor_view_->pad : PadValue::null;
   const PadValue result_pad = pad_value.value_or(source_pad);
+  const TensorLayout source_layout =
+      tensor_type->tensor_view_ ? tensor_type->tensor_view_->layout : TensorLayout::ND;
 
-  // View preserves dtype but has new shape (which can have different rank than input).
-  // When the source is a DistributedTensorType, the result keeps that kind and
-  // carries the same window_buffer_ — a slice is still a view into the same
-  // comm-group allocation.
-  std::optional<TensorView> result_tv;
-  if (!AreExprVectorsEqual(valid_shape, new_shape) || result_pad != PadValue::null) {
-    result_tv = TensorView({}, TensorLayout::ND, valid_shape, result_pad);
+  std::vector<ExprPtr> source_strides;
+  if (tensor_type->tensor_view_ && !tensor_type->tensor_view_->stride.empty()) {
+    source_strides = tensor_type->tensor_view_->stride;
+  } else if (source_layout != TensorLayout::NZ) {
+    source_strides = tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, source_layout);
   }
+
+  const Span& offset_span = args[0]->span_;
+  ExprPtr linear_offset = std::make_shared<ConstInt>(0, DataType::INDEX, offset_span);
+  if (!source_strides.empty() && offsets.size() == source_strides.size()) {
+    ExprPtr acc;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      ExprPtr term = tensor_view_semantics::MakeIndexMul(offsets[i], source_strides[i], offset_span);
+      if (!acc) {
+        acc = std::move(term);
+      } else if (auto ca = As<ConstInt>(acc); ca) {
+        if (auto ct = As<ConstInt>(term)) {
+          acc = std::make_shared<ConstInt>(ca->value_ + ct->value_, DataType::INDEX, offset_span);
+        } else {
+          acc = MakeAdd(acc, term, offset_span);
+        }
+      } else {
+        acc = MakeAdd(acc, term, offset_span);
+      }
+    }
+    if (acc) linear_offset = std::move(acc);
+  }
+  if (tensor_type->tensor_view_ && tensor_type->tensor_view_->start_offset) {
+    const ExprPtr& parent_off = tensor_type->tensor_view_->start_offset;
+    if (auto cp = As<ConstInt>(parent_off); cp) {
+      if (auto cl = As<ConstInt>(linear_offset)) {
+        linear_offset = std::make_shared<ConstInt>(cp->value_ + cl->value_, DataType::INDEX, offset_span);
+      } else {
+        linear_offset = MakeAdd(parent_off, linear_offset, offset_span);
+      }
+    } else {
+      linear_offset = MakeAdd(parent_off, linear_offset, offset_span);
+    }
+  }
+
+  // MX loads cannot encode a sliced base pointer, so keep slice provenance on
+  // MX-layout tensors even for a zero offset. Ordinary tensor.slice calls keep
+  // their historical canonical type behavior; orchestration-level slice
+  // lineage is tracked separately by codegen precondition analysis.
+  std::vector<ExprPtr> view_valid =
+      AreExprVectorsEqual(valid_shape, new_shape) ? std::vector<ExprPtr>{} : valid_shape;
+  ExprPtr slice_start_offset = IsMxTensorLayout(source_layout) ? std::move(linear_offset) : nullptr;
+  std::optional<TensorView> result_tv =
+      TensorView({}, source_layout, std::move(view_valid), result_pad, std::move(slice_start_offset));
   if (auto dt = As<DistributedTensorType>(args[0]->GetType())) {
     return std::make_shared<DistributedTensorType>(new_shape, tensor_type->dtype_, std::nullopt,
                                                    std::move(result_tv), dt->window_buffer_);

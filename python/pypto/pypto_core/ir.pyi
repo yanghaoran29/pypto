@@ -344,6 +344,12 @@ class TensorLayout(enum.Enum):
     NZ = ...
     """NZ layout."""
 
+    MX_A_ZZ = ...
+    """MX Left/A scale GM pack (ZZ)."""
+
+    MX_B_NN = ...
+    """MX Right/B scale GM pack (NN)."""
+
 class TileLayout(enum.Enum):
     """Tile layout enumeration (shared by blayout and slayout)."""
 
@@ -372,7 +378,7 @@ class PadValue(enum.Enum):
     """Min value padding."""
 
 class TensorView:
-    """Tensor view representation with stride, layout, valid shape, and pad mode."""
+    """Tensor view representation with stride, layout, valid shape, start offset, and pad mode."""
 
     stride: Sequence[Expr]
     """Stride for each dimension."""
@@ -386,6 +392,9 @@ class TensorView:
     pad: PadValue
     """Pad mode for out-of-valid-shape accesses (default PadValue.null)."""
 
+    start_offset: Expr | None
+    """Linear element base offset (slice provenance; None if unset)."""
+
     @overload
     def __init__(self) -> None:
         """Create an empty tensor view with default ND layout."""
@@ -397,14 +406,16 @@ class TensorView:
         layout: TensorLayout,
         valid_shape: Sequence[Expr | int | Scalar] = ...,
         pad: PadValue = ...,
+        start_offset: Expr | int | Scalar | None = ...,
     ) -> None:
-        """Create a tensor view with stride, layout, optional valid shape, and optional pad.
+        """Create a tensor view with stride, layout, optional valid shape, pad, and start_offset.
 
         Args:
             stride: Stride for each dimension (Expr, int, or Scalar/DynVar)
-            layout: Tensor layout type (ND, DN, or NZ)
+            layout: Tensor layout type (ND, DN, NZ, MX_A_ZZ, or MX_B_NN)
             valid_shape: Valid shape for each dimension (optional, defaults to empty)
             pad: Pad mode for out-of-valid-shape accesses (defaults to PadValue.null)
+            start_offset: Linear base offset (optional, defaults to None)
         """
 
 class _TensorViewSemanticsModule:
@@ -999,6 +1010,10 @@ class MemorySpace(enum.Enum):
 
     Bias = ...
     """Bias buffer."""
+    LeftScale = ...
+    """L0A-side MX block-scale buffer (A5)."""
+    RightScale = ...
+    """L0B-side MX block-scale buffer (A5)."""
 
     ScalarLocal = ...
     """On-core scalar register file / C stack (ArrayType)."""

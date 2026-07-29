@@ -61,6 +61,16 @@ def _implicit_tile_view_defaults(
         default_blayout = ir.TileLayout.col_major
         default_slayout = ir.TileLayout.row_major
         default_fractal = 1024
+    elif memory_space == ir.MemorySpace.LeftScale:
+        # ISA TileLeftScale: RowMajor / RowMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.row_major
+        default_slayout = ir.TileLayout.row_major
+        default_fractal = 32
+    elif memory_space == ir.MemorySpace.RightScale:
+        # ISA TileRightScale: ColMajor / ColMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.col_major
+        default_slayout = ir.TileLayout.col_major
+        default_fractal = 32
     return default_blayout, default_slayout, default_fractal
 
 
@@ -177,6 +187,8 @@ class TypeResolver:
         "ND": ir.TensorLayout.ND,
         "DN": ir.TensorLayout.DN,
         "NZ": ir.TensorLayout.NZ,
+        "MX_A_ZZ": ir.TensorLayout.MX_A_ZZ,
+        "MX_B_NN": ir.TensorLayout.MX_B_NN,
     }
 
     _MEMORY_SPACE_MAP: dict[str, "ir.MemorySpace"] = {
@@ -187,6 +199,8 @@ class TypeResolver:
         "Right": ir.MemorySpace.Right,
         "Acc": ir.MemorySpace.Acc,
         "Bias": ir.MemorySpace.Bias,
+        "LeftScale": ir.MemorySpace.LeftScale,
+        "RightScale": ir.MemorySpace.RightScale,
     }
 
     def __init__(
@@ -1315,7 +1329,7 @@ class TypeResolver:
         raise ParserTypeError(
             f"Cannot resolve layout: {ast.unparse(layout_node)}",
             span=span,
-            hint="Use pl.ND, pl.DN, or pl.NZ",
+            hint="Use pl.ND, pl.DN, pl.NZ, pl.MX_A_ZZ, or pl.MX_B_NN",
         )
 
     def validate_annotation_consistency(
@@ -1446,7 +1460,7 @@ class TypeResolver:
                 span=self._get_span(node),
                 hint=(
                     "Use pl.TensorView(valid_shape=[...], stride=[...], "
-                    "layout=pl.TensorLayout.NZ, pad=pl.PadValue.zero)"
+                    "layout=pl.TensorLayout.NZ, pad=pl.PadValue.zero, start_offset=...)"
                 ),
             )
         if node.args:
@@ -1465,11 +1479,13 @@ class TypeResolver:
                 tv.layout = self.resolve_layout(kw.value)
             elif kw.arg == "pad":
                 tv.pad = self._resolve_padvalue(kw.value)
+            elif kw.arg == "start_offset":
+                tv.start_offset = self._parse_tileview_expr(kw.value)
             else:
                 raise ParserTypeError(
                     f"Unknown TensorView keyword argument: {kw.arg!r}",
                     span=self._get_span(kw),
-                    hint="Supported: valid_shape, stride, layout, pad",
+                    hint="Supported: valid_shape, stride, layout, pad, start_offset",
                 )
         return tv
 

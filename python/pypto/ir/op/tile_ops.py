@@ -28,6 +28,7 @@ from pypto.pypto_core.ir import (
     PadValue,
     ScalarType,
     Span,
+    TensorLayout,
     TileLayout,
 )
 
@@ -164,7 +165,7 @@ def load(
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     valid_shapes: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     clamp: bool = False,
     span: Span | None = None,
 ) -> Call:
@@ -174,6 +175,11 @@ def load(
     region that exists in the source. The tile's valid region is the source's
     valid region, shifted by ``offsets`` and cut to the tile — a load can never
     report as real data bytes the source does not have.
+
+    MX scale GM tensors are annotated with ``TensorLayout.MX_A_ZZ`` /
+    ``MX_B_NN`` on the source type (same shorthand as ``pl.NZ``). Loading such
+    a tensor uses the MX Mat path (``fractal=32``); the load still lands in
+    L1/Mat — use ``tile.move`` to LeftScale/RightScale afterwards.
 
     Args:
         tensor: Source tensor (TensorType)
@@ -187,7 +193,8 @@ def load(
             the actual valid data region differs from the allocated tile size.
             Uses the same coordinate convention as shapes. This is a *request*: it
             narrows the tile, but cannot widen it past what the source has.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
+        target_memory: Target memory space. Defaults to MemorySpace.Vec for
+            ordinary loads and MemorySpace.Mat for MX-layout sources.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shapes`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
@@ -201,6 +208,28 @@ def load(
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
     """
+    def _is_mx_source(src: Expr) -> bool:
+        ty = src.type
+        tv = getattr(ty, "tensor_view", None)
+        if tv is None:
+            return False
+        layout = getattr(tv, "layout", None)
+        return layout in (TensorLayout.MX_A_ZZ, TensorLayout.MX_B_NN)
+
+    is_mx = _is_mx_source(tensor)
+
+    if target_memory is None:
+        target_memory = MemorySpace.Mat if is_mx else MemorySpace.Vec
+
+    # MX cube scale loads are Mat-only. Preserve the distinction between an
+    # omitted target (resolved above) and an explicitly requested Vec target.
+    if is_mx and target_memory == MemorySpace.Vec:
+        raise ValueError(
+            "tile.load of an MX-layout tensor requires target_memory=MemorySpace.Mat "
+            "(MX scale GM loads are L1/Mat only; use tile.move to LeftScale/RightScale); "
+            "got MemorySpace.Vec"
+        )
+
     # Validate target_memory: only Vec and Mat are allowed for load
     if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
         raise ValueError(
@@ -472,7 +501,8 @@ def move(
 
     Args:
         tile: Input tile (TileType)
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right,
+            .LeftScale, .RightScale)
         blayout: Optional block layout for the destination tile
         slayout: Optional scatter layout for the destination tile
         span: Optional source span for debugging (auto-captured if not provided)
@@ -481,8 +511,6 @@ def move(
         Call expression that returns a TileType in the target memory space
     """
     actual_span = _get_span_or_capture(span)
-    args = [tile]
-
     kwargs: dict[str, Any] = {
         "target_memory": target_memory,
     }
@@ -491,7 +519,7 @@ def move(
     if slayout is not None:
         kwargs["slayout"] = slayout
 
-    return _ir_core.create_op_call("tile.move", args, kwargs, actual_span)
+    return _ir_core.create_op_call("tile.move", [tile], kwargs, actual_span)
 
 
 def get_block_idx(span: Span | None = None) -> Call:

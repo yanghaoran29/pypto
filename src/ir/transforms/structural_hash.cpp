@@ -462,6 +462,15 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       }
       // Hash layout
       h = hash_combine(h, static_cast<result_type>(tv.layout));
+      // Hash start_offset (optional; presence marks slice provenance)
+      if (tv.start_offset) {
+        h = hash_combine(h, static_cast<result_type>(1));
+        h = hash_combine(h, HashNode(tv.start_offset));
+      } else {
+        h = hash_combine(h, static_cast<result_type>(0));
+      }
+      // Hash pad
+      h = hash_combine(h, static_cast<result_type>(tv.pad));
     } else {
       h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
     }

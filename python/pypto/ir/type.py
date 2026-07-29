@@ -35,10 +35,17 @@ from .utils import _normalize_expr, _normalize_shape
 _native_tensor_type_init = TensorType.__init__
 _native_tile_type_init = TileType.__init__
 
+# Defensive: keep longer memref-name prefixes before shorter ones so a future
+# short prefix (e.g. ``mem_left_``) never shadows a longer one (e.g.
+# ``mem_leftscale_``). Today these pairs do not actually overlap, but the
+# ordering is kept stable against new spaces. Names come from
+# MemorySpaceToString().lower() (e.g. LeftScale -> leftscale).
 _MEMREF_NAME_PREFIX_TO_SPACE = {
     "mem_ddr_": MemorySpace.DDR,
     "mem_vec_": MemorySpace.Vec,
     "mem_mat_": MemorySpace.Mat,
+    "mem_leftscale_": MemorySpace.LeftScale,
+    "mem_rightscale_": MemorySpace.RightScale,
     "mem_left_": MemorySpace.Left,
     "mem_right_": MemorySpace.Right,
     "mem_acc_": MemorySpace.Acc,
@@ -140,12 +147,23 @@ class _TensorViewMeta(type):
         layout: TensorLayout | None = None,
         valid_shape: Sequence[Expr | int] | None = None,
         pad: PadValue = PadValue.null,
+        start_offset: Expr | int | None = None,
     ) -> "_TensorViewBase":
-        if stride is None and layout is None and valid_shape is None and pad == PadValue.null:
+        if (
+            stride is None
+            and layout is None
+            and valid_shape is None
+            and pad == PadValue.null
+            and start_offset is None
+        ):
             return _TensorViewBase()
         if layout is None:
-            raise ValueError("layout is required when stride, valid_shape, or pad is provided")
-        return _TensorViewBase(_normalize_seq(stride), layout, _normalize_seq(valid_shape), pad)
+            raise ValueError("layout is required when stride, valid_shape, pad, or start_offset is provided")
+        if isinstance(start_offset, int):
+            start_offset = _normalize_expr(start_offset)
+        return _TensorViewBase(
+            _normalize_seq(stride), layout, _normalize_seq(valid_shape), pad, start_offset
+        )
 
 
 class TensorView(metaclass=_TensorViewMeta):

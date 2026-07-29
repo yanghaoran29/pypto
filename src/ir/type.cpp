@@ -63,8 +63,11 @@ void CanonicalizeTensorViewInPlace(std::optional<TensorView>& tensor_view,
   }
 
   ClearRedundantFullValidShape(tensor_view->valid_shape, shape);
+  // Keep non-ND layouts (NZ/DN/MX_*) and any explicit start_offset, matching
+  // how NZ empty-stride views are preserved as layout markers.
   if (tensor_view->stride.empty() && tensor_view->layout == TensorLayout::ND &&
-      tensor_view->valid_shape.empty() && tensor_view->pad == PadValue::null) {
+      tensor_view->valid_shape.empty() && tensor_view->pad == PadValue::null &&
+      !tensor_view->start_offset) {
     tensor_view.reset();
   }
 }
@@ -153,6 +156,10 @@ std::string TensorLayoutToString(TensorLayout layout) {
       return "DN";
     case TensorLayout::NZ:
       return "NZ";
+    case TensorLayout::MX_A_ZZ:
+      return "MX_A_ZZ";
+    case TensorLayout::MX_B_NN:
+      return "MX_B_NN";
     default:
       throw TypeError("Unknown TensorLayout value: " + std::to_string(static_cast<int>(layout)));
   }
@@ -165,6 +172,10 @@ TensorLayout StringToTensorLayout(const std::string& str) {
     return TensorLayout::DN;
   } else if (str == "NZ") {
     return TensorLayout::NZ;
+  } else if (str == "MX_A_ZZ") {
+    return TensorLayout::MX_A_ZZ;
+  } else if (str == "MX_B_NN") {
+    return TensorLayout::MX_B_NN;
   }
   throw TypeError("Unknown TensorLayout string: " + str);
 }
@@ -201,8 +212,8 @@ ShapedType::ShapedType(DataType dtype, const std::vector<int64_t>& shape, std::o
 }
 
 TensorView::TensorView(const std::vector<int64_t>& stride_ints, TensorLayout layout_,
-                       const std::vector<int64_t>& valid_shape_ints, PadValue pad_)
-    : layout(layout_), pad(pad_) {
+                       const std::vector<int64_t>& valid_shape_ints, PadValue pad_, ExprPtr start_offset_)
+    : layout(layout_), pad(pad_), start_offset(std::move(start_offset_)) {
   for (int64_t s : stride_ints) {
     stride.push_back(std::make_shared<ConstInt>(s, DataType::INDEX, Span::unknown()));
   }

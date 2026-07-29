@@ -1093,6 +1093,8 @@ bool StructuralEqualImpl<AssertMode>::EqualType(const TypePtr& lhs, const TypePt
         }
         return false;
       }
+      // Compare start_offset (optional; presence marks slice provenance)
+      if (!Equal(lhs_tv.start_offset, rhs_tv.start_offset)) return false;
       // Compare pad
       if (lhs_tv.pad != rhs_tv.pad) {
         if constexpr (AssertMode) {

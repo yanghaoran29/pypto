@@ -119,6 +119,40 @@ lhs/rhs 广播后的 batch 形状完全一致；matmul 的 (M, N) 必须与 acc 
 `tensor.matmul` / `tensor.matmul_acc` 在任一操作数 rank > 2 时分派到该批量路径；后续由
 `FlattenTileNdTo2D` 将其展开为逐 batch 的 2D 操作。
 
+### MX scale 内存与数据搬运（Ascend950）
+
+MX 使用独立的 `LeftScale` / `RightScale` 内存空间与 `FP8E8M0` scale dtype。
+本变更落地 **scale 内存空间 + load/move** 路径（尚不含 matmul）。
+
+| IR / DSL | 说明 |
+| -------- | ---- |
+| `tile.load` of `pl.Tensor[..., pl.MX_A_ZZ|MX_B_NN]` | MX scale GM pack（对齐 `#pto.layout`）；dtype 为 FP8E8M0 或 UINT8；默认 `target_memory=Mat`（L1）；拒绝 slice / 任意 `TensorView.start_offset`（含 0）/ strided 源；**不是**直接 load 进 Scale，需再 `tile.move` → LeftScale/RightScale |
+| `tile.move(..., target_memory=LeftScale/RightScale)` | Mat→Scale move；layout 固定为左侧 row/row、右侧 col/col，显式 override 必须严格一致 |
+| `tile.create(..., target_memory=LeftScale/RightScale)` | 不支持；应先通过 MX load 创建 Mat scale 数据，再 move 到 scale 空间 |
+
+scale tile 规范样例：scale=`FP8E8M0`，形状 `[M, ceil(K/32)]` / `[ceil(K/32), N]`，
+GM scale layout 由源 tensor 的 `pl.MX_A_ZZ` / `pl.MX_B_NN` 标注（host ZZ/NN pack，codegen → `#pto.layout<mx_*>`）；fractal=32。load 到 Mat 后需 `tile.move` 进 Scale。
+
+#### MX / Ascend950：pto-isa 约束
+
+| 约束 | 要点 |
+| ---- | ---- |
+| 独立 scale buffer | Cube **不**把 scale 折进 Left/Right；`TileType::ScaleLeft` / `ScaleRight`（L0A/L0B sidecar）↔ PyPTO `LeftScale` / `RightScale` |
+| payload | scale 为 `float8_e8m0_t` / `FP8E8M0`；physical scale 组数 `ceil(K/32)`，fractal=32 |
+| layout | `pl.MX_A_ZZ` → row-major ZZ；`pl.MX_B_NN` → col-major NN；`TLoadMxCube*`（AZZ2ZZ 等） |
+| `TMov` `CommonCheckMX` | 允许 `uint8_t` Mat → `float8_e8m0` ScaleLeft/Right；canonical：ui8 Mat reshape 再 ui8→f8 Scale |
+
+#### MX / Ascend950：PTOAS 约束
+
+| 约束 | 要点 |
+| ---- | ---- |
+| 单一 `loc=scaling` | 尚无独立 left/right_scale loc；PyPTO 两侧都降到 `loc=scaling`，EmitC 再选 ScaleLeft/Right |
+| dtype 必须 `!pto.f8E8M0` | `ui8`+`scaling` 会错成 Fixpipe `TileType::Scaling`；进 Scale 前需提升为 FP8E8M0 |
+| 禁止 Mat↔Scaling `treshape` | 不同 loc；reshape 留在 Mat（ui8），再 `tmov` 进 scaling |
+| shape-matched Mat→Scale `tmov` | flat `[1,G]` 须先 `treshape` 到 `[M,K/32]`（或 B 侧 shape） |
+| 顺序 | PyPTO 按源序发 Mat→scaling `tmov`；存在 `tget_scale_addr` 时 PTOAS `PTOA5NormalizeTMovPass` 可做 bind-before-fill 重排 |
+| `#pto.layout` / mx load | `mx_a_zz` / `mx_b_nn` / … |
+
 ## Python 用法
 
 ```python
@@ -534,6 +568,7 @@ a5 或不提供 SDMA provider 的 runtime 上，启用该能力的 worker 会在
 | --------- | ---- |
 | `src/ir/op/type_inference.cpp` | 共享的类型推断工具 |
 | `tensor_ops/elementwise.cpp` | TensorOp: add, sub, mul, div |
+| `tile_ops/matmul.cpp` | TileOp：matmul、gemv |
 | `tile_ops/memory.cpp` | TileOp: load, store, read, get_block_idx |
 | `tile_ops/elementwise.cpp` | TileOp: add, mul, div, adds, muls 等 |
 | `tile_ops/reduction.cpp` | TileOp: sum（含 axis, keepdim） |

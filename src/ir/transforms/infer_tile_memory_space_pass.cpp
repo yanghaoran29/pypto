@@ -310,6 +310,18 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
       return *result;
     }
 
+    // MX scale GM tensors (TensorLayout::MX_*) load Mat-only. When
+    // target_memory is absent, retargetable demand may fall through to Vec —
+    // force Mat so Phase 3 does not rebuild TileView via GetImplicitTileView
+    // (ordinary Mat NZ strips fractal=32; Vec is invalid for TLoadMxCube*).
+    if (op_name == "tile.load" && !call->args_.empty()) {
+      if (auto tensor_type = AsTensorTypeLike(call->args_[0]->GetType());
+          tensor_type && tensor_type->tensor_view_.has_value() &&
+          IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
+        return MemorySpace::Mat;
+      }
+    }
+
     // Resolver returned nullopt — kwarg absent. Two cases:
     // (1) Inherit-input op (fillpad/slice/...): output = first tile input's
     //     space. Demand back-prop ensures input is or will be resolved to
@@ -613,6 +625,11 @@ class TileMemorySpaceMutator : public IRMutator {
     // different space than the kwarg says (or the kwarg is absent because the
     // converter let the pass decide), we rewrite the call so codegen reads a
     // consistent value and the result type gets a fresh implicit TileView.
+    //
+    // Exception: tile.load of MX-layout tensors already carries fractal=32 MX
+    // scale layouts from DeduceTileLoadType. Rebuilding via
+    // GetImplicitTileView(Mat) yields ordinary NZ and strips fractal — preserve
+    // the existing TileView and keep target_memory=Mat.
     if (auto call = As<Call>(new_value); call) {
       auto& registry = OpRegistry::GetInstance();
       const std::string& call_op_name = call->op_->name_;
@@ -626,10 +643,45 @@ class TileMemorySpaceMutator : public IRMutator {
           for (const auto& [key, value] : call->kwargs_) {
             if (key == "target_memory") {
               kwarg_target = AnyCast<MemorySpace>(value, "target_memory");
-              break;
             }
           }
-          if (!kwarg_target.has_value() || *kwarg_target != promoted) {
+          bool is_mx_load = false;
+          if (!call->args_.empty()) {
+            if (auto src_ty = AsTensorTypeLike(call->args_[0]->GetType());
+                src_ty && src_ty->tensor_view_.has_value()) {
+              is_mx_load = IsMxTensorLayout(src_ty->tensor_view_->layout);
+            }
+          }
+          if (is_mx_load) {
+            // Preserve MX fractal=32 TileView from DeduceTileLoadType. Ordinary
+            // GetImplicitTileView(Mat) yields NZ and strips fractal. InferFromOp
+            // already forces Mat for MX sources; still stamp target_memory if the
+            // Call kwargs omitted it (pre-stamp / hand-built IR).
+            INTERNAL_CHECK_SPAN(promoted == MemorySpace::Mat, call->span_)
+                << "Internal error: tile.load of MX-layout tensor resolved to non-Mat ("
+                << static_cast<int>(promoted) << "); InferFromOp should force Mat";
+            if (!kwarg_target.has_value() || *kwarg_target != MemorySpace::Mat) {
+              std::vector<std::pair<std::string, std::any>> new_kwargs;
+              new_kwargs.reserve(call->kwargs_.size() + 1);
+              bool saw_target_memory = false;
+              for (const auto& [key, value] : call->kwargs_) {
+                if (key == "target_memory") {
+                  saw_target_memory = true;
+                  new_kwargs.emplace_back(key, std::any(MemorySpace::Mat));
+                } else {
+                  new_kwargs.emplace_back(key, value);
+                }
+              }
+              if (!saw_target_memory) {
+                new_kwargs.emplace_back("target_memory", std::any(MemorySpace::Mat));
+              }
+              auto preserved_type = std::make_shared<TileType>(old_call_type->shape_, old_call_type->dtype_,
+                                                               old_call_type->memref_,
+                                                               old_call_type->tile_view_, MemorySpace::Mat);
+              new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs), call->attrs_,
+                                                 std::move(preserved_type), call->span_);
+            }
+          } else if (!kwarg_target.has_value() || *kwarg_target != promoted) {
             std::vector<std::pair<std::string, std::any>> new_kwargs;
             new_kwargs.reserve(call->kwargs_.size() + 1);
             bool saw_target_memory = false;
@@ -959,12 +1011,33 @@ class TileMemoryInferredVerifier : public IRVisitor {
           if (j > 0) allowed_str += "/";
           allowed_str += MemorySpaceToString(allowed_spaces[j]);
         }
-        diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
-                                  "InCore function '" + func_name_ + "': Op '" + call->op_->name_ +
-                                      "' input " + std::to_string(i) + " ('" + var->name_hint_ +
-                                      "') requires " + allowed_str + " but is in " +
-                                      MemorySpaceToString(actual),
-                                  var->span_);
+      diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
+                                "InCore function '" + func_name_ + "': Op '" + call->op_->name_ +
+                                    "' input " + std::to_string(i) + " ('" + var->name_hint_ +
+                                    "') requires " + allowed_str + " but is in " +
+                                    MemorySpaceToString(actual),
+                                var->span_);
+      }
+    }
+
+    // tile.move into LeftScale/RightScale is Mat-only (L1→L0A/L0B scale sidecar).
+    // tile.move has no static input_constraint (its target is kwarg-driven), so
+    // check it here after InferTileMemorySpace has resolved the source space.
+    if (call->op_->name_ == "tile.move" && !call->args_.empty()) {
+      const MemorySpace target = call->GetKwarg<MemorySpace>("target_memory", MemorySpace::Vec);
+      if (target == MemorySpace::LeftScale || target == MemorySpace::RightScale) {
+        if (auto mv_var = As<Var>(call->args_[0])) {
+          auto mv_tile = As<TileType>(mv_var->GetType());
+          if (mv_tile && mv_tile->memory_space_.has_value() &&
+              *mv_tile->memory_space_ != MemorySpace::Mat) {
+            diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
+                                      "InCore function '" + func_name_ + "': Op 'tile.move' into " +
+                                          MemorySpaceToString(target) +
+                                          " requires input in Mat memory, but '" + mv_var->name_hint_ +
+                                          "' is in " + MemorySpaceToString(*mv_tile->memory_space_),
+                                      mv_var->span_);
+          }
+        }
       }
     }
   }

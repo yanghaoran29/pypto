@@ -2685,6 +2685,7 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
         for (const auto& dim : tensor_type->tensor_view_->stride) {
           collect_vars_from_expr(dim);
         }
+        collect_vars_from_expr(tensor_type->tensor_view_->start_offset);
       }
     } else if (auto tile_type = As<TileType>(type)) {
       for (const auto& dim : tile_type->shape_) {
@@ -3043,9 +3044,12 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
   bool has_stride = !tensor_view.stride.empty();
   bool has_non_default_layout = (tensor_view.layout != TensorLayout::ND);
   bool has_non_default_pad = (tensor_view.pad != PadValue::null);
+  bool has_start_offset = static_cast<bool>(tensor_view.start_offset);
 
   // If all fields are at defaults, skip TensorView entirely
-  if (first && !has_stride && !has_non_default_layout && !has_non_default_pad) return "";
+  if (first && !has_stride && !has_non_default_layout && !has_non_default_pad && !has_start_offset) {
+    return "";
+  }
 
   // When TensorView is non-trivial, always emit both stride and layout to satisfy
   // the C++ constructor signature TensorView(stride, layout, valid_shape=[], pad=null).
@@ -3080,6 +3084,11 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
         oss << "min";
         break;
     }
+  }
+
+  if (has_start_offset) {
+    maybe_comma();
+    oss << "start_offset=" << PrintExprForType(tensor_view.start_offset);
   }
 
   oss << ")";

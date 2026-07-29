@@ -597,9 +597,18 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
         bool view_changed = false;
         auto new_stride = SimplifyExprVec(tv.stride, &view_changed);
         auto new_vs = SimplifyExprVec(tv.valid_shape, &view_changed);
+        ExprPtr new_start_offset = tv.start_offset;
+        if (tv.start_offset) {
+          auto simplified = SimplifyExpr(tv.start_offset);
+          if (simplified.get() != tv.start_offset.get()) {
+            view_changed = true;
+            new_start_offset = std::move(simplified);
+          }
+        }
         if (view_changed) {
           changed = true;
-          new_tv = TensorView(std::move(new_stride), tv.layout, std::move(new_vs), tv.pad);
+          new_tv = TensorView(std::move(new_stride), tv.layout, std::move(new_vs), tv.pad,
+                              std::move(new_start_offset));
         }
       }
       if (!changed) return type;

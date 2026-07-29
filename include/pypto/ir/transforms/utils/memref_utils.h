@@ -102,11 +102,19 @@ inline std::optional<TensorView> RemapTensorViewExprs(const std::optional<Tensor
   bool view_changed = false;
   auto new_stride = RemapTypeExprVector(tensor_view->stride, remap_expr, view_changed);
   auto new_valid_shape = RemapTypeExprVector(tensor_view->valid_shape, remap_expr, view_changed);
+  ExprPtr new_start_offset = tensor_view->start_offset;
+  if (tensor_view->start_offset) {
+    new_start_offset = remap_expr(tensor_view->start_offset);
+    if (new_start_offset.get() != tensor_view->start_offset.get()) {
+      view_changed = true;
+    }
+  }
   if (!view_changed) {
     return tensor_view;
   }
   changed = true;
-  return TensorView(std::move(new_stride), tensor_view->layout, std::move(new_valid_shape), tensor_view->pad);
+  return TensorView(std::move(new_stride), tensor_view->layout, std::move(new_valid_shape), tensor_view->pad,
+                    std::move(new_start_offset));
 }
 
 template <typename RemapExprFn>

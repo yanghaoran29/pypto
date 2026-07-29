@@ -22,16 +22,43 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
+
+namespace {
+
+/// MX scale GM tensors (TensorLayout::MX_A_ZZ / MX_B_NN) load Mat-only.
+/// When callers omit target_memory, stamp Mat into the Call kwargs so
+/// InferTileMemorySpace sees an explicit Mat and does not rebuild TileView via
+/// GetImplicitTileView (ordinary Mat NZ drops fractal=32). DeduceTileLoadType
+/// already defaults the result type to Mat; this keeps kwargs and type in sync.
+void StampMxLoadTargetMemoryKwarg(const std::vector<ExprPtr>& args,
+                                  std::vector<std::pair<std::string, std::any>>& kwargs) {
+  if (args.empty() || !args[0]) return;
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  if (!tensor_type || !tensor_type->tensor_view_.has_value() ||
+      !IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
+    return;
+  }
+  for (const auto& [key, value] : kwargs) {
+    if (key == "target_memory") {
+      return;
+    }
+  }
+  kwargs.emplace_back("target_memory", MemorySpace::Mat);
+}
+
+}  // namespace
 
 void ValidateKwargs(const std::vector<std::pair<std::string, std::any>>& kwargs,
                     const std::unordered_map<std::string, std::type_index>& allowed_kwargs,
@@ -145,11 +172,17 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   // Get operator instance (shared definition)
   OpPtr op = entry.GetOp();
 
+  // Mutable copy so MX load can stamp target_memory=Mat into Call kwargs.
+  std::vector<std::pair<std::string, std::any>> effective_kwargs = kwargs;
+  if (op_name == "tile.load") {
+    StampMxLoadTargetMemoryKwarg(args, effective_kwargs);
+  }
+
   // Validate kwargs against allowed attributes (stored in Op)
-  if (!kwargs.empty()) {
+  if (!effective_kwargs.empty()) {
     const auto& allowed_kwargs = op->GetAttrs();
     if (!allowed_kwargs.empty()) {
-      ValidateKwargs(kwargs, allowed_kwargs, op_name);
+      ValidateKwargs(effective_kwargs, allowed_kwargs, op_name);
     }
   }
 
@@ -158,7 +191,7 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   // Deduce result type (pass args and kwargs separately)
   TypePtr result_type;
   try {
-    result_type = deduce_type_fn(args, kwargs);
+    result_type = deduce_type_fn(args, effective_kwargs);
   } catch (const std::exception& e) {
     std::string location = span.is_valid() ? " at " + span.to_string() : "";
     throw ValueError(std::string(e.what()) + location);
@@ -176,7 +209,7 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   const auto& mem_spec = entry.GetMemorySpec();
   if (mem_spec.has_value() && mem_spec->deduce_output_memory) {
     auto resolve_memory_space = [&]() -> std::optional<MemorySpace> {
-      auto resolved = mem_spec->deduce_output_memory(kwargs);
+      auto resolved = mem_spec->deduce_output_memory(effective_kwargs);
       if (resolved.has_value()) {
         return resolved;
       }
@@ -230,7 +263,7 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   }
 
   // Create Call with deduced type
-  return std::make_shared<Call>(op, args, kwargs, result_type, std::move(span));
+  return std::make_shared<Call>(op, args, effective_kwargs, result_type, std::move(span));
 }
 
 const OpRegistryEntry& OpRegistry::GetEntry(const std::string& op_name) const {

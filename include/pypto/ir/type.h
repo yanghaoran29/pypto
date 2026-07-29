@@ -133,12 +133,20 @@ using ScalarTypePtr = std::shared_ptr<const ScalarType>;
  * - ND: ND layout
  * - DN: DN layout
  * - NZ: NZ layout
+ * - MX_A_ZZ / MX_B_NN: MX scale GM packs (align PTOAS #pto.layout / pto-isa Layout::)
  */
 enum class TensorLayout {
-  ND,  ///< ND layout
-  DN,  ///< DN layout
-  NZ   ///< NZ layout
+  ND,       ///< ND layout
+  DN,       ///< DN layout
+  NZ,       ///< NZ layout
+  MX_A_ZZ,  ///< MX Left/A scale GM pack (ZZ)
+  MX_B_NN   ///< MX Right/B scale GM pack (NN)
 };
+
+/** True when layout selects the MX scale GM load path (TLoadMxCube*). */
+inline bool IsMxTensorLayout(TensorLayout layout) {
+  return layout == TensorLayout::MX_A_ZZ || layout == TensorLayout::MX_B_NN;
+}
 
 /**
  * @brief Convert TensorLayout enum to string
@@ -178,7 +186,7 @@ enum class PadValue {
  * @brief Tensor view representation
  *
  * Represents the view information for a tensor, including stride, layout,
- * valid_shape, and pad mode. The shape is stored in TensorType itself.
+ * valid_shape, start offset, and pad mode. The shape is stored in TensorType itself.
  */
 struct TensorView {
   std::vector<ExprPtr> stride;  ///< Stride for each dimension
@@ -186,6 +194,7 @@ struct TensorView {
   std::vector<ExprPtr>
       valid_shape;                ///< Valid shape for each dimension (optional, empty means use full shape)
   PadValue pad = PadValue::null;  ///< Pad mode for accesses outside valid_shape but within shape
+  ExprPtr start_offset;           ///< Linear element base offset (set by tensor.slice; nullptr if none)
 
   /**
    * @brief Default constructor with ND layout and empty stride/valid_shape
@@ -199,10 +208,15 @@ struct TensorView {
    * @param layout Tensor layout type
    * @param valid_shape Valid shape for each dimension (optional, defaults to empty)
    * @param pad Pad mode (optional, defaults to PadValue::null)
+   * @param start_offset Linear base offset (optional, defaults to null)
    */
   TensorView(std::vector<ExprPtr> stride, TensorLayout layout, std::vector<ExprPtr> valid_shape = {},
-             PadValue pad = PadValue::null)
-      : stride(std::move(stride)), layout(layout), valid_shape(std::move(valid_shape)), pad(pad) {}
+             PadValue pad = PadValue::null, ExprPtr start_offset = nullptr)
+      : stride(std::move(stride)),
+        layout(layout),
+        valid_shape(std::move(valid_shape)),
+        pad(pad),
+        start_offset(std::move(start_offset)) {}
 
   /**
    * @brief Constructor with integer stride and valid_shape (auto-converted to ConstInt)
@@ -211,9 +225,11 @@ struct TensorView {
    * @param layout Tensor layout type
    * @param valid_shape Valid shape for each dimension (int64, defaults to empty)
    * @param pad Pad mode (optional, defaults to PadValue::null)
+   * @param start_offset Linear base offset (optional, defaults to null)
    */
   TensorView(const std::vector<int64_t>& stride, TensorLayout layout,
-             const std::vector<int64_t>& valid_shape = {}, PadValue pad = PadValue::null);
+             const std::vector<int64_t>& valid_shape = {}, PadValue pad = PadValue::null,
+             ExprPtr start_offset = nullptr);
 
   /**
    * @brief Get field descriptors for reflection-based visitation
@@ -224,7 +240,8 @@ struct TensorView {
     return std::make_tuple(reflection::UsualField(&TensorView::stride, "stride"),
                            reflection::UsualField(&TensorView::layout, "layout"),
                            reflection::UsualField(&TensorView::valid_shape, "valid_shape"),
-                           reflection::UsualField(&TensorView::pad, "pad"));
+                           reflection::UsualField(&TensorView::pad, "pad"),
+                           reflection::UsualField(&TensorView::start_offset, "start_offset"));
   }
 };
 

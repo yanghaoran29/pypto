@@ -1918,7 +1918,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // tiles carry no membership and never trigger this. See ``kPipelineMembershipAttr``.
   //
   // Default (capacity-gated, #1475): protect concurrent clones in EVERY space —
-  // including the L0 matmul spaces (Left/Right/Acc/Bias) and regardless of whether
+  // including the L0 matmul spaces (Left/Right/Acc/Bias/LeftScale/RightScale) and regardless of whether
   // a tile is a load or a `tile.move` result — up to the max-affordable
   // double-buffering depth `F_g` (see below). This is what fixes the L0b operand
   // collapse: the binding matmul operands are L0 `tile.move` results, so the legacy
@@ -1935,7 +1935,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // fit; the predicate is retained verbatim only as the never-worse-than-legacy floor.
   auto is_l0_space = [](MemorySpace s) {
     return s == MemorySpace::Left || s == MemorySpace::Right || s == MemorySpace::Acc ||
-           s == MemorySpace::Bias;
+           s == MemorySpace::Bias || s == MemorySpace::LeftScale || s == MemorySpace::RightScale;
   };
   // Capacity-gated (#1475): keep software-pipelined operands in separate buffers so the pipeline
   // stages double-buffer instead of serializing on a shared buffer. #1900's `pipeline_membership` tags

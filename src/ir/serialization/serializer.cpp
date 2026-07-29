@@ -389,6 +389,10 @@ class IRSerializer::Impl {
     }
     tv_map["pad"] = msgpack::object(pad_str, zone);
 
+    // Serialize a missing start_offset as MessagePack nil (same as TileView).
+    tv_map["start_offset"] =
+        tensor_view->start_offset ? SerializeNode(tensor_view->start_offset, zone) : msgpack::object();
+
     return msgpack::object(tv_map, zone);
   }
 

@@ -1369,6 +1369,9 @@ void CollectCallTypeBindings(const TypePtr& pattern, const TypePtr& value, const
     if (pattern_tensor->tensor_view_ && value_tensor->tensor_view_) {
       CollectCallExprVectorBindings(pattern_tensor->tensor_view_->stride, value_tensor->tensor_view_->stride,
                                     context + " tensor stride", var_map, constraints);
+      CollectCallExprBindings(pattern_tensor->tensor_view_->start_offset,
+                              value_tensor->tensor_view_->start_offset, context + " tensor start_offset",
+                              var_map, constraints);
     }
     return;
   }

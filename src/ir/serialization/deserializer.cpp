@@ -304,6 +304,10 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
           tensor_view.layout = TensorLayout::DN;
         } else if (layout_str == "NZ") {
           tensor_view.layout = TensorLayout::NZ;
+        } else if (layout_str == "MX_A_ZZ") {
+          tensor_view.layout = TensorLayout::MX_A_ZZ;
+        } else if (layout_str == "MX_B_NN") {
+          tensor_view.layout = TensorLayout::MX_B_NN;
         } else {
           CHECK(false) << "Unknown TensorLayout: " << layout_str;
         }
@@ -321,9 +325,13 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
         } else {
           CHECK(false) << "Unknown PadValue: " << pad_str;
         }
+      } else if (key == "start_offset") {
+        if (p->val.type != msgpack::type::NIL) {
+          tensor_view.start_offset = std::static_pointer_cast<const Expr>(DeserializeNode(p->val, zone));
+        }
       }
-      // Older serialized IR may omit "valid_shape" or "pad"; defaults stay
-      // fully valid and PadValue::null, respectively.
+      // Older serialized IR may omit "valid_shape", "pad", or "start_offset"; defaults stay
+      // fully valid, PadValue::null, and nullptr, respectively.
     }
 
     return tensor_view;

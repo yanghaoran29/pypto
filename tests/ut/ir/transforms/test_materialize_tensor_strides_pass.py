@@ -184,6 +184,40 @@ def test_empty_stride_materialization_preserves_pad():
     assert _verify_strict(After) == []
 
 
+@pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
+def test_empty_mx_stride_materializes_and_passes_strict_verifier(layout):
+    view = ir.TensorView([], layout)
+    tensor_type = ir.TensorType(_dims([8, 16]), DataType.FP8E8M0, None, view)
+    x = ir.Var("x", tensor_type, _SPAN)
+    program = ir.Program([ir.Function("f", [x], [], ir.ReturnStmt([], _SPAN), _SPAN)], "p", _SPAN)
+
+    after = _materialize(program)
+    param_type = after.get_function("f").params[0].type
+
+    assert isinstance(param_type, ir.TensorType)
+    assert param_type.tensor_view is not None
+    assert _values_of(param_type.tensor_view.stride) == [16, 1]
+    assert param_type.tensor_view.layout == layout
+    assert _verify_strict(after) == []
+
+
+def test_empty_stride_materialization_preserves_start_offset():
+    offset = ir.ConstInt(17, DataType.INDEX, _SPAN)
+    view = ir.TensorView([], ir.TensorLayout.ND, [], ir.PadValue.null, offset)
+    tensor_type = ir.TensorType(_dims([8, 16]), DataType.FP32, None, view)
+    x = ir.Var("x", tensor_type, _SPAN)
+    program = ir.Program([ir.Function("f", [x], [], ir.ReturnStmt([], _SPAN), _SPAN)], "p", _SPAN)
+
+    after = _materialize(program)
+    param_type = after.get_function("f").params[0].type
+
+    assert isinstance(param_type, ir.TensorType)
+    assert param_type.tensor_view is not None
+    assert _values_of(param_type.tensor_view.stride) == [16, 1]
+    assert cast(ir.ConstInt, param_type.tensor_view.start_offset).value == 17
+    assert _verify_strict(after) == []
+
+
 def test_empty_default_nd_view_canonicalizes_absent():
     # Empty ND is the default TensorView and canonicalizes to no explicit view.
     @pl.program
@@ -213,7 +247,8 @@ def test_distributed_tensor_param_preserves_memref_and_pad_metadata():
     """Materializing a distributed tensor view keeps non-stride metadata."""
     base = ir.Var("base", ir.PtrType(), _SPAN)
     memref = ir.MemRef(base, 0, 128, _SPAN)
-    view = ir.TensorView([], ir.TensorLayout.DN, [], ir.PadValue.zero)
+    offset = ir.ConstInt(7, DataType.INDEX, _SPAN)
+    view = ir.TensorView([], ir.TensorLayout.DN, [], ir.PadValue.zero, offset)
     dist_type = ir.DistributedTensorType(_dims([4, 8]), DataType.FP32, memref, view)
 
     ib = IRBuilder()
@@ -234,6 +269,7 @@ def test_distributed_tensor_param_preserves_memref_and_pad_metadata():
     assert _values_of(param_type.tensor_view.stride) == [1, 4]
     assert param_type.tensor_view.layout == ir.TensorLayout.DN
     assert param_type.tensor_view.pad == ir.PadValue.zero
+    assert cast(ir.ConstInt, param_type.tensor_view.start_offset).value == 7
 
 
 def test_distributed_tensor_view_preserves_window_buffer_metadata():

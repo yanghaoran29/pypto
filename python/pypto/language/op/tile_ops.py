@@ -364,7 +364,7 @@ def load(
     offsets: Sequence[IntLike],
     shapes: Sequence[IntLike],
     valid_shapes: Sequence[IntLike] | None = None,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     clamp: bool = False,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
@@ -374,13 +374,18 @@ def load(
     shifted by ``offsets`` and cut to the tile — a load never reports source bytes
     that do not exist as real data.
 
+    MX scale GM tensors use ``pl.Tensor[..., pl.MX_A_ZZ]`` / ``pl.MX_B_NN``
+    (same shorthand as ``pl.NZ``). Loading them uses the MX Mat path; the load
+    still lands in L1/Mat — use ``pl.move`` to LeftScale/RightScale afterwards.
+
     Args:
         tensor: Source tensor
         offsets: Offsets in each dimension. Always in the source tensor's
             coordinate system.
         shapes: Shape of the region to load in each dimension. Always in the
             source tensor's coordinate system.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
+        target_memory: Target memory space. Defaults to MemorySpace.Vec for
+            ordinary loads and MemorySpace.Mat for MX-layout sources.
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes. Narrows
@@ -600,14 +605,20 @@ def move(
 
     Args:
         tile: Input tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right,
+            .LeftScale, .RightScale)
         blayout: Optional block layout for the destination tile
         slayout: Optional scatter layout for the destination tile
 
     Returns:
         Tile wrapping the move operation
     """
-    call_expr = _ir_ops.move(tile.unwrap(), target_memory, blayout=blayout, slayout=slayout)
+    call_expr = _ir_ops.move(
+        tile.unwrap(),
+        target_memory,
+        blayout=blayout,
+        slayout=slayout,
+    )
     return Tile(expr=call_expr)
 
 

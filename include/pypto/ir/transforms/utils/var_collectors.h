@@ -157,7 +157,7 @@ inline std::unordered_set<const Var*> CollectStmtDefinedVars(const StmtPtr& stmt
 
 /// Visit all expression fields embedded in a type using the given visitor.
 ///
-/// Covers: TensorType/DistributedTensorType::shape_, tensor_view_.{valid_shape, stride};
+/// Covers: TensorType/DistributedTensorType::shape_, tensor_view_.{valid_shape, stride, start_offset};
 ///         TileType::shape_, tile_view_.{valid_shape, stride, start_offset};
 ///         TupleType elements (recursively).
 inline void VisitTypeExprFields(IRVisitor& visitor, const TypePtr& type) {
@@ -175,6 +175,7 @@ inline void VisitTypeExprFields(IRVisitor& visitor, const TypePtr& type) {
       const auto& tv = tensor_type->tensor_view_.value();
       visit_exprs(tv.valid_shape);
       visit_exprs(tv.stride);
+      if (tv.start_offset) visitor.VisitExpr(tv.start_offset);
     }
   } else if (auto tile_type = As<TileType>(type)) {
     visit_exprs(tile_type->shape_);
