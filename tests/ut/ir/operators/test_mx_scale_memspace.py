@@ -34,7 +34,6 @@ def _const_shape(rows: int, cols: int):
     return [ir.ConstInt(rows, DataType.INDEX, span), ir.ConstInt(cols, DataType.INDEX, span)]
 
 
-
 def _mx_tensor_var(name: str, rows: int, cols: int, layout: ir.TensorLayout):
     return ir.Var(
         name,
@@ -222,6 +221,47 @@ class TestMxScaleMemSpaces:
         with pytest.raises(Exception, match="requires the input tile to be in Mat"):
             passes.infer_tile_memory_space()(prog)
 
+    def test_scale_move_verifier_rejects_vec_iter_arg(self):
+        span = ir.Span.unknown()
+        shape = _const_shape(16, 8)
+        vec_type = ir.TileType(shape, DataType.FP8E8M0, None, None, ir.MemorySpace.Vec)
+        init = ir.Var("init", vec_type, span)
+        carried = ir.IterArg("carried", vec_type, init, span)
+        scale_type = ir.TileType(
+            shape,
+            DataType.FP8E8M0,
+            None,
+            ir.TileView(
+                blayout=ir.TileLayout.row_major,
+                slayout=ir.TileLayout.row_major,
+                fractal=32,
+            ),
+            ir.MemorySpace.LeftScale,
+        )
+        move = ir.Call(
+            ir.get_op("tile.move"),
+            [carried],
+            {"target_memory": ir.MemorySpace.LeftScale},
+            scale_type,
+            span,
+        )
+        result = ir.Var("result", scale_type, span)
+        function = ir.Function(
+            "mx_move_vec_iter_arg",
+            [init],
+            [],
+            ir.SeqStmts([ir.AssignStmt(result, move, span), ir.ReturnStmt([], span)], span),
+            span,
+            ir.FunctionType.InCore,
+        )
+        program = ir.Program([function], "mx_move_vec_iter_arg", span)
+        properties = passes.IRPropertySet()
+        properties.insert(passes.IRProperty.TileMemoryInferred)
+
+        diagnostics = passes.PropertyVerifierRegistry.verify(properties, program)
+
+        assert any("requires input in Mat memory" in diagnostic.message for diagnostic in diagnostics)
+
     @pytest.mark.parametrize(
         ("space", "blayout", "slayout"),
         [
@@ -333,12 +373,7 @@ class TestMxScaleMemSpaces:
             ) -> pl.Tensor[[8, 8], pl.FP8E8M0]:
                 source_tuple = (source,)
                 source_alias = source_tuple[0]
-                _scale = pl.load(
-                    source_alias,
-                    [0, 0],
-                    [8, 8],
-                    target_memory=pl.Mem.Mat
-                )
+                _scale = pl.load(source_alias, [0, 0], [8, 8], target_memory=pl.Mem.Mat)
                 return source
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -378,12 +413,7 @@ class TestMxScaleMemSpaces:
                 self,
                 source: pl.Tensor[[8, 8], pl.FP8E8M0, pl.MX_A_ZZ],
             ) -> pl.Tensor[[8, 8], pl.FP8E8M0]:
-                _scale = pl.load(
-                    source,
-                    [0, 0],
-                    [8, 8],
-                    target_memory=pl.Mem.Mat
-                )
+                _scale = pl.load(source, [0, 0], [8, 8], target_memory=pl.Mem.Mat)
                 return source
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -394,6 +424,36 @@ class TestMxScaleMemSpaces:
                 sliced = pl.slice(source, [8, 8], [1, 0])
                 forwarded, forwarded_copy = self.forward(sliced)
                 result, task_id = pl.submit(self.kernel, forwarded)
+                return result
+
+        program = passes.convert_to_ssa()(Input)
+        orchestration = next(
+            function
+            for function in program.functions.values()
+            if function.func_type == pl.FunctionType.Orchestration
+        )
+        with pytest.raises(Exception, match="packed top-level tensor.*tensor.slice-derived"):
+            codegen.generate_orchestration(program, orchestration)
+
+    def test_mx_load_rejects_slice_forwarded_through_tensor_view(self):
+        @pl.program
+        class Input:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                source: pl.Tensor[[8, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+            ) -> pl.Tensor[[8, 8], pl.FP8E8M0]:
+                _scale = pl.load(source, [0, 0], [8, 8], target_memory=pl.Mem.Mat)
+                return source
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestration(
+                self,
+                source: pl.Tensor[[16, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+            ) -> pl.Tensor[[8, 8], pl.FP8E8M0]:
+                sliced = pl.slice(source, [8, 8], [1, 0])
+                viewed = pl.tensor.view(sliced, [8, 8])
+                result, _ = pl.submit(self.kernel, viewed)
                 return result
 
         program = passes.convert_to_ssa()(Input)
@@ -535,12 +595,7 @@ class TestMxScaleMemSpaces:
             ),
             ir.Span.unknown(),
         )
-        call = tile.load(
-            tensor,
-            [0, 0],
-            [8, 8],
-            target_memory=ir.MemorySpace.Mat
-        )
+        call = tile.load(tensor, [0, 0], [8, 8], target_memory=ir.MemorySpace.Mat)
         assert isinstance(call.type, ir.TileType)
         assert call.type.tile_view.fractal == 32
 
@@ -556,12 +611,7 @@ class TestMxScaleMemSpaces:
             source = function.param("source", tensor_type)
             scale = builder.let(
                 "scale",
-                tile.load(
-                    source,
-                    [0, 0],
-                    [16, 2],
-                    target_memory=ir.MemorySpace.Mat
-                ),
+                tile.load(source, [0, 0], [16, 2], target_memory=ir.MemorySpace.Mat),
             )
             function.return_type(scale.type)
             builder.return_stmt(scale)

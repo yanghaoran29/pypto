@@ -32,6 +32,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
@@ -181,6 +182,11 @@ class MxSliceCallVerifier : public IRVisitor {
     bool slice_derived = false;
     if (auto call = As<Call>(assign->value_)) {
       slice_derived = IsOp(call, "tensor.slice");
+      if (!slice_derived && AsTensorTypeLike(assign->var_->GetType()) && !call->args_.empty() &&
+          op_predicates::IsBufferAliasingViewOp(call->op_->name_)) {
+        auto source = AsVarLike(call->args_[0]);
+        slice_derived = source && slice_derived_vars_.count(source.get()) > 0;
+      }
       if (!slice_derived && AsTensorTypeLike(assign->var_->GetType())) {
         slice_derived = ReturnedValueIsSliceDerived(call->op_, call->args_, 0);
       }
@@ -272,11 +278,10 @@ class MxSliceCallVerifier : public IRVisitor {
         // the layout tag selects the hardware load path. Allow ND as well for
         // SSA-forwarded values whose return annotation dropped the MX layout.
         const bool layout_ok = view.layout == TensorLayout::ND || IsMxTensorLayout(view.layout);
-        const auto packed = tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_,
-                                                                                 view.layout);
-        CHECK_SPAN(layout_ok &&
-                       (view.stride.empty() ||
-                        tile_view_semantics::ShapeExprListsEquivalent(view.stride, packed)),
+        const auto packed =
+            tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, view.layout);
+        CHECK_SPAN(layout_ok && (view.stride.empty() ||
+                                 tile_view_semantics::ShapeExprListsEquivalent(view.stride, packed)),
                    span)
             << "MX tile.load parameter " << param_idx << " of function '" << callee->name_
             << "' must be passed a packed MX/ND tensor, not a strided or incompatible TensorView";

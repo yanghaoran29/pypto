@@ -1011,25 +1011,24 @@ class TileMemoryInferredVerifier : public IRVisitor {
           if (j > 0) allowed_str += "/";
           allowed_str += MemorySpaceToString(allowed_spaces[j]);
         }
-      diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
-                                "InCore function '" + func_name_ + "': Op '" + call->op_->name_ +
-                                    "' input " + std::to_string(i) + " ('" + var->name_hint_ +
-                                    "') requires " + allowed_str + " but is in " +
-                                    MemorySpaceToString(actual),
-                                var->span_);
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
+                                  "InCore function '" + func_name_ + "': Op '" + call->op_->name_ +
+                                      "' input " + std::to_string(i) + " ('" + var->name_hint_ +
+                                      "') requires " + allowed_str + " but is in " +
+                                      MemorySpaceToString(actual),
+                                  var->span_);
       }
     }
 
     // tile.move into LeftScale/RightScale is Mat-only (L1→L0A/L0B scale sidecar).
     // tile.move has no static input_constraint (its target is kwarg-driven), so
     // check it here after InferTileMemorySpace has resolved the source space.
-    if (call->op_->name_ == "tile.move" && !call->args_.empty()) {
+    if (IsOp(call, "tile.move") && !call->args_.empty()) {
       const MemorySpace target = call->GetKwarg<MemorySpace>("target_memory", MemorySpace::Vec);
       if (target == MemorySpace::LeftScale || target == MemorySpace::RightScale) {
-        if (auto mv_var = As<Var>(call->args_[0])) {
+        if (auto mv_var = AsVarLike(call->args_[0])) {
           auto mv_tile = As<TileType>(mv_var->GetType());
-          if (mv_tile && mv_tile->memory_space_.has_value() &&
-              *mv_tile->memory_space_ != MemorySpace::Mat) {
+          if (mv_tile && mv_tile->memory_space_.has_value() && *mv_tile->memory_space_ != MemorySpace::Mat) {
             diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileMemoryInferred", 0,
                                       "InCore function '" + func_name_ + "': Op 'tile.move' into " +
                                           MemorySpaceToString(target) +
