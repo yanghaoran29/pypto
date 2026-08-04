@@ -606,6 +606,25 @@ tile_l0a = pl.move(tile_l1, target_memory=pl.Mem.Left)                # Mat → 
 out = pl.store(tile, [0, 0], output)                                  # Tile → DDR
 ```
 
+### MX Quantization (Ascend950/A5)
+
+```python
+src_tile = pl.load(src, [0, 0], [16, 64])
+quant, e8m0_scale = pl.quant_mx(src_tile, dtype=pl.FP8E4M3FN)
+result = pl.tdequant(int_tile, row_scale, row_offset)
+```
+
+`quant_mx` accepts a 2D FP16/FP32/BF16 tile with `M % 16 == 0`, `K % 32 == 0`,
+and `M*K <= 59461`. Its `dtype` selects the semantic quantized type; currently
+only `FP8E4M3FN` is supported and it returns an `FP8E4M3FN` quantized
+tile and an `FP8E8M0` block-scale tile; PTOAS's raw INT8/UINT8 destinations
+remain an internal compiler detail. Bind or unpack its two results before indexing; direct
+inline indexing such as `pl.quant_mx(src_tile)[0]` is not supported. Do not carry
+the pair as one value through `if` or loop results; unpack it and carry the two
+tiles separately. `tdequant`
+accepts an INT8/INT16 tile and FP32 `[M, 1]` scale and offset tiles. Both
+operations are available only on the Ascend950 backend.
+
 ### Pattern: Matrix Multiply (DDR → Mat → Left/Right → Acc → DDR)
 
 ```python

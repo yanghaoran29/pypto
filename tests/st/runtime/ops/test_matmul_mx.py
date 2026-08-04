@@ -7,12 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""On-board A5 runtime test for MX matmul.
+"""On-board A5 runtime tests for MX matmul.
 
 The codegen unit tests verify the emitted ``tmatmul_mx`` and
 ``tget_scale_addr`` instructions. This test additionally executes the base and
 accumulating forms on real Ascend950 hardware and compares their FP32 outputs
-with torch.
+with torch. A second case covers the full FP32 -> MXFP8 quantization -> MX
+matmul pipeline.
 """
 
 import pypto.language as pl
@@ -76,6 +77,19 @@ def _matmul_mx_golden(
     return torch.matmul(a_scaled, b_scaled).to(torch.float32)
 
 
+def _exact_quantizable_matrix(rows: int, cols: int, *, transpose_pattern: bool = False) -> torch.Tensor:
+    """Create FP32 blocks that quant_mx represents exactly with power-of-two scales."""
+    pattern = (torch.arange(MX_GROUP_SIZE, dtype=torch.float32) % 9) - 4
+    pattern[0] = 448
+    pattern[1] = -448
+    groups_per_row = cols // MX_GROUP_SIZE
+    exponents = (torch.arange(rows * groups_per_row) % 4 - 1).reshape(rows, groups_per_row)
+    if transpose_pattern:
+        exponents = exponents.flip(0)
+    scales = torch.pow(2.0, exponents).to(torch.float32)
+    return (pattern.reshape(1, 1, MX_GROUP_SIZE) * scales.unsqueeze(-1)).reshape(rows, cols).contiguous()
+
+
 @pl.jit
 def matmul_mx_onboard(
     a: pl.Tensor[[M, K], pl.FP8E4M3FN],
@@ -108,6 +122,49 @@ def matmul_mx_onboard(
         accumulated = pl.matmul_mx_acc(base, lhs, lhs_scale, rhs, rhs_scale)
         out_acc = pl.store(accumulated, [0, 0], out_acc)
     return out, out_acc
+
+
+@pl.jit
+def quantized_matmul_mx_onboard(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b_transposed: pl.Tensor[[N, K], pl.FP32],
+    out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+):
+    """Quantize both FP32 operands on-chip before executing MX matmul."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        a_src = pl.load(a, [0, 0], [M, K])
+        a_quant, a_scale = pl.quant_mx(a_src)
+        a_mat = pl.move(a_quant, target_memory=pl.Mem.Mat)
+        lhs = pl.move(a_mat, target_memory=pl.Mem.Left)
+        a_scale_2d = pl.tile.reshape(a_scale, [M, K // MX_GROUP_SIZE])
+        a_scale_mat = pl.move(
+            a_scale_2d,
+            target_memory=pl.Mem.Mat,
+            blayout=pl.TileLayout.row_major,
+            slayout=pl.TileLayout.row_major,
+        )
+        lhs_scale = pl.move(a_scale_mat, target_memory=pl.Mem.LeftScale)
+
+        # Quantize B as [N, K] so every block still spans K, then transpose the
+        # quantized values and scale groups into matmul's [K, N] / [K/32, N].
+        b_src = pl.load(b_transposed, [0, 0], [N, K])
+        b_quant, b_scale = pl.quant_mx(b_src)
+        b_quant_t = pl.tile.transpose_view(b_quant)
+        b_mat = pl.move(b_quant_t, target_memory=pl.Mem.Mat)
+        rhs = pl.move(b_mat, target_memory=pl.Mem.Right)
+        b_scale_2d = pl.tile.reshape(b_scale, [N, K // MX_GROUP_SIZE])
+        b_scale_t = pl.tile.transpose_view(b_scale_2d)
+        b_scale_mat = pl.move(
+            b_scale_t,
+            target_memory=pl.Mem.Mat,
+            blayout=pl.TileLayout.col_major,
+            slayout=pl.TileLayout.col_major,
+        )
+        rhs_scale = pl.move(b_scale_mat, target_memory=pl.Mem.RightScale)
+
+        result = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+        out = pl.store(result, [0, 0], out)
+    return out
 
 
 @pytest.mark.platforms("a5")
@@ -143,6 +200,20 @@ class TestMatmulMxOnBoard:
 
         torch.testing.assert_close(out, base, rtol=0, atol=0)
         torch.testing.assert_close(out_acc, 2 * base, rtol=0, atol=0)
+
+    def test_quantized_matmul_mx_onboard(self, test_config):
+        quantized_matmul_mx_onboard._cache.clear()
+        a = _exact_quantizable_matrix(M, K)
+        b_transposed = _exact_quantizable_matrix(N, K, transpose_pattern=True)
+        expected = torch.matmul(a, b_transposed.T)
+        out = torch.empty_like(expected)
+
+        if test_config.codegen_only:
+            quantized_matmul_mx_onboard.compile(a, b_transposed, out, config=test_config)
+            return
+
+        quantized_matmul_mx_onboard(a, b_transposed, out, config=test_config)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-3)
 
 
 if __name__ == "__main__":

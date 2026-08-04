@@ -577,6 +577,23 @@ tile_l0a = pl.move(tile_l1, target_memory=pl.Mem.Left)                # Mat → 
 out = pl.store(tile, [0, 0], output)                                  # Tile → DDR
 ```
 
+### MX 量化（Ascend950/A5）
+
+```python
+src_tile = pl.load(src, [0, 0], [16, 64])
+quant, e8m0_scale = pl.quant_mx(src_tile, dtype=pl.FP8E4M3FN)
+result = pl.tdequant(int_tile, row_scale, row_offset)
+```
+
+`quant_mx` 接受二维 FP16/FP32/BF16 tile，要求 `M % 16 == 0`、`K % 32 == 0`
+且 `M*K <= 59461`。`dtype` 用于选择量化结果的语义类型；目前仅支持
+`FP8E4M3FN`，并返回 `FP8E4M3FN` 量化 tile 和
+`FP8E8M0` block-scale tile；PTOAS 所需的原始 INT8/UINT8 destination 属于
+编译器内部细节。应先绑定或解包两个返回值再索引；不支持
+`pl.quant_mx(src_tile)[0]` 这种直接内联索引。不要将返回 pair 作为一个整体
+通过 `if` 或循环结果传递；应先解包，再分别传递两个 tile。`tdequant` 接受 INT8/INT16 tile
+以及 FP32 `[M, 1]` scale 和 offset tile。两个算子都仅支持 Ascend950 后端。
+
 ### 模式：矩阵乘法（DDR → Mat → Left/Right → Acc → DDR）
 
 ```python

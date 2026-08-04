@@ -2,6 +2,8 @@
 
 把组合 (composite) tile / distributed 算子降级 (lower) 为一组基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.maximum`、`tile.minimum`、`tile.cast`）和分布式原语的组合，使代码生成 (codegen) 不再需要发射高层 (high-level) 指令。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。新的组合算子只需在 Pass 文件内部的分发表 (dispatch table) 里加一条降级规则，无需改动分发器本身。
 
+本 Pass 还处理 `tile.tquant_mx`，物化 PTOAS 所需的 scratch 和输出 tile。
+
 ## 概览 (Overview)
 
 `LowerCompositeOps` 是函数级 (function-level) Pass，对每条 `var = Call(...)` 形式的 `AssignStmt`，若其被调对象出现在 Pass 的降级分发表里，则将其改写为一个 `SeqStmts`。对 `tile.sin` / `tile.cos`，规则会发射固定形态的基本 tile 算子序列：`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`，先做 Cody-Waite 区间归约 (range reduction，π 拆成 4 段)，再做 9 次奇多项式 Horner 求值。对 `pld.tensor.*` 分布式集合通信算子，规则会发射下文记录的跨 rank recipe；`pld.tensor.allreduce` 在 InCore/composite lowering 中仍保持显式 signal 形态。原始目标 `Var` 仍是最终 `AssignStmt` 的 LHS，因此下游对该名字/身份的引用都保持不变。
@@ -23,6 +25,8 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 ## 运行时机 (When It Runs)
 
 `LowerCompositeOps` 是 `Default` 流水线 `tile_pto_passes` 的**第一个 Pass**（见 `python/pypto/ir/pass_manager.py`），紧跟 `ConvertTensorToTileOps`（位置 12）和 `OptimizeOrchTensors`（位置 13）之后。此时所有 tensor 级三角调用 (`tensor.sin`、`tensor.cos`) 已经被转换注册表 (conversion registry) 改写成 tile 等价物 (`tile.sin`、`tile.cos`)，tile 流水线即将开始 tile-shape 规范化 (canonicalisation)。在 `FlattenTileNdTo2D` 之前完成三角函数降级，可以让本 Pass 与 2D 展平规则解耦——展开生成的所有基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）在任意 rank 下都有定义良好的语义。
+
+更早的公共流水线已经执行 `FlattenCallExpr`，因此在 `tile.tquant_mx` 降级前，tuple consumer 已稳定为 `element = TupleGetItem(tuple_var, index)` 形态。
 
 ## 架构 (Architecture)
 
@@ -48,6 +52,14 @@ src/ir/transforms/lower_composite_ops_pass.cpp
 2. 在 `LookupCompositeRule` 的 `kRules` 里加一条 `{"<op>", &Lower<Op>Rule}`。
 
 无需修改 mutator。当分发表条目增多——或某条规则需要独立的翻译单元时——再把它拆回 `src/ir/transforms/composite_ops/` 下的独立注册表。
+
+多结果 `tile.tquant_mx` DPS 规则是一个例外：它会把 tuple projection 改写到显式 destination，让内存规划看见所有同时存活的输出。
+
+## 算法（`tile.tquant_mx` 规则）
+
+降级创建 `pto.tquant.mx` 所需且 dtype 与源一致的 `max`、`scaling` scratch tile，以及原始 INT8 `dst`、UINT8 `exp` 目标，再把四者全部作为有副作用的 `tile.tquant_mx_dps` `EvalStmt` 的显式操作数。DPS 调用之后会为公共 tuple 创建零拷贝 FP8 alias。这让内存规划看见所有同时存活区间，避免 source/output/scratch 相互重叠，保证指令不会被死代码消除删除，同时避免把 PTOAS 的存储约定泄漏到 DSL 类型契约。
+
+mutator 把每个 `TupleGetItem(tuple_var, index)` 映射到对应的语义 FP8 alias，并让该映射沿裸 tuple alias 传播。部分消费以及重复提取同一 index 都共享 PTOAS 实际写入的同一 buffer。即使某一结果未消费，PTOAS 仍要求四个输出，因此两个原始 destination 和两个 alias 都会存在。`pl.quant_mx(src)[0]` 这种直接内联索引会被明确拒绝；应先绑定或解包返回值。内部 `tile.tquant_mx_dps` 不注册为组合规则，Pass 仍然幂等。
 
 ## 算法 (Algorithm，sin / cos 规则)
 
@@ -185,6 +197,8 @@ sin 与 cos 共用同一组多项式系数：cos 路径只在区间归约阶段�
 ## 幂等性 (Idempotency)
 
 连跑两次 `LowerCompositeOps` 会得到与第一次完全相同的 IR：recipes 展开后只剩 `tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.maximum`、`tile.minimum`、`tile.cast` 等基本算子以及下文列出的分布式原语。mutator 只改写已注册的组合调用（`tile.sin`、`tile.cos`、`pld.tensor.*` 分布式集合通信算子等），所以第二次访问 body 时不会有任何变化。`tests/ut/ir/transforms/test_lower_composite_ops.py` 中的 sin/cos 与分布式集合通信幂等性测试验证了这一性质。
+
+`tile.tquant_mx` 规则生成的是非组合算子 `tile.tquant_mx_dps`，因此 MX lowering 同样幂等。
 
 ## `pld.tensor.*` 分布式集合通信算子
 
@@ -328,3 +342,4 @@ mutator 重写 `VisitStmt_(const AssignStmtPtr&)` 而不是 `VisitCall`，原因
 - **算子推导器 (op deducer)**：`src/ir/op/tile_ops/unary.cpp:94` 的 `DeduceTileFP32OnlyType` —— 在算子构造时强制 FP32-only。
 - **转换注册表 (conversion registry)**：`src/ir/transforms/op_conversion_registry.cpp` 中的 `RegisterSimple("tensor.sin", "tile.sin")` 与 cos 对应项 —— 上游 tensor-to-tile 改写，产出本 Pass 消费的 `tile.sin` / `tile.cos` 调用。
 - **测试**：`tests/ut/ir/transforms/test_lower_composite_ops.py`（结构）与 `tests/ut/ir/transforms/test_lower_composite_ops_numerical.py`（NumPy 数值对照）。
+- **MX 量化测试**：`tests/ut/codegen/test_mx_quant_codegen.py`（tuple 消费与内存规划）。

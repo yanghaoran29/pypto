@@ -66,6 +66,8 @@ __all__ = [
     "abs",
     "relu",
     "cast",
+    "quant_mx",
+    "tdequant",
     "matmul",
     "batch_matmul",
     "matmul_acc",
@@ -1164,6 +1166,45 @@ def cast(
     """
     call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode)
     return Tile(expr=call_expr)
+
+
+# ============================================================================
+# MX Quantization Operations
+# ============================================================================
+
+
+def quant_mx(src: Tile, *, dtype: DataType = DataType.FP8E4M3FN) -> tuple[Tile, Tile]:
+    """MX block-32 dynamic quantization (MXFP8).
+
+    Args:
+        src: source tile (FP16/FP32/BF16, 2D).
+        dtype: Quantized element dtype. Currently only ``FP8E4M3FN`` is
+            supported.
+
+    Returns:
+        ``(quantized, e8m0_scale)`` with semantic dtypes ``FP8E4M3FN`` and
+        ``FP8E8M0``. The compiler keeps the raw PTOAS byte destinations
+        internal to lowering.
+    """
+    if dtype != DataType.FP8E4M3FN:
+        raise ValueError(f"pl.quant_mx supports only FP8E4M3FN dtype, but got {dtype}")
+    call_expr = _ir_ops.tquant_mx(src.unwrap(), mode="mxfp8_e4m3")
+    span = call_expr.span
+    return (
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
+    )
+
+
+def tdequant(src: Tile, scale: Tile, offset: Tile) -> Tile:
+    """Dequantize integer tile with per-row scale/offset."""
+    call_expr = _ir_ops.tdequant(src.unwrap(), scale.unwrap(), offset.unwrap())
+    return Tile(expr=call_expr)
+
+
+# ============================================================================
+# Matrix Operations
+# ============================================================================
 
 
 def matmul(lhs: Tile, rhs: Tile) -> Tile:

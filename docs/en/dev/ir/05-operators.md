@@ -296,7 +296,7 @@ UINT32 + INT32 → INT32 (signed precedence)
 
 `tensor.view` is a metadata-only zero-copy shape/layout reinterpret. It is registered as a `TensorOp` passthrough in `ConvertTensorToTileOps`; PTO in-core codegen lowers it to `pto.make_tensor_view` over the original base pointer. Targets require rank at least 1 (DN requires rank at least 2); orchestration shape reinterpret is ND-only and cannot also change layout. Shape reinterpretation of a partially valid source is limited to either a packed ND leading-dimension collapse to 2D or a contiguous-prefix linear collapse to `[1, product(shape)]`; both require an explicit target `valid_shape`. These forms preserve the source tensor kind and backing metadata.
 
-`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes, so `dtype` must differ and be one of signed/unsigned 8/16/32/64-bit integers, FP16, BF16, or FP32. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors are unsupported.
+`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes, so `dtype` must differ and be one of signed/unsigned 8/16/32/64-bit integers, FP8E4M3FN, FP8E8M0, FP16, BF16, or FP32. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors are unsupported.
 
 **Example:**
 
@@ -332,6 +332,8 @@ with ib.function("tensor_example") as f:
 | **Element-wise** | `tile.add/sub/mul/div` | Tile-Tile operations |
 | - | `tile.adds/subs/muls/divs` | Tile-Scalar operations. A **constant** scalar operand adopts the tile's element dtype (a bare int literal is otherwise parsed as `index`, which no `pto.t*s` op accepts) — except a float literal on an integer tile, which keeps FP32 so promotion is preserved. An explicit `pl.const(v, dtype)` is a deliberate annotation and is left as-is, as is any non-constant expression; a non-constant `index` scalar (loop var, `pl.dim`) is rejected — convert it with `pl.cast`. Same rule for `tensor.*s`. |
 | **Unary** | `tile.sqrt` | Element-wise square root |
+| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only MX block-32 dynamic quantization returning semantic `{FP8E4M3FN quant, FP8E8M0 scale}` results; public `dtype` currently accepts only `FP8E4M3FN`; requires a full valid region (`valid_shape == shape`), `M % 16 == 0`, `K % 32 == 0`, and `M*K <= 59461`; either result may be consumed independently; Pass 12 hides PTOAS's raw INT8/UINT8 destinations and codegen emits `pto.tquant.mx` |
+| - | `tile.tdequant` / `pl.tdequant` | Integer per-row dequantization: `dst = (src - offset) * scale`; src accepts row-major or column-major input and is normalized to row-major, dst is row-major, and `[M,1]` scale/offset are column-major |
 | **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
 | - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat). The result's layout comes from `target_memory`'s implicit view, except `Left`/`Right`, which take the TEXTRACT-side L0 formats (these differ from `tile.move`'s TMOV-side ones) |
 | - | `tile.reshape` | Reshape tile to new dimensions (element count must match). Carries the source's `valid_shape` through without widening it — see [Reshape and the valid region](#reshape-and-the-valid-region) |
@@ -355,7 +357,7 @@ The deduced result `TileView` splits by field:
 | Field | Source of the result value |
 | ----- | -------------------------- |
 | `blayout` / `slayout` | The **destination** space's implicit layout wherever it has one of its own (`Mat`, `Acc`, `Left`, `Right`, `LeftScale`, `RightScale`); for the flat spaces (`Vec`, `Bias`, …) the source tile's effective layout carries over. A `blayout` / `slayout` kwarg overrides either |
-| `fractal` | The **destination** space's boxing granularity, never the source's: `Acc` (L0C, NZ-boxed) is 1024, MX scale tiles are 32, everything else 512 |
+| `fractal` | The **destination** space's boxing granularity: `Acc` (L0C, NZ-boxed) is 1024, MX scale tiles are 32, everything else 512. The narrow exception is explicit UINT8/FP8E8M0 MX-scale staging from Vec to Mat: matching row/row or col/col layouts preserve the source fractal-32 metadata so the next move can enter LeftScale/RightScale |
 | `valid_shape` / `pad` | Carried over from the source |
 | `stride` / `start_offset` | Dropped — the destination is a dense buffer |
 
@@ -363,6 +365,10 @@ The layout comes from the destination because it describes how that buffer is
 boxed; `tile_view_semantics::GetImplicitTileLayout` supplies it. `Right` needs a
 local override — L0B requires `blayout=row_major` even for an `[N, 1]` shape,
 whose implicit `blayout` is `col_major`.
+
+Reshaping a fractal-32 UINT8/FP8E8M0 quantization scale into its 2D matrix
+preserves the block size and selects row/row; transposing that view selects
+col/col. These are the canonical left and right scale staging layouts.
 
 `tile.move` stamps the destination `memory_space` itself (see the `TileType`
 contract in [Types](02-types.md#tiletype)), so a result view matching the
