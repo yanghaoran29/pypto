@@ -115,6 +115,13 @@
 | `dim` | `pl.` | 张量的运行期维度 |
 | `read` `write` | `pl.` | 元素访问 |
 
+## 量化
+
+| 算子 | 可达 | 作用 |
+| ---- | ---- | ---- |
+| `quant_mx` | `pl.` (t) | Ascend950 MX block-32 动态量化，把 FP16、FP32 或 BF16 转为 FP8E4M3FN 数据和 FP8E8M0 scale |
+| `tdequant` | `pl.` (t) | Ascend950 逐行仿射反量化，使用 FP32 scale 和 offset 处理 INT8 或 INT16 数据 |
+
 ## 线性代数
 
 | 算子 | 可达 | 作用 |
