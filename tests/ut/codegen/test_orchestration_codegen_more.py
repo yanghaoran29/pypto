@@ -405,6 +405,58 @@ class TestOrchestrationMore:
         with pytest.raises(ValueError, match="cannot combine shape reinterpret"):
             _generate_orch_code(program)
 
+    def test_tensor_view_mx_a_shaped_nd_backing_view_uses_alias(self):
+        """MX_A_ZZ storage can expose a packed ND producer view."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        span = ir.Span.unknown()
+        mx_view = ir.TensorView([], ir.TensorLayout.MX_A_ZZ)
+        mx_type = ir.TensorType([32, 4], DataType.FP8E8M0, tensor_view=mx_view)
+        ib = IRBuilder()
+        with ib.function("orch_mx_a_nd", type=ir.FunctionType.Orchestration) as f:
+            scale = f.param("scale", mx_type)
+            f.return_type(ir.TensorType([1, 128], DataType.FP8E8M0))
+            viewed = ib.let(
+                "viewed",
+                tensor_ops.view(scale, [1, 128], layout=ir.TensorLayout.ND),
+            )
+            ib.return_stmt(viewed)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_mx_a_nd_view", span)
+
+        code = _generate_orch_code(program)
+
+        assert "Tensor viewed = ext_scale;" in code
+        assert ".reshape(" not in code
+
+    def test_tensor_view_nd_shaped_mx_a_consumer_view_uses_alias(self):
+        """An ND FP8E8M0 backing tensor can expose an MX_A_ZZ consumer view."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        ib = IRBuilder()
+        with ib.function("orch_nd_mx_a", type=ir.FunctionType.Orchestration) as f:
+            scale = f.param("scale", ir.TensorType([1, 128], DataType.FP8E8M0))
+            mx_type = ir.TensorType(
+                [32, 4],
+                DataType.FP8E8M0,
+                tensor_view=ir.TensorView([], ir.TensorLayout.MX_A_ZZ),
+            )
+            f.return_type(mx_type)
+            viewed = ib.let(
+                "viewed",
+                tensor_ops.view(scale, [32, 4], layout=ir.TensorLayout.MX_A_ZZ),
+            )
+            ib.return_stmt(viewed)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_nd_mx_a_view", ir.Span.unknown())
+
+        code = _generate_orch_code(program)
+
+        assert "Tensor viewed = ext_scale;" in code
+        assert ".reshape(" not in code
+
     def test_tensor_view_shape_reinterpret_rejects_dn_source(self):
         """Shape-only tensor.view on a DN source cannot lower to runtime reshape.
 

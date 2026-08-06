@@ -144,9 +144,11 @@ dtype。PyPTO 在 Ascend950 上通过 `matmul_mx` 算子族支持 host-prequant 
 GM scale layout `mx_a_zz` / `mx_b_nn`（host ZZ/NN pack）；对齐 M↑16、K↑64、N↑32（fp8）。
 
 MX tensor subview 是当前遗留限制。由于硬件路径无法表达 subview base
-offset，`tensor.slice`、`tensor.reshape`、`tensor.transpose`、
-`tensor.reinterpret_view` 和 `tensor.view` 均拒绝 MX-layout source。
-在完整的 scale layout contract 实现前，`pld.tile.remote_load` 也拒绝 MX layout。
+offset，`tensor.slice`、`tensor.reshape`、`tensor.transpose` 和
+`tensor.reinterpret_view` 均拒绝 MX-layout source。`tensor.view` 唯一的
+例外是 FP8E8M0 在 `MX_A_ZZ` 与 packed ND storage 之间的 shaped、zero-copy
+backing alias；它保留同一个完整 buffer，而不是选择 subview。在完整的
+scale layout contract 实现前，`pld.tile.remote_load` 也拒绝 MX layout。
 
 #### MX / Ascend950：pto-isa 约束
 
@@ -281,7 +283,7 @@ UINT32 + INT32 → INT32 (signed precedence)
 
 **操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（内部 API，更新 valid_shape 元数据，不搬移数据 — 仅供编译器生成代码使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按后端分策略下降 —— A5（Ascend950）将末维 gather 展开为对扁平元素偏移 `flat[i, j] = i * src_cols + index[i, j]` 的单次整块 `tile.gather`，并在此之前把带 stride 的 tile 源（如 `tile.slice` 视图）物化为连续 tile，使扁平索引能正确寻址；A2A3（Ascend910B）保留 legacy 的按行 `tile.gather` 循环，此时每个单行切片内的列索引即等于扁平索引），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`；见[掩码模式](#掩码模式)），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列 —— 见[掩码模式](#掩码模式)），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace），`tensor.and/ands/or/ors/xor/xors/not/shl/shls/shr/shrs`（仅整数的位运算与移位。此处列出的是注册的 *IR* 名称；其中名字本身是 Python 关键字的三个，其 Python 拼写带尾部下划线 —— `tensor.and_`、`tensor.or_`、`tensor.not_` —— printer 也按该形式输出，以保证 IR 能往返为合法 Python；对应同名 `tile.*` 操作。张量-张量形式的两个操作数形状必须相同 —— 硬件没有 `tile.row_expand_and`，因此广播在类型推导阶段即被拒绝，而不是延迟到 pass 中失败。`tensor.not` 仅支持 int16/uint16，与 `tile.not`/TNOT 一致。移位保持 lhs 的元素类型；`and`/`or`/`xor` 按整数位宽提升，与其 tile 版本行为一致。`ConvertTensorToTileOps` 将其中九个 1:1 下降，并为 `tensor.xor`/`tensor.xors` 合成 `pto.txor` 所需的临时操作数，使 tensor 层调用者无需提供 `tmp`）
 
-`tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为 `TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。目标 rank 至少为 1（DN 至少为 2）；编排层仅支持 ND shape 重新解释，且不能同时改变 layout。对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading dimensions 折叠为 2D，或把连续前缀线性折叠为 `[1, product(shape)]`；两种形式都必须显式提供目标 `valid_shape`，并会保留源张量类型及其底层元数据。
+`tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为 `TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。目标 rank 至少为 1（DN 至少为 2）。编排层通常仅支持 ND shape 重新解释，且不能同时改变 layout；FP8E8M0 dynamic A-scale storage 还允许在 packed ND 与 `MX_A_ZZ` 之间建立元素数相同的 shaped alias，编排层保留同一个 runtime tensor，不调用 `reshape`。对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading dimensions 折叠为 2D，或把连续前缀线性折叠为 `[1, product(shape)]`；两种形式都必须显式提供目标 `valid_shape`，并会保留源张量类型及其底层元数据。
 
 `pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图，因此 `dtype` 必须不同，且仅支持有/无符号 8/16/32/64 位整数、FP8E4M3FN、FP8E8M0、FP16、BF16 与 FP32。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 暂不支持。
 

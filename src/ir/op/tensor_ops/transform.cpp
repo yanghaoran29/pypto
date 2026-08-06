@@ -480,8 +480,15 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
   TensorLayout src_layout =
       src_type->tensor_view_.has_value() ? src_type->tensor_view_->layout : TensorLayout::ND;
   TensorLayout new_layout = requested_layout.value_or(src_layout);
-  CHECK_SPAN(!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout), args[0]->span_)
-      << "tensor.view does not support MX layouts";
+  const bool has_shape = args.size() >= 2;
+  const bool is_mx_a_backing_nd_view =
+      has_shape && src_type->dtype_ == DataType::FP8E8M0 &&
+      ((src_layout == TensorLayout::MX_A_ZZ && new_layout == TensorLayout::ND) ||
+       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_A_ZZ));
+  CHECK_SPAN((!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout)) || is_mx_a_backing_nd_view,
+             args[0]->span_)
+      << "tensor.view does not support MX layouts except shaped ND/MX_A_ZZ backing views for "
+         "FP8E8M0";
   CHECK(new_layout != TensorLayout::NZ)
       << "tensor.view: NZ layout is not allowed on TensorType (NZ is tile-only)";
   CHECK(src_layout != TensorLayout::NZ)
@@ -495,7 +502,6 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
   }
 
   std::vector<ExprPtr> new_shape;
-  const bool has_shape = args.size() >= 2;
   const bool has_explicit_valid_shape = args.size() == 3;
   if (has_shape && src_type->tensor_view_.has_value() && !src_type->tensor_view_->stride.empty()) {
     auto packed_stride = tensor_view_semantics::BuildLogicalStridesFromLayout(src_type->shape_, src_layout);
