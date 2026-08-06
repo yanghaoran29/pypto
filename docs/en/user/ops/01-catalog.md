@@ -123,6 +123,13 @@ tile depend on the pad value; see
 | `dim` | `pl.` | A tensor's runtime dimension |
 | `read` `write` | `pl.` | Element access |
 
+## Quantization
+
+| Operator | Reach | What it does |
+| -------- | ----- | ------------ |
+| `quant_mx` | `pl.` (t) | Ascend950 MX block-32 dynamic quantization from FP16, FP32, or BF16 to FP8E4M3FN data plus FP8E8M0 scales |
+| `tdequant` | `pl.` (t) | Ascend950 per-row affine dequantization of INT8 or INT16 data with FP32 scale and offset |
+
 ## Linear algebra
 
 | Operator | Reach | What it does |

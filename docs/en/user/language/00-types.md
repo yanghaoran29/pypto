@@ -141,10 +141,12 @@ scale tensor** of an MX (microscaling) operand on Ascend950 — `MX_A_ZZ` for th
 scale pack, `MX_B_NN` for the right/B one — so that a Mat-to-scale `pl.move` can check the
 source layout instead of byte-copying incompatible data into `LeftScale` / `RightScale`.
 They are the one case where a layout marker on a `pl.Tensor` annotation is required rather
-than discouraged. Current limitations: an MX `pl.load` must pass `target_memory=pl.Mem.Mat`
-explicitly, MX subviews (`slice`, `reshape`, `transpose`, `reinterpret_view`, `view`) and
-MX `remote_load` are rejected. The matmul itself is `pl.matmul_mx` and its `_acc` /
-`_bias` variants, which take a data tile and a scale tile per operand.
+than discouraged. An MX `pl.load` must pass `target_memory=pl.Mem.Mat` explicitly. Ordinary
+MX subviews (`slice`, `reshape`, `transpose`, and `reinterpret_view`) and MX `remote_load`
+are rejected. For FP8E8M0 A scales, `pl.tensor.view` supports a product-preserving shaped
+alias between an ND backing tensor and an `MX_A_ZZ` consumer tensor; shaped `MX_B_NN`
+views remain unsupported. The matmul itself is `pl.matmul_mx` and its `_acc` / `_bias`
+variants, which take a data tile and a scale tile per operand.
 
 ### Dynamic shapes
 
