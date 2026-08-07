@@ -22,7 +22,7 @@ MX_GROUP_SIZE = 32
 
 
 def _quant_inputs_and_golden() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build exact MXFP8 blocks with known E8M0 scales and byte outputs."""
+    """Build exact MXFP8 blocks with known quantized values and E8M0 scales."""
     fp8_values = torch.tensor(
         [
             -448,
@@ -63,9 +63,9 @@ def _quant_inputs_and_golden() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
     group_exponents = (torch.arange(ROWS * COLS // MX_GROUP_SIZE) % 4 - 1).reshape(ROWS, 2)
     scales = torch.pow(2.0, group_exponents).to(torch.float32)
     src = (fp8_values.reshape(1, 1, MX_GROUP_SIZE) * scales.unsqueeze(-1)).reshape(ROWS, COLS)
-    quantized = fp8_values.to(torch.float8_e4m3fn).view(torch.int8).repeat(ROWS, 2)
-    scale_codes = (group_exponents + 127).to(torch.uint8).reshape(1, -1)
-    return src.contiguous(), quantized.contiguous(), scale_codes.contiguous()
+    quantized = fp8_values.to(torch.float8_e4m3fn).repeat(ROWS, 2)
+    scale = (group_exponents + 127).to(torch.uint8).reshape(1, -1).view(torch.float8_e8m0fnu)
+    return src.contiguous(), quantized.contiguous(), scale.contiguous()
 
 
 def _tdequant_src() -> torch.Tensor:
@@ -81,7 +81,7 @@ def _tdequant_offset() -> torch.Tensor:
 
 
 class TestQuantMx(PTOTestCase):
-    """Quantize FP32 blocks into raw E4M3 bytes and E8M0 scale codes."""
+    """Quantize FP32 blocks through the public packed-A MX interface."""
 
     __test__ = False
 
@@ -95,11 +95,11 @@ class TestQuantMx(PTOTestCase):
         src, expected_quant, expected_scale = _quant_inputs_and_golden()
         return [
             TensorSpec("src", [ROWS, COLS], DataType.FP32, init_value=src),
-            TensorSpec("out_quant", [ROWS, COLS], DataType.INT8, is_output=True),
+            TensorSpec("out_quant", [ROWS, COLS], DataType.FP8E4M3FN, is_output=True),
             TensorSpec(
                 "out_scale",
                 [1, ROWS * COLS // MX_GROUP_SIZE],
-                DataType.UINT8,
+                DataType.FP8E8M0,
                 is_output=True,
             ),
         ]
@@ -111,21 +111,21 @@ class TestQuantMx(PTOTestCase):
             def quant_mx(
                 self,
                 src: pl.Tensor[[ROWS, COLS], pl.FP32],
-                out_quant: pl.Out[pl.Tensor[[ROWS, COLS], pl.INT8]],
-                out_scale: pl.Out[pl.Tensor[[1, ROWS * COLS // MX_GROUP_SIZE], pl.UINT8]],
+                out_quant: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP8E4M3FN]],
+                out_scale: pl.Out[pl.Tensor[[1, ROWS * COLS // MX_GROUP_SIZE], pl.FP8E8M0]],
             ):
                 src_tile = pl.load(src, [0, 0], [ROWS, COLS])
-                quantized, scale = pl.tile._quant_mx_nd(src_tile)
-                out_quant = pl.store(pl.reinterpret_view(quantized, pl.INT8), [0, 0], out_quant)
-                out_scale = pl.store(pl.reinterpret_view(scale, pl.UINT8), [0, 0], out_scale)
+                quantized, scale = pl.quant_mx(src_tile, layout=pl.MX_A_ZZ)
+                out_quant = pl.store(quantized, [0, 0], out_quant)
+                out_scale = pl.store(scale, [0, 0], out_scale)
                 return out_quant, out_scale
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def orchestrator(
                 self,
                 src: pl.Tensor[[ROWS, COLS], pl.FP32],
-                out_quant: pl.Out[pl.Tensor[[ROWS, COLS], pl.INT8]],
-                out_scale: pl.Out[pl.Tensor[[1, ROWS * COLS // MX_GROUP_SIZE], pl.UINT8]],
+                out_quant: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP8E4M3FN]],
+                out_scale: pl.Out[pl.Tensor[[1, ROWS * COLS // MX_GROUP_SIZE], pl.FP8E8M0]],
             ):
                 out_quant, out_scale = self.quant_mx(src, out_quant, out_scale)
                 return out_quant, out_scale
