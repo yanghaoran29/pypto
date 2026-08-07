@@ -531,6 +531,11 @@ void BindPass(nb::module_& m) {
   passes.def(
       "simplify", &pass::Simplify,
       "Create a pass that simplifies expressions and statements using algebraic rules and bound analysis");
+  passes.def("expand_mx_packed_quant", &pass::ExpandMxPackedQuant,
+             "Expand tile.tquant_mx(layout=MX_A_ZZ|MX_B_NN) into per-box flat quant + ZZ/NN scales.\n\n"
+             "Must run before LowerCompositeOps. B (MX_B_NN) also inserts an INT8 [N,K]->[K,N]\n"
+             "transpose. Public pl.quant_mx(layout=...) expands at the DSL boundary; this pass\n"
+             "covers IR that still carries the layout kwarg.");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
              "Decompose composite tile/distributed ops into primitives via the "
              "composite-lowering registry. Today lowers tile.sin/tile.cos and "

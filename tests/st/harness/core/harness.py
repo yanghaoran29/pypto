@@ -88,6 +88,8 @@ class DataType(Enum):
     BF16 = "bf16"
     FP32 = "fp32"
     FP16 = "fp16"
+    FP8E4M3FN = "fp8e4m3fn"
+    FP8E8M0 = "fp8e8m0"
     INT32 = "int32"
     UINT32 = "uint32"
     INT16 = "int16"
@@ -104,6 +106,8 @@ class DataType(Enum):
             DataType.BF16: torch.bfloat16,
             DataType.FP32: torch.float32,
             DataType.FP16: torch.float16,
+            DataType.FP8E4M3FN: torch.float8_e4m3fn,
+            DataType.FP8E8M0: torch.float8_e8m0fnu,
             DataType.INT32: torch.int32,
             DataType.UINT32: torch.int32,  # PyTorch has no uint32; use int32 (same bits)
             DataType.INT16: torch.int16,

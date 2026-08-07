@@ -717,6 +717,16 @@ Pass RunVerifier(const IRPropertySet& properties);
 Pass Simplify();
 
 /**
+ * @brief Expand ``tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`` into per-box flat
+ *        quant + continuous ZZ/NN scale assembly (B also INT8-transposes to [K,N]).
+ *
+ * Must run before ``LowerCompositeOps`` so expanded flat ``tile.tquant_mx`` calls
+ * still receive DPS lowering. Public ``pl.quant_mx(layout=...)`` expands at the
+ * DSL boundary; this pass covers IR that still carries the ``layout`` kwarg.
+ */
+Pass ExpandMxPackedQuant();
+
+/**
  * @brief Decompose composite tile/distributed ops into primitive ops.
  *
  * Lowering rules live in a file-local dispatch table inside

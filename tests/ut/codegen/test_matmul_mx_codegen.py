@@ -38,7 +38,7 @@ def _emit_incore_mlir(program) -> str:
     return "\n".join(parts)
 
 
-class TestMxMatmulCodegen:
+class TestMatmulMxCodegen:
     def test_rejects_ascend910b_before_codegen(self):
         @pl.program
         class Program:
@@ -174,3 +174,7 @@ class TestMxMatmulCodegen:
         mlir = _emit_incore_mlir(Program)
         assert "pto.tmatmul.mx.bias" in mlir
         assert mlir.count("pto.tget_scale_addr") == 2
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

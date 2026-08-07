@@ -15,13 +15,27 @@ from pypto import ir
 from pypto.pypto_core import DataType
 
 
-class TestTQuantMxTypes:
+class TestQuantMxTypes:
     def test_public_quant_mx_rejects_unsupported_dtype(self):
         span = ir.Span.unknown()
         src = pl.Tile(expr=ir.Var("src", ir.TileType([16, 64], DataType.FP32), span))
 
         with pytest.raises(ValueError, match="supports only FP8E4M3FN"):
-            pl.quant_mx(src, dtype=pl.FP8E5M2)
+            pl.quant_mx(src, layout=pl.MX_A_ZZ, dtype=pl.FP8E5M2)
+
+    def test_public_quant_mx_rejects_nd_layout(self):
+        span = ir.Span.unknown()
+        src = pl.Tile(expr=ir.Var("src", ir.TileType([32, 128], DataType.FP32), span))
+
+        with pytest.raises(ValueError, match="MX_A_ZZ or TensorLayout.MX_B_NN"):
+            pl.quant_mx(src, layout=pl.ND)
+
+    def test_public_quant_mx_requires_layout(self):
+        span = ir.Span.unknown()
+        src = pl.Tile(expr=ir.Var("src", ir.TileType([32, 128], DataType.FP32), span))
+
+        with pytest.raises(TypeError):
+            pl.quant_mx(src)  # type: ignore[call-arg]
 
     def test_tquant_mx_returns_public_pair(self):
         span = ir.Span.unknown()

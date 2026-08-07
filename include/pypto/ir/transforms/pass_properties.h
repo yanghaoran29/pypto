@@ -206,6 +206,8 @@ inline const PassProperties kInferTileMemorySpaceProperties{
                  IRProperty::AivSplitValid},
     .invalidated = {IRProperty::AivSplitValid}};
 
+inline const PassProperties kExpandMxPackedQuantProperties{};
+
 // -- Insert MX scale-address binding pass ------------------------------------
 //
 // Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale

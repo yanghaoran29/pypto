@@ -1381,7 +1381,7 @@ class TestCrossCoreBoundaries:
                 out_0: pl.Out[pl.Tensor[[16, 2], pl.FP8E8M0]],
             ) -> pl.Tensor[[16, 2], pl.FP8E8M0]:
                 a_src = pl.load(a, [0, 0], [16, 64])
-                a_quant, a_scale = pl.quant_mx(a_src)
+                a_quant, a_scale = pl.tile._quant_mx_nd(a_src)
                 a_scale_2d = pl.tile.reshape(a_scale, [16, 2])
                 a_scale_mat = pl.move(
                     a_scale_2d,

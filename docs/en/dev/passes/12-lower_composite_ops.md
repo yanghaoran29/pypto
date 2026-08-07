@@ -284,4 +284,4 @@ The cast modes `RINT` (cos), `ROUND` (sin), `FLOOR` (sign), and `None` (int↔fl
 - **Op deducer**: `DeduceTileFP32OnlyType` in `src/ir/op/tile_ops/unary.cpp:94` — enforces FP32-only at op-construction time.
 - **Conversion registry**: `RegisterSimple("tensor.sin", "tile.sin")` and the cos counterpart in `src/ir/transforms/op_conversion_registry.cpp` — the upstream tensor-to-tile rewrite that produces the `tile.sin` / `tile.cos` calls this pass consumes.
 - **Tests**: `tests/ut/ir/transforms/test_lower_composite_ops.py` (structural), `tests/ut/ir/transforms/test_lower_composite_ops_numerical.py` (NumPy-reference numerical).
-- **MX quantization tests**: `tests/ut/codegen/test_mx_quant_codegen.py` (tuple consumption and memory planning).
+- **MX quantization tests**: `tests/ut/codegen/test_quant_mx_codegen.py` (tuple consumption and memory planning).
