@@ -481,14 +481,18 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
       src_type->tensor_view_.has_value() ? src_type->tensor_view_->layout : TensorLayout::ND;
   TensorLayout new_layout = requested_layout.value_or(src_layout);
   const bool has_shape = args.size() >= 2;
-  const bool is_mx_a_backing_nd_view =
+  // FP8E8M0 scale buffers may alias between packed ND storage and the Cube
+  // consumer layouts. MX_A_ZZ covers LeftScale boxes; MX_B_NN covers RightScale.
+  const bool is_mx_scale_backing_nd_view =
       has_shape && src_type->dtype_ == DataType::FP8E8M0 &&
       ((src_layout == TensorLayout::MX_A_ZZ && new_layout == TensorLayout::ND) ||
-       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_A_ZZ));
-  CHECK_SPAN((!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout)) || is_mx_a_backing_nd_view,
+       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_A_ZZ) ||
+       (src_layout == TensorLayout::MX_B_NN && new_layout == TensorLayout::ND) ||
+       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_B_NN));
+  CHECK_SPAN((!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout)) || is_mx_scale_backing_nd_view,
              args[0]->span_)
-      << "tensor.view does not support MX layouts except shaped ND/MX_A_ZZ backing views for "
-         "FP8E8M0";
+      << "tensor.view does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN backing views "
+         "for FP8E8M0";
   CHECK(new_layout != TensorLayout::NZ)
       << "tensor.view: NZ layout is not allowed on TensorType (NZ is tile-only)";
   CHECK(src_layout != TensorLayout::NZ)

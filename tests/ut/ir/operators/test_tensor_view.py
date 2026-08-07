@@ -257,7 +257,7 @@ def test_mx_a_backing_view_rejects_non_scale_dtype():
     """The MX_A_ZZ backing alias is limited to E8M0 scale storage."""
     src = _tensor_var([1, 128], dtype=DataType.FP32)
 
-    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ"):
+    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN"):
         ir.op.tensor.view(src, [32, 4], layout=ir.TensorLayout.MX_A_ZZ)
 
 
@@ -265,16 +265,22 @@ def test_mx_a_backing_view_requires_explicit_shape():
     """An MX_A_ZZ layout flip without a backing shape remains unsupported."""
     src = _tensor_var([1, 128], dtype=DataType.FP8E8M0)
 
-    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ"):
+    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN"):
         ir.op.tensor.view(src, layout=ir.TensorLayout.MX_A_ZZ)
 
 
-def test_mx_b_backing_view_remains_unsupported():
-    """The A-scale backing exception must not admit MX-B weight layouts."""
+def test_nd_shaped_mx_b_consumer_view_is_allowed():
+    """An FP8E8M0 ND backing tensor may expose an MX_B_NN consumer view."""
     src = _tensor_var([1, 128], dtype=DataType.FP8E8M0)
 
-    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ"):
-        ir.op.tensor.view(src, [32, 4], layout=ir.TensorLayout.MX_B_NN)
+    call = ir.op.tensor.view(src, [4, 32], layout=ir.TensorLayout.MX_B_NN)
+
+    out = call.type
+    assert isinstance(out, ir.TensorType)
+    assert _values_of(out.shape) == [4, 32]
+    view = _result_view(call)
+    assert view is not None
+    assert view.layout == ir.TensorLayout.MX_B_NN
 
 
 def test_cross_layout_flip_below_rank_2_rejected():
