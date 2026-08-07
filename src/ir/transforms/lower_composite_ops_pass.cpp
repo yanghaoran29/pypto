@@ -834,7 +834,7 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 // ============================================================================
 // ``tile.tquant_mx`` lowering — materialize source-dtype scratch, keep pto.tquant.mx.
 //
-// Rewrites the 1-arg DSL form ``tile.tquant_mx(src)`` into the internal form
+// Rewrites the flat one-source form ``tile.tquant_mx(src)`` into the internal form
 // ``tile.tquant_mx_dps(src, max, scaling, dst, exp)``. All four PTOAS outputs are
 // explicit IR tiles, so the memory planner can keep their simultaneously-live
 // buffers disjoint from the source and from one another. The scratch are flat [1, groups]
@@ -2313,10 +2313,10 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
 // total credit count it issued so the signal returns to all-zero after the
 // call.
 //
-// Today the rules are ``tile.sin`` / ``tile.cos`` and ``pld.tensor.*``
-// distributed collectives. Host-level allreduce is skipped here and lowered
-// later by LowerHostTensorCollectives. The pass is idempotent provided each
-// rule emits only ops not listed here.
+// Today the rules are ``tile.sin`` / ``tile.cos``, flat ``tile.tquant_mx``, and
+// ``pld.tensor.*`` distributed collectives. Host-level allreduce is skipped here
+// and lowered later by LowerHostTensorCollectives. The pass is idempotent
+// provided each rule emits only ops not listed here.
 //
 // When the table grows past a handful of entries — or a rule wants its own
 // translation unit — promote this back to a standalone registry under
@@ -2389,7 +2389,8 @@ class LowerCompositeOpsMutator : public IRMutator {
     if (auto tuple_call = As<Call>(op->tuple_); IsOp(tuple_call, "tile.tquant_mx")) {
       CHECK_SPAN(false, op->span_)
           << "Direct indexing of pl.quant_mx(...) is not supported; bind the pair first, for example "
-             "'quant, scale = pl.quant_mx(src)' or 'result = pl.quant_mx(src); quant = result[0]'";
+             "'quant, scale = pl.quant_mx(src, layout=pl.MX_A_ZZ)' or "
+             "'result = pl.quant_mx(src, layout=pl.MX_A_ZZ); quant = result[0]'";
     }
     return IRMutator::VisitExpr_(op);
   }

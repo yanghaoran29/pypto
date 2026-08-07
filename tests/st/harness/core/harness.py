@@ -102,12 +102,16 @@ class DataType(Enum):
     @property
     def torch_dtype(self) -> torch.dtype:
         """Get corresponding torch dtype."""
+        if self in {DataType.FP8E4M3FN, DataType.FP8E8M0}:
+            name = "float8_e4m3fn" if self is DataType.FP8E4M3FN else "float8_e8m0fnu"
+            dtype = getattr(torch, name, None)
+            if dtype is None:
+                raise ValueError(f"This PyTorch build does not provide torch.{name}")
+            return dtype
         mapping = {
             DataType.BF16: torch.bfloat16,
             DataType.FP32: torch.float32,
             DataType.FP16: torch.float16,
-            DataType.FP8E4M3FN: torch.float8_e4m3fn,
-            DataType.FP8E8M0: torch.float8_e8m0fnu,
             DataType.INT32: torch.int32,
             DataType.UINT32: torch.int32,  # PyTorch has no uint32; use int32 (same bits)
             DataType.INT16: torch.int16,

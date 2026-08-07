@@ -454,21 +454,21 @@ REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
   std::ostringstream oss;
 
   if (op->args_.size() >= 2) {
-    const bool is_mx_a_backing_nd_view =
+    const bool is_mx_scale_backing_nd_view =
         input_type->dtype_ == DataType::FP8E8M0 &&
-        ((src_layout == TensorLayout::MX_A_ZZ && target_layout == TensorLayout::ND) ||
-         (src_layout == TensorLayout::ND && target_layout == TensorLayout::MX_A_ZZ));
-    CHECK_SPAN(target_layout == src_layout || is_mx_a_backing_nd_view, op->span_)
+        ((IsMxTensorLayout(src_layout) && target_layout == TensorLayout::ND) ||
+         (src_layout == TensorLayout::ND && IsMxTensorLayout(target_layout)));
+    CHECK_SPAN(target_layout == src_layout || is_mx_scale_backing_nd_view, op->span_)
         << "tensor.view orchestration lowering cannot combine shape reinterpret with layout change: "
         << "runtime Tensor::reshape has no arbitrary-stride layout view; pass only a shape argument "
         << "(no layout change) in orchestration code or lower the view through PTO in-core codegen";
     CHECK_SPAN(
-        (src_layout == TensorLayout::ND && target_layout == TensorLayout::ND) || is_mx_a_backing_nd_view,
+        (src_layout == TensorLayout::ND && target_layout == TensorLayout::ND) || is_mx_scale_backing_nd_view,
         op->span_)
         << "tensor.view orchestration lowering only supports shape reinterpret for ND layout tensors: "
         << "runtime Tensor::reshape assumes row-major contiguous storage; lower non-ND views through "
         << "PTO in-core codegen";
-    if (is_mx_a_backing_nd_view) {
+    if (is_mx_scale_backing_nd_view) {
       return "Tensor " + result_var + " = " + ext_input_name + ";";
     }
     auto shape_tuple = As<MakeTuple>(op->args_[1]);

@@ -721,8 +721,8 @@ Pass Simplify();
  *        quant + continuous ZZ/NN scale assembly (B also INT8-transposes to [K,N]).
  *
  * Must run before ``LowerCompositeOps`` so expanded flat ``tile.tquant_mx`` calls
- * still receive DPS lowering. Public ``pl.quant_mx(layout=...)`` expands at the
- * DSL boundary; this pass covers IR that still carries the ``layout`` kwarg.
+ * still receive DPS lowering. Public ``pl.quant_mx(layout=...)`` emits the packed
+ * form; this pass materializes its per-box implementation.
  */
 Pass ExpandMxPackedQuant();
 
@@ -731,11 +731,12 @@ Pass ExpandMxPackedQuant();
  *
  * Lowering rules live in a file-local dispatch table inside
  * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
- * ``tile.sin`` / ``tile.cos`` and explicit-signal InCore
- * ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered later
- * by ``LowerHostTensorCollectives``. Future composite ops (softmax, gelu,
- * layernorm, ...) are added by appending a rule function + one dispatch-table
- * row, without touching the mutator.
+ * ``tile.sin`` / ``tile.cos``, flat ``tile.tquant_mx``, and explicit-signal
+ * InCore ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered
+ * later by ``LowerHostTensorCollectives``. Future single-result composite ops
+ * (softmax, gelu, layernorm, ...) are added by appending a rule function + one
+ * dispatch-table row. Multi-result rules may also need projection remapping in
+ * the mutator, as ``tile.tquant_mx`` does.
  *
  * FP32-only for the trig rules — non-FP32 inputs are rejected at
  * op-construction time by the op deducer, never reaching this pass.

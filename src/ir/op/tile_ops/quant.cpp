@@ -49,6 +49,21 @@ void ValidateMxQuantMode(const std::string& mode, const std::string& op_name) {
                << "'; expected one of {mxfp8_e4m3, mxfp8}";
 }
 
+int64_t GetStaticElementCount(const TileTypePtr& type, const std::string& operand,
+                              const std::string& op_name) {
+  const TileView view = tile_view_semantics::GetEffectiveTileView(*type);
+  int64_t count = 1;
+  for (const auto& dim_expr : view.valid_shape) {
+    auto dim = As<ConstInt>(dim_expr);
+    CHECK(dim && dim->value_ > 0) << "The operator " << op_name << " requires " << operand
+                                  << " to have a static positive valid_shape";
+    CHECK(count <= std::numeric_limits<int64_t>::max() / dim->value_)
+        << "The operator " << op_name << " " << operand << " valid element count overflows int64";
+    count *= dim->value_;
+  }
+  return count;
+}
+
 TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
                                const std::vector<std::pair<std::string, std::any>>& kwargs,
                                const std::string& op_name) {
@@ -86,10 +101,14 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
     }
   }
 
+  TileTypePtr max_type;
+  TileTypePtr scaling_type;
+  TileTypePtr raw_dst_type;
+  TileTypePtr raw_exp_type;
   if (is_dps) {
     // ptoas TQuantMxOp requires max/scaling element type to match src.
-    auto max_type = As<TileType>(args[1]->GetType());
-    auto scaling_type = As<TileType>(args[2]->GetType());
+    max_type = As<TileType>(args[1]->GetType());
+    scaling_type = As<TileType>(args[2]->GetType());
     CHECK(max_type && max_type->dtype_ == src_type->dtype_)
         << "The operator " << op_name << " requires max scratch dtype to match src ("
         << src_type->dtype_.ToString() << "), but got "
@@ -98,13 +117,13 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
         << "The operator " << op_name << " requires scaling scratch dtype to match src ("
         << src_type->dtype_.ToString() << "), but got "
         << (scaling_type ? scaling_type->dtype_.ToString() : std::string("<non-tile>"));
-    auto dst_type = As<TileType>(args[3]->GetType());
-    auto exp_type = As<TileType>(args[4]->GetType());
-    CHECK(dst_type && dst_type->dtype_ == DataType::INT8)
+    raw_dst_type = As<TileType>(args[3]->GetType());
+    raw_exp_type = As<TileType>(args[4]->GetType());
+    CHECK(raw_dst_type && raw_dst_type->dtype_ == DataType::INT8)
         << "The operator " << op_name << " requires dst dtype INT8";
-    CHECK(exp_type && exp_type->dtype_ == DataType::UINT8)
+    CHECK(raw_exp_type && raw_exp_type->dtype_ == DataType::UINT8)
         << "The operator " << op_name << " requires exp dtype UINT8";
-    CHECK(tile_view_semantics::ShapeExprListsEquivalent(dst_type->shape_, src_type->shape_))
+    CHECK(tile_view_semantics::ShapeExprListsEquivalent(raw_dst_type->shape_, src_type->shape_))
         << "The operator " << op_name << " requires dst shape to match src";
   }
 
@@ -125,9 +144,9 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
   CHECK(k_const->value_ > 0 && k_const->value_ % 32 == 0)
       << "The operator " << op_name << " requires K divisible by 32, but got " << k_const->value_;
   if (pack_layout.has_value()) {
-    CHECK(k_const->value_ % 64 == 0)
-        << "The operator " << op_name << " with layout=" << TensorLayoutToString(*pack_layout)
-        << " requires K divisible by 64, but got " << k_const->value_;
+    CHECK(k_const->value_ % 64 == 0) << "The operator " << op_name
+                                     << " with layout=" << TensorLayoutToString(*pack_layout)
+                                     << " requires K divisible by 64, but got " << k_const->value_;
   }
   constexpr int64_t kMaxTileElements = 59461;
   CHECK(m_const->value_ <= kMaxTileElements / k_const->value_)
@@ -153,17 +172,28 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " scale-group count overflows int64";
   auto groups_dim = std::make_shared<ConstInt>(m_const->value_ * k_groups, DataType::INDEX, Span::unknown());
   auto one = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+
+  if (is_dps) {
+    const int64_t groups = m_const->value_ * k_groups;
+    CHECK(GetStaticElementCount(max_type, "max scratch", op_name) == groups)
+        << "The operator " << op_name << " requires max scratch valid element count " << groups;
+    CHECK(GetStaticElementCount(scaling_type, "scaling scratch", op_name) == groups)
+        << "The operator " << op_name << " requires scaling scratch valid element count " << groups;
+    CHECK(GetStaticElementCount(raw_exp_type, "exp destination", op_name) == groups)
+        << "The operator " << op_name << " requires exp destination valid element count " << groups;
+    const TileView dst_view = tile_view_semantics::GetEffectiveTileView(*raw_dst_type);
+    CHECK(tile_view_semantics::ShapeExprListsEquivalent(dst_view.valid_shape, src_type->shape_))
+        << "The operator " << op_name << " requires dst valid_shape to match src";
+    return GetUnknownType();
+  }
+
   TileView scale_view;
   scale_view.valid_shape = {one, groups_dim};
   scale_view.blayout = TileLayout::row_major;
   scale_view.slayout = TileLayout::none_box;
-  scale_view.fractal = 32;
+  scale_view.fractal = tile_view_semantics::kMXScaleFractal;
   auto scale_type = std::make_shared<TileType>(std::vector<ExprPtr>{one, groups_dim}, DataType::FP8E8M0,
                                                std::nullopt, scale_view);
-
-  if (is_dps) {
-    return GetUnknownType();
-  }
 
   std::vector<TypePtr> elements{dst_type, scale_type};
   return std::make_shared<TupleType>(std::move(elements));
@@ -218,7 +248,7 @@ REGISTER_OP("tile.tquant_mx")
     .set_op_category("TileOp")
     .set_description(
         "MX block-32 dynamic quantization: TupleType{quantized (FP8E4M3FN), e8m0_scale "
-        "(FP8E8M0)}. The lower_composite pass rewrites this 1-arg DSL form into "
+        "(FP8E8M0)}. The lower_composite pass rewrites the flat one-source form into "
         "tile.tquant_mx_dps, materializing source-dtype scratch (max, scaling) as IR-level tiles so the "
         "memory planner can address them; codegen then emits pto.tquant.mx. mode selects "
         "mxfp8_e4m3 (alias: mxfp8). The FP8 value is stored as its byte representation (mirrors "

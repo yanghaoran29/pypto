@@ -1795,7 +1795,7 @@ def tquant_mx(
 
     ``layout`` is optional at the IR builder level: omit for flat ``[1, groups]``
     scales; pass ``MX_A_ZZ`` / ``MX_B_NN`` to request ExpandMxPackedQuant.
-    Public ``pl.quant_mx`` requires a packed layout and expands at the DSL.
+    Public ``pl.quant_mx`` requires a packed layout and emits this packed form.
     """
     actual_span = _get_span_or_capture(span)
     kwargs: dict = {"mode": mode}

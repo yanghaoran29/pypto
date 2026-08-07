@@ -321,7 +321,7 @@ with ib.function("tensor_example") as f:
 | **逐元素** | `tile.add/sub/mul/div` | Tile-Tile 操作 |
 | - | `tile.adds/subs/muls/divs` | Tile-Scalar 操作。**常量**标量操作数会采用 tile 的元素 dtype（裸整数字面量否则会被解析为 `index`，而任何 `pto.t*s` 算子都不接受它）——但整数 tile 上的浮点字面量仍保持 FP32，以保留类型提升语义。显式的 `pl.const(v, dtype)` 属于用户的有意标注，与任何非常量表达式一样保持不变；非常量的 `index` 标量（循环变量、`pl.dim`）会被拒绝——需用 `pl.cast` 转换。`tensor.*s` 同理。 |
 | **一元** | `tile.sqrt` | 逐元素平方根 |
-| **量化** | `tile.tquant_mx` / `pl.quant_mx` | 仅 Ascend950 支持的 MX block-32 动态量化，返回语义类型 `{FP8E4M3FN quant, FP8E8M0 scale}`；公开 `dtype` 目前仅接受 `FP8E4M3FN`；要求完整有效区域（`valid_shape == shape`）、`M % 16 == 0`、`K % 32 == 0`、`M*K <= 59461`，两个结果可独立使用；Pass 12 隐藏 PTOAS 所需的原始 INT8/UINT8 destination，codegen 生成 `pto.tquant.mx` |
+| **量化** | `tile.tquant_mx` / `pl.quant_mx` | 仅 Ascend950 支持的 MX block-32 动态量化，返回语义类型 `{FP8E4M3FN quant, FP8E8M0 scale}`；公开 `dtype` 目前仅接受 `FP8E4M3FN`；要求完整有效区域（`valid_shape == shape`）、`M % 16 == 0`、`K % 32 == 0`、`M*K <= 59461`，两个结果可独立使用；[Pass 12](../passes/12-expand_mx_packed_quant.md) 展开紧凑 ZZ/NN 布局，[Pass 13](../passes/13-lower_composite_ops.md) 隐藏 PTOAS 所需的原始 INT8/UINT8 destination，随后 codegen 生成 `pto.tquant.mx` |
 | - | `tile.tdequant` / `pl.tdequant` | 整数逐行反量化：`dst = (src - offset) * scale`；src 接受 row-major 或 column-major 输入并规范化为 row-major，dst 为 row-major，`[M,1]` scale/offset 为 column-major |
 | **变换** | `tile.slice` | 提取子 tile，静态 shape，可选动态 valid_shape |
 | - | `tile.extract` | 从 `src` 在 `(index_row, index_col)` 处提取子 tile —— ISA TEXTRACT Variant 1（Mat→Left/Right，Acc→Mat）。结果 layout 取自 `target_memory` 的隐式 view；`Left`/`Right` 例外，使用 TEXTRACT 侧的 L0 格式（与 `tile.move` 的 TMOV 侧不同） |
@@ -361,7 +361,7 @@ scale 的规范暂存 layout。
 `tile.move` 自己把目标 `memory_space` 打到推导出的类型上（参见
 [类型](02-types.md#tiletype) 中的 `TileType` 契约），因此当结果 view 与目标 space 的
 implicit view 一致时会折叠为 `nullopt` —— 这与
-[`InferTileMemorySpace`](../passes/17-infer_tile_memory_space.md) 为重新定型的 tile
+[`InferTileMemorySpace`](../passes/18-infer_tile_memory_space.md) 为重新定型的 tile
 刷新的 per-space implicit view 是同一套。
 
 ### reshape 与有效区域（valid region）
