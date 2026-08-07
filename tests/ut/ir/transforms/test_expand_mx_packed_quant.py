@@ -9,6 +9,8 @@
 
 """Unit tests for ExpandMxPackedQuant."""
 
+from collections import Counter
+
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
@@ -45,6 +47,53 @@ def _keepalive_bases(program: ir.Program) -> tuple[set[int], set[int]]:
     return a_bases, b_bases
 
 
+def _static_shape(expr: ir.Expr) -> tuple[int, ...]:
+    tile_type = expr.type
+    assert isinstance(tile_type, ir.TileType)
+    shape: list[int] = []
+    for dim in tile_type.shape:
+        assert isinstance(dim, ir.ConstInt)
+        shape.append(dim.value)
+    return tuple(shape)
+
+
+def _static_tuple(expr: ir.Expr) -> tuple[int, ...]:
+    assert isinstance(expr, ir.MakeTuple)
+    values: list[int] = []
+    for element in expr.elements:
+        assert isinstance(element, ir.ConstInt)
+        values.append(element.value)
+    return tuple(values)
+
+
+def _expanded_packing_ops(
+    program: ir.Program,
+) -> tuple[list[tuple[int, ...]], Counter[tuple[int, ...]], Counter[tuple[int, ...]], list[tuple[int, ...]]]:
+    quant_input_shapes: list[tuple[int, ...]] = []
+    data_store_offsets: Counter[tuple[int, ...]] = Counter()
+    scale_store_offsets: Counter[tuple[int, ...]] = Counter()
+    transpose_output_shapes: list[tuple[int, ...]] = []
+
+    class _Collector(ir.IRVisitor):
+        def visit_call(self, call):
+            if call.op.name == "tile.tquant_mx":
+                quant_input_shapes.append(_static_shape(call.args[0]))
+            elif call.op.name == "tile.store":
+                value_type = call.args[0].type
+                if isinstance(value_type, ir.TileType):
+                    offsets = _static_tuple(call.args[1])
+                    if value_type.dtype == ir.DataType.FP8E4M3FN and _static_shape(call.args[0]) == (16, 64):
+                        data_store_offsets[offsets] += 1
+                    elif value_type.dtype == ir.DataType.FP8E8M0 and _static_shape(call.args[0]) == (1, 32):
+                        scale_store_offsets[offsets] += 1
+            elif call.op.name == "tile.transpose":
+                transpose_output_shapes.append(_static_shape(call))
+            super().visit_call(call)
+
+    _Collector().visit_program(program)
+    return quant_input_shapes, data_store_offsets, scale_store_offsets, transpose_output_shapes
+
+
 class TestExpandMxPackedQuant:
     """Packed MX expansion preserves the hardware lifetime boundary between sites."""
 
@@ -66,13 +115,11 @@ class TestExpandMxPackedQuant:
                 b_nk: pl.Tensor[[64, 128], pl.FP32],
                 a_q_out: pl.Out[pl.Tensor[[32, 128], pl.FP8E4M3FN]],
                 a_s_out: pl.Out[pl.Tensor[[1, 128], pl.FP8E8M0]],
-                b_nk_q_out: pl.Out[pl.Tensor[[64, 128], pl.FP8E4M3FN]],
                 b_q_out: pl.Out[pl.Tensor[[128, 64], pl.FP8E4M3FN]],
                 b_s_out: pl.Out[pl.Tensor[[1, 256], pl.FP8E8M0]],
             ) -> tuple[
                 pl.Tensor[[32, 128], pl.FP8E4M3FN],
                 pl.Tensor[[1, 128], pl.FP8E8M0],
-                pl.Tensor[[64, 128], pl.FP8E4M3FN],
                 pl.Tensor[[128, 64], pl.FP8E4M3FN],
                 pl.Tensor[[1, 256], pl.FP8E8M0],
             ]:
@@ -82,7 +129,29 @@ class TestExpandMxPackedQuant:
                 a_s_out = pl.store(a_s, [0, 0], a_s_out)
                 b_q_out = pl.store(b_q, [0, 0], b_q_out)
                 b_s_out = pl.store(b_s, [0, 0], b_s_out)
-                return a_q_out, a_s_out, b_nk_q_out, b_q_out, b_s_out
+                return a_q_out, a_s_out, b_q_out, b_s_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        quant_shapes, data_offsets, scale_offsets, transpose_shapes = _expanded_packing_ops(expanded)
+
+        # A is split into four [32, 32] source boxes and B into eight. Packed A
+        # stores four [16, 64] boxes directly; packed B is assembled in Vec and
+        # transposed once to its public [K, N] result layout.
+        assert quant_shapes == [(32, 32)] * 12
+        assert data_offsets == Counter({(0, 0): 1, (0, 64): 1, (16, 0): 1, (16, 64): 1})
+        assert scale_offsets == Counter(
+            {
+                (0, 0): 2,
+                (0, 32): 2,
+                (0, 64): 2,
+                (0, 96): 2,
+                (0, 128): 1,
+                (0, 160): 1,
+                (0, 192): 1,
+                (0, 224): 1,
+            }
+        )
+        assert transpose_shapes == [(128, 64)]
 
         after = _run_default_through(Before, "MemoryReuse")
         a_bases, b_bases = _keepalive_bases(after)
