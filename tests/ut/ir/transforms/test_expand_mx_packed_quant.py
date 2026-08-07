@@ -125,6 +125,231 @@ def _expanded_packing_ops(
 class TestExpandMxPackedQuant:
     """Packed MX expansion bounds async lifetimes with explicit pipe drains."""
 
+    def test_store_fusion_does_not_cross_destination_read(self):
+        """A fused GM write must not become visible before an earlier read."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                q_out: pl.InOut[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+                snapshot_out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+            ) -> tuple[
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+            ]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), layout=pl.MX_A_ZZ)
+                old_q = pl.load(q_out, [0, 0], [16, 64])
+                snapshot_out = pl.store(old_q, [0, 0], snapshot_out)
+                q_out = pl.store(quant, [0, 0], q_out)
+                s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out, snapshot_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        kernel = expanded.get_function("kernel")
+        assert kernel is not None
+        q_out = next(param for param in kernel.params if param.name_hint.startswith("q_out"))
+        events: list[str] = []
+
+        class _AccessCollector(ir.IRVisitor):
+            def visit_call(self, call):
+                if (
+                    call.op.name == "tile.load"
+                    and isinstance(call.args[0], ir.Var)
+                    and call.args[0].unique_id == q_out.unique_id
+                ):
+                    events.append("read")
+                elif (
+                    call.op.name == "tile.store"
+                    and isinstance(call.args[2], ir.Var)
+                    and call.args[2].unique_id == q_out.unique_id
+                ):
+                    events.append("write")
+                super().visit_call(call)
+
+        _AccessCollector().visit_program(expanded)
+
+        assert events == ["read", "write"]
+        passes.run_verifier()(expanded)
+
+    def test_dynamic_source_offset_uses_assemble_fallback(self):
+        """A dynamic aggregate load stays live for slice-based expansion."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                q_out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+            ]:
+                loaded = pl.load(src, [row_offset, 0], [16, 64])
+                quant, scale = pl.quant_mx(loaded, layout=pl.MX_A_ZZ)
+                q_out = pl.store(quant, [0, 0], q_out)
+                s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        op_counts: Counter[str] = Counter()
+
+        class _OpCollector(ir.IRVisitor):
+            def visit_call(self, call):
+                op_counts[call.op.name] += 1
+                super().visit_call(call)
+
+        _OpCollector().visit_program(expanded)
+
+        assert op_counts["tile.slice"] == 1
+        assert op_counts["tile.store"] == 2
+        passes.run_verifier()(expanded)
+        assert "__FREE_VAR" not in ir.python_print(expanded)
+
+    def test_store_fusion_does_not_cross_a_future_destination_update(self):
+        """A destination SSA value defined after quantization cannot be hoisted."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                prior: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                q_out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+            ]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), layout=pl.MX_A_ZZ)
+                prior_tile = pl.load(prior, [0, 0], [16, 64])
+                q_out = pl.store(prior_tile, [0, 0], q_out)
+                q_out = pl.store(quant, [0, 0], q_out)
+                s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+
+        passes.run_verifier()(expanded)
+        assert "__FREE_VAR" not in ir.python_print(expanded)
+
+    def test_store_fusion_does_not_escape_control_flow(self):
+        """Stores guarded by an if must remain conditional after expansion."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                cond: pl.Scalar[pl.BOOL],
+                q_out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+            ]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), layout=pl.MX_A_ZZ)
+                if cond:
+                    q_out = pl.store(quant, [0, 0], q_out)
+                    s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        store_depths: list[int] = []
+        if_depth = 0
+
+        class _ControlFlowCollector(ir.IRVisitor):
+            def visit_if_stmt(self, stmt):
+                nonlocal if_depth
+                if_depth += 1
+                super().visit_if_stmt(stmt)
+                if_depth -= 1
+
+            def visit_call(self, call):
+                if call.op.name == "tile.store":
+                    store_depths.append(if_depth)
+                super().visit_call(call)
+
+        _ControlFlowCollector().visit_program(expanded)
+
+        assert store_depths == [1, 1]
+        passes.run_verifier()(expanded)
+
+    def test_store_only_aliases_survive_assemble_fallback(self):
+        """Fallback stores must retain the tuple-projection definitions."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                q_out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+            ]:
+                transformed = pl.abs(pl.load(src, [0, 0], [16, 64]))
+                quant, scale = pl.quant_mx(transformed, layout=pl.MX_A_ZZ)
+                q_out = pl.store(quant, [0, 0], q_out)
+                s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+
+        passes.run_verifier()(expanded)
+        assert "__FREE_VAR" not in ir.python_print(expanded)
+
+    def test_b_packing_does_not_reuse_user_tensor_as_scratch(self):
+        """A shape-compatible InOut tensor is user data, not compiler scratch."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                unrelated: pl.InOut[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+                q_out: pl.Out[pl.Tensor[[64, 16], pl.FP8E4M3FN]],
+                s_out: pl.Out[pl.Tensor[[1, 32], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[64, 16], pl.FP8E4M3FN],
+                pl.Tensor[[1, 32], pl.FP8E8M0],
+                pl.Tensor[[16, 64], pl.FP8E4M3FN],
+            ]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), layout=pl.MX_B_NN)
+                q_out = pl.store(quant, [0, 0], q_out)
+                s_out = pl.store(scale, [0, 0], s_out)
+                return q_out, s_out, unrelated
+
+        expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        kernel = expanded.get_function("kernel")
+        assert kernel is not None
+        unrelated = next(param for param in kernel.params if param.name_hint.startswith("unrelated"))
+        store_op_name = ir.get_op("tile.store").name
+        store_target_ids: set[int] = set()
+
+        class _StoreTargetCollector(ir.IRVisitor):
+            def visit_call(self, call):
+                if call.op.name == store_op_name and isinstance(call.args[2], ir.Var):
+                    store_target_ids.add(call.args[2].unique_id)
+                super().visit_call(call)
+
+        _StoreTargetCollector().visit_program(expanded)
+
+        assert unrelated.unique_id not in store_target_ids
+        passes.run_verifier()(expanded)
+
     def test_memory_reuse_is_bounded_by_pipe_all_drains(self):
         """A/B packed quant may reuse buffers only after a real pipe drain.
 

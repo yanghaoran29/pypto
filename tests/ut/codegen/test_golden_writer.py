@@ -22,6 +22,13 @@ from pypto.runtime.tensor_spec import ScalarSpec, TensorSpec
 
 torch = pytest.importorskip("torch")
 
+_LOW_PRECISION_DTYPE_CASES = [pytest.param(torch.uint8, "torch.uint8", id="uint8")]
+for _dtype_name in ("float8_e4m3fn", "float8_e8m0fnu"):
+    _dtype = getattr(torch, _dtype_name, None)
+    if _dtype is not None:
+        _LOW_PRECISION_DTYPE_CASES.append(pytest.param(_dtype, f"torch.{_dtype_name}", id=_dtype_name))
+del _dtype_name, _dtype
+
 
 def _dummy_golden(tensors, params=None):
     tensors["out"][:] = tensors["a"] * 3
@@ -30,11 +37,7 @@ def _dummy_golden(tensors, params=None):
 class TestGoldenWriterDtype:
     @pytest.mark.parametrize(
         "dtype,name",
-        [
-            pytest.param(torch.uint8, "torch.uint8", id="uint8"),
-            pytest.param(torch.float8_e4m3fn, "torch.float8_e4m3fn", id="fp8e4m3fn"),
-            pytest.param(torch.float8_e8m0fnu, "torch.float8_e8m0fnu", id="fp8e8m0"),
-        ],
+        _LOW_PRECISION_DTYPE_CASES,
     )
     def test_low_precision_dtype_name(self, dtype, name):
         assert _torch_dtype_str(dtype) == name

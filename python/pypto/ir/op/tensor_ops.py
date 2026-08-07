@@ -1865,8 +1865,9 @@ def view(
        both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Orchestration lowering supports ND shape reinterprets
-    and the shaped ND/MX_A_ZZ backing/consumer views used when an AIV producer
-    writes dynamic MX scales; other layout-changing shape reinterprets are unsupported.
+    and the shaped ND/MX_A_ZZ/MX_B_NN backing/consumer views used when an AIV
+    producer writes dynamic MX scales; other layout-changing shape reinterprets
+    are unsupported.
 
     Args:
         tensor: Input tensor expression.
@@ -1881,9 +1882,9 @@ def view(
             collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
-            Orchestration also permits shaped ND/MX_A_ZZ backing and consumer
-            views for an FP8E8M0 A-scale; other layout-changing shape views remain
-            limited to in-core lowering.
+            Orchestration also permits shaped ND/MX_A_ZZ/MX_B_NN backing and
+            consumer views for FP8E8M0 MX scales; other layout-changing shape
+            views remain limited to in-core lowering.
         span: Optional source span for debugging (auto-captured if not
             provided).
 

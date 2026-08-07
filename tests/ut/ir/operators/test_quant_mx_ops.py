@@ -65,6 +65,17 @@ class TestQuantMxTypes:
 
         assert isinstance(call.type, ir.UnknownType)
 
+    def test_tquant_mx_dps_rejects_wrong_scratch_element_count(self):
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 64], DataType.FP32), span)
+        max_scratch = ir.Var("max", ir.TileType([1, 31], DataType.FP32), span)
+        scaling_scratch = ir.Var("scaling", ir.TileType([1, 32], DataType.FP32), span)
+        dst = ir.Var("dst", ir.TileType([16, 64], DataType.INT8), span)
+        exp = ir.Var("exp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match="max scratch valid element count 32"):
+            ir.op.tile.tquant_mx_dps(src, max_scratch, scaling_scratch, dst, exp, span=span)
+
     def test_tquant_mx_rejects_dynamic_shape_before_lowering(self):
         span = ir.Span.unknown()
         m = ir.Var("m", ir.ScalarType(DataType.INDEX), span)

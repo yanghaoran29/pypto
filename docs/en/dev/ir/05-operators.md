@@ -334,7 +334,7 @@ with ib.function("tensor_example") as f:
 | **Element-wise** | `tile.add/sub/mul/div` | Tile-Tile operations |
 | - | `tile.adds/subs/muls/divs` | Tile-Scalar operations. A **constant** scalar operand adopts the tile's element dtype (a bare int literal is otherwise parsed as `index`, which no `pto.t*s` op accepts) — except a float literal on an integer tile, which keeps FP32 so promotion is preserved. An explicit `pl.const(v, dtype)` is a deliberate annotation and is left as-is, as is any non-constant expression; a non-constant `index` scalar (loop var, `pl.dim`) is rejected — convert it with `pl.cast`. Same rule for `tensor.*s`. |
 | **Unary** | `tile.sqrt` | Element-wise square root |
-| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only MX block-32 dynamic quantization returning semantic `{FP8E4M3FN quant, FP8E8M0 scale}` results; public `dtype` currently accepts only `FP8E4M3FN`; requires a full valid region (`valid_shape == shape`), `M % 16 == 0`, `K % 32 == 0`, and `M*K <= 59461`; either result may be consumed independently; Pass 12 hides PTOAS's raw INT8/UINT8 destinations and codegen emits `pto.tquant.mx` |
+| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only MX block-32 dynamic quantization returning semantic `{FP8E4M3FN quant, FP8E8M0 scale}` results; public `dtype` currently accepts only `FP8E4M3FN`; requires a full valid region (`valid_shape == shape`), `M % 16 == 0`, `K % 32 == 0`, and `M*K <= 59461`; either result may be consumed independently; [Pass 12](../passes/12-expand_mx_packed_quant.md) expands packed ZZ/NN layouts and [Pass 13](../passes/13-lower_composite_ops.md) hides PTOAS's raw INT8/UINT8 destinations before codegen emits `pto.tquant.mx` |
 | - | `tile.tdequant` / `pl.tdequant` | Integer per-row dequantization: `dst = (src - offset) * scale`; src accepts row-major or column-major input and is normalized to row-major, dst is row-major, and `[M,1]` scale/offset are column-major |
 | **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
 | - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat). The result's layout comes from `target_memory`'s implicit view, except `Left`/`Right`, which take the TEXTRACT-side L0 formats (these differ from `tile.move`'s TMOV-side ones) |
@@ -375,7 +375,7 @@ col/col. These are the canonical left and right scale staging layouts.
 `tile.move` stamps the destination `memory_space` itself (see the `TileType`
 contract in [Types](02-types.md#tiletype)), so a result view matching the
 destination's implicit view collapses to `nullopt` — the same per-space view
-[`InferTileMemorySpace`](../passes/17-infer_tile_memory_space.md) refreshes a
+[`InferTileMemorySpace`](../passes/18-infer_tile_memory_space.md) refreshes a
 retyped tile to.
 
 ### Reshape and the valid region
