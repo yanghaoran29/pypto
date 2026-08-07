@@ -73,9 +73,16 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
       << " does not support a partial src valid_shape; valid_shape must match the physical shape";
 
   std::string mode = "mxfp8_e4m3";
+  std::optional<TensorLayout> pack_layout;
   for (const auto& [key, value] : kwargs) {
     if (key == "mode") {
       mode = AnyCast<std::string>(value, "kwarg key: mode");
+    } else if (key == "layout") {
+      pack_layout = AnyCast<TensorLayout>(value, "kwarg key: layout");
+      CHECK(*pack_layout == TensorLayout::MX_A_ZZ || *pack_layout == TensorLayout::MX_B_NN)
+          << "The operator " << op_name
+          << " layout must be MX_A_ZZ or MX_B_NN (ND/None are not allowed), got "
+          << TensorLayoutToString(*pack_layout);
     }
   }
 
@@ -117,20 +124,30 @@ TypePtr DeduceTileTQuantMxType(const std::vector<ExprPtr>& args,
                                    << m_const->value_;
   CHECK(k_const->value_ > 0 && k_const->value_ % 32 == 0)
       << "The operator " << op_name << " requires K divisible by 32, but got " << k_const->value_;
+  if (pack_layout.has_value()) {
+    CHECK(k_const->value_ % 64 == 0)
+        << "The operator " << op_name << " with layout=" << TensorLayoutToString(*pack_layout)
+        << " requires K divisible by 64, but got " << k_const->value_;
+  }
   constexpr int64_t kMaxTileElements = 59461;
   CHECK(m_const->value_ <= kMaxTileElements / k_const->value_)
       << "The operator " << op_name << " requires M*K <= " << kMaxTileElements << ", but got "
       << m_const->value_ << "*" << k_const->value_;
 
   DataType dst_dtype = DataType::FP8E4M3FN;
+  // Public packed forms: MX_A_ZZ keeps [M,K]; MX_B_NN returns transposed [K,N]
+  // (ExpandMxPackedQuant inserts the INT8 transpose). Flat (no layout) keeps src shape.
+  std::vector<ExprPtr> dst_shape = src_type->shape_;
+  if (pack_layout == TensorLayout::MX_B_NN) {
+    dst_shape = {k_dim, m_dim};  // src is [N,K] → quant [K,N]
+  }
   TileView dst_view;
-  dst_view.valid_shape = src_type->shape_;
+  dst_view.valid_shape = dst_shape;
   InheritTileViewLayout(dst_view, src_type);
-  auto dst_type = std::make_shared<TileType>(src_type->shape_, dst_dtype, std::nullopt, dst_view);
+  auto dst_type = std::make_shared<TileType>(dst_shape, dst_dtype, std::nullopt, dst_view);
 
-  // E8M0 scale as flat [1, groups] (groups = M*K/32).
-  // Flat is already 32-byte-row-aligned (one row of groups bytes), so no pad is
-  // needed.
+  // E8M0 scale as flat [1, groups].
+  // For MX_A_ZZ: groups = M*K/32; for MX_B_NN (src [N,K]): groups = N*K/32.
   const int64_t k_groups = k_const->value_ / 32;
   CHECK(m_const->value_ <= std::numeric_limits<int64_t>::max() / k_groups)
       << "The operator " << op_name << " scale-group count overflows int64";
@@ -208,6 +225,7 @@ REGISTER_OP("tile.tquant_mx")
         "pto-isa's int8_t FP8 / uint8_t E8M0 tiles); the tstore byte-copies into the FP8 outputs.")
     .add_argument("src", "Source tile (FP16/FP32/BF16, 2D)")
     .set_attr<std::string>("mode")
+    .set_attr<TensorLayout>("layout")
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()

@@ -177,6 +177,7 @@ from pypto.pypto_core.ir import (
     PadValue,
     PtrType,
     Span,
+    TensorLayout,
     TileLayout,
 )
 
@@ -1173,22 +1174,58 @@ def cast(
 # ============================================================================
 
 
-def quant_mx(src: Tile, *, dtype: DataType = DataType.FP8E4M3FN) -> tuple[Tile, Tile]:
-    """MX block-32 dynamic quantization (MXFP8).
+def _quant_mx_nd(src: Tile, *, dtype: DataType = DataType.FP8E4M3FN) -> tuple[Tile, Tile]:
+    """Flat MX block-32 quant: ``(quant[M,K], scale[1, M*K/32])`` (no ZZ/NN pack).
 
-    Args:
-        src: source tile (FP16/FP32/BF16, 2D).
-        dtype: Quantized element dtype. Currently only ``FP8E4M3FN`` is
-            supported.
-
-    Returns:
-        ``(quantized, e8m0_scale)`` with semantic dtypes ``FP8E4M3FN`` and
-        ``FP8E8M0``. The compiler keeps the raw PTOAS byte destinations
-        internal to lowering.
+    Internal helper used by ExpandMxPackedQuant box expansion and by call sites
+    that still need today's flat E8M0 layout. Public ``quant_mx`` requires an
+    MX pack ``layout`` and must not be used for flat scales.
     """
     if dtype != DataType.FP8E4M3FN:
         raise ValueError(f"pl.quant_mx supports only FP8E4M3FN dtype, but got {dtype}")
     call_expr = _ir_ops.tquant_mx(src.unwrap(), mode="mxfp8_e4m3")
+    span = call_expr.span
+    return (
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
+    )
+
+
+def quant_mx(
+    src: Tile,
+    *,
+    layout: TensorLayout,
+    dtype: DataType = DataType.FP8E4M3FN,
+) -> tuple[Tile, Tile]:
+    """MX block-32 dynamic quantization with required packed scale ``layout``.
+
+    ``layout`` is required (no default) and must be ``MX_A_ZZ`` or ``MX_B_NN``.
+    ``ND`` / ``None`` are rejected. Flat ``[1, groups]`` quant without ZZ/NN pack
+    is available as :func:`_quant_mx_nd` for internal / migration use.
+
+    ExpandMxPackedQuant lowers ``layout=MX_*`` into per-box flat quant + continuous
+    ZZ/NN scale assembly (B also INT8-transposes to ``[K,N]``).
+
+    Args:
+        src: Source tile (FP16/FP32/BF16, 2D).
+            ``MX_A_ZZ``: ``[M, K]`` with ``M%16==0``, ``K%64==0``.
+            ``MX_B_NN``: ``[N, K]`` with ``N%16==0``, ``K%64==0``.
+        layout: Pack target — ``TensorLayout.MX_A_ZZ`` or ``MX_B_NN``.
+        dtype: Quantized element dtype. Currently only ``FP8E4M3FN``.
+
+    Returns:
+        ``MX_A_ZZ``: ``(quant[M,K], scale[1, M*K/32])`` in continuous ZZ order.
+        ``MX_B_NN``: ``(quant[K,N], scale[1, (K/32)*N])`` — data transposed to
+        Cube RHS layout; scale in continuous NN order.
+    """
+    if dtype != DataType.FP8E4M3FN:
+        raise ValueError(f"pl.quant_mx supports only FP8E4M3FN dtype, but got {dtype}")
+    if layout not in (TensorLayout.MX_A_ZZ, TensorLayout.MX_B_NN):
+        raise ValueError(
+            "pl.quant_mx layout must be TensorLayout.MX_A_ZZ or TensorLayout.MX_B_NN "
+            f"(ND/None are not allowed), got {layout!r}"
+        )
+    call_expr = _ir_ops.tquant_mx(src.unwrap(), mode="mxfp8_e4m3", layout=layout)
     span = call_expr.span
     return (
         Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),

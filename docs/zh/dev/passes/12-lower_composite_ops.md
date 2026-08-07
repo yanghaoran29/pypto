@@ -342,4 +342,4 @@ mutator 重写 `VisitStmt_(const AssignStmtPtr&)` 而不是 `VisitCall`，原因
 - **算子推导器 (op deducer)**：`src/ir/op/tile_ops/unary.cpp:94` 的 `DeduceTileFP32OnlyType` —— 在算子构造时强制 FP32-only。
 - **转换注册表 (conversion registry)**：`src/ir/transforms/op_conversion_registry.cpp` 中的 `RegisterSimple("tensor.sin", "tile.sin")` 与 cos 对应项 —— 上游 tensor-to-tile 改写，产出本 Pass 消费的 `tile.sin` / `tile.cos` 调用。
 - **测试**：`tests/ut/ir/transforms/test_lower_composite_ops.py`（结构）与 `tests/ut/ir/transforms/test_lower_composite_ops_numerical.py`（NumPy 数值对照）。
-- **MX 量化测试**：`tests/ut/codegen/test_mx_quant_codegen.py`（tuple 消费与内存规划）。
+- **MX 量化测试**：`tests/ut/codegen/test_quant_mx_codegen.py`（tuple 消费与内存规划）。

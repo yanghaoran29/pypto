@@ -41,7 +41,7 @@ def _allocation_range(mlir: str, name_fragment: str) -> tuple[int, int]:
     return start, start + int(rows) * int(cols) * element_bytes
 
 
-class TestMxQuantCodegen:
+class TestQuantMxCodegen:
     def test_tquant_lowers_to_four_output_pto_op(self):
         @pl.program
         class Program:
@@ -53,7 +53,7 @@ class TestMxQuantCodegen:
                 out_s: pl.Tensor[[1, 32], pl.UINT8],
             ):
                 src_tile: pl.Tile[[16, 64], pl.FP32] = pl.load(src, [0, 0], [16, 64])
-                quant, scale = pl.quant_mx(src_tile)
+                quant, scale = pl.tile._quant_mx_nd(src_tile)
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
                 pl.store(pl.reinterpret_view(scale, pl.UINT8), [0, 0], out_s)
 
@@ -85,7 +85,7 @@ class TestMxQuantCodegen:
                 out_s: pl.Tensor[[1, 1472], pl.UINT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 2944])
-                quant, scale = pl.quant_mx(src_tile)
+                quant, scale = pl.tile._quant_mx_nd(src_tile)
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
                 pl.store(pl.reinterpret_view(scale, pl.UINT8), [0, 0], out_s)
 
@@ -104,7 +104,7 @@ class TestMxQuantCodegen:
                 out_s: pl.Tensor[[1, 32], pl.UINT8],
             ):
                 src_tile: pl.Tile[[16, 64], pl.FP16] = pl.load(src, [0, 0], [16, 64])
-                quant, scale = pl.quant_mx(src_tile, dtype=pl.FP8E4M3FN)
+                quant, scale = pl.tile._quant_mx_nd(src_tile, dtype=pl.FP8E4M3FN)
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
                 pl.store(pl.reinterpret_view(scale, pl.UINT8), [0, 0], out_s)
 
@@ -123,7 +123,7 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                result = pl.quant_mx(src_tile)[0]
+                result = pl.tile._quant_mx_nd(src_tile)[0]
                 pl.store(result, [0, 0], out_q)
 
         with pytest.raises(ValueError, match=r"Direct indexing of pl\.quant_mx"):
@@ -141,9 +141,9 @@ class TestMxQuantCodegen:
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
                 if cond:
-                    pair = pl.quant_mx(src_tile)
+                    pair = pl.tile._quant_mx_nd(src_tile)
                 else:
-                    pair = pl.quant_mx(src_tile)
+                    pair = pl.tile._quant_mx_nd(src_tile)
                 quant = pair[0]
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
 
@@ -161,9 +161,9 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                pair = pl.quant_mx(src_tile)
+                pair = pl.tile._quant_mx_nd(src_tile)
                 for _i in pl.range(n):
-                    pair = pl.quant_mx(src_tile)
+                    pair = pl.tile._quant_mx_nd(src_tile)
                 quant = pair[0]
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
 
@@ -181,10 +181,10 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                pair = pl.quant_mx(src_tile)
+                pair = pl.tile._quant_mx_nd(src_tile)
                 for _i in pl.range(n):
                     with pl.scope():
-                        pair = pl.quant_mx(src_tile)
+                        pair = pl.tile._quant_mx_nd(src_tile)
                 quant = pair[0]
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
 
@@ -202,10 +202,10 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                pair = pl.quant_mx(src_tile)
+                pair = pl.tile._quant_mx_nd(src_tile)
                 for _i in pl.range(n):
                     for _aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                        pair = pl.quant_mx(src_tile)
+                        pair = pl.tile._quant_mx_nd(src_tile)
                 quant = pair[0]
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
 
@@ -222,7 +222,7 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                quant, _scale = pl.quant_mx(src_tile)
+                quant, _scale = pl.tile._quant_mx_nd(src_tile)
                 pl.store(pl.reinterpret_view(quant, pl.INT8), [0, 0], out_q)
 
         class TQuantMxDpsStmtCollector(ir.IRVisitor):
@@ -257,7 +257,7 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                result = pl.quant_mx(src_tile)
+                result = pl.tile._quant_mx_nd(src_tile)
                 pl.store(pl.reinterpret_view(result[0], pl.INT8), [0, 0], out_q)
 
         mlir = _generate_mlir(Program)
@@ -276,7 +276,7 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                result = pl.quant_mx(src_tile)
+                result = pl.tile._quant_mx_nd(src_tile)
                 for _i in pl.range(1):
                     pl.store(pl.reinterpret_view(result[0], pl.INT8), [0, 0], out_q)
 
@@ -297,7 +297,7 @@ class TestMxQuantCodegen:
                 out_q1: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                result = pl.quant_mx(src_tile)
+                result = pl.tile._quant_mx_nd(src_tile)
                 first = result[0]
                 second = result[0]
                 pl.store(pl.reinterpret_view(first, pl.INT8), [0, 0], out_q0)
@@ -319,7 +319,7 @@ class TestMxQuantCodegen:
                 out_q: pl.Tensor[[16, 64], pl.INT8],
             ):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                result = pl.quant_mx(src_tile)
+                result = pl.tile._quant_mx_nd(src_tile)
                 alias1 = result
                 alias2 = alias1
                 quant = alias2[0]
@@ -337,7 +337,7 @@ class TestMxQuantCodegen:
             @pl.function(type=pl.FunctionType.InCore)
             def main(self, src: pl.Tensor[[16, 64], pl.FP16]):
                 src_tile = pl.load(src, [0, 0], [16, 64])
-                _quant, _scale = pl.quant_mx(src_tile)
+                _quant, _scale = pl.tile._quant_mx_nd(src_tile)
 
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -346,6 +346,8 @@ class TestMxQuantCodegen:
         with pytest.raises(ValueError, match=r"tile\.tquant_mx_dps"):
             codegen.PTOCodegen().generate(ir.Program([target], target.name, optimized.span))
 
+
+class TestTDequantCodegen:
     def test_tdequant_emits_pto_tdequant(self):
         @pl.program
         class Program:

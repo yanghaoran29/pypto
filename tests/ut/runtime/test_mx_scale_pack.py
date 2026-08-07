@@ -16,6 +16,7 @@ PTOAS / pto-isa golden ``convert_scale_a_format`` / ``convert_scale_b_format``
 transforms used by the multi-box matmul_mx ST sample.
 """
 
+import pytest
 import torch
 
 SCALE_BLOCK_SIZE = 16
@@ -125,3 +126,7 @@ class TestMxScalePack:
                 expected = logical[kb * 2 : (kb + 1) * 2, nb * 16 : (nb + 1) * 16].T.contiguous()
                 assert torch.equal(box_grid[nb, kb], expected)
         assert torch.equal(_unpack_b_scale(packed), logical)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
