@@ -26,25 +26,30 @@ def _run_default_through(program: ir.Program, last_pass: str) -> ir.Program:
     return pipeline.run(program)
 
 
-def _keepalive_bases(program: ir.Program) -> tuple[set[int], set[int]]:
-    a_bases: set[int] = set()
-    b_bases: set[int] = set()
+def _chunk_lifetime_stats(program: ir.Program) -> tuple[list[set[int]], int]:
+    groups: list[set[int]] = []
+    current_bases: set[int] = set()
+    barrier_count = 0
 
     class _Collector(ir.IRVisitor):
         def visit_assign_stmt(self, stmt):
             name = stmt.var.name_hint
             tile_type = stmt.var.type
-            if "__keep_tmp_" in name and isinstance(tile_type, ir.TileType):
-                assert tile_type.memref is not None
-                base_id = tile_type.memref.base_.unique_id
-                if name.startswith(("a_q_out", "a_s_out")):
-                    a_bases.add(base_id)
-                elif name.startswith(("b_q_out", "b_s_out")):
-                    b_bases.add(base_id)
+            if "__chunk_keep_tmp_" in name and isinstance(tile_type, ir.TileType):
+                if tile_type.memref is not None:
+                    current_bases.add(tile_type.memref.base_.unique_id)
             super().visit_assign_stmt(stmt)
 
+        def visit_call(self, call):
+            nonlocal barrier_count, current_bases
+            if call.op.name == "system.bar_all":
+                barrier_count += 1
+                groups.append(current_bases)
+                current_bases = set()
+            super().visit_call(call)
+
     _Collector().visit_program(program)
-    return a_bases, b_bases
+    return groups, barrier_count
 
 
 def _static_shape(expr: ir.Expr) -> tuple[int, ...]:
@@ -68,7 +73,16 @@ def _static_tuple(expr: ir.Expr) -> tuple[int, ...]:
 
 def _expanded_packing_ops(
     program: ir.Program,
-) -> tuple[list[tuple[int, ...]], Counter[tuple[int, ...]], Counter[tuple[int, ...]], list[tuple[int, ...]]]:
+) -> tuple[
+    list[tuple[int, ...]],
+    list[tuple[int, ...]],
+    list[tuple[int, ...]],
+    Counter[tuple[int, ...]],
+    Counter[tuple[int, ...]],
+    list[tuple[int, ...]],
+]:
+    source_load_shapes: list[tuple[int, ...]] = []
+    result_load_shapes: list[tuple[int, ...]] = []
     quant_input_shapes: list[tuple[int, ...]] = []
     data_store_offsets: Counter[tuple[int, ...]] = Counter()
     scale_store_offsets: Counter[tuple[int, ...]] = Counter()
@@ -76,7 +90,14 @@ def _expanded_packing_ops(
 
     class _Collector(ir.IRVisitor):
         def visit_call(self, call):
-            if call.op.name == "tile.tquant_mx":
+            if call.op.name == "tile.load" and call.type.dtype == ir.DataType.FP32:
+                source_load_shapes.append(_static_shape(call))
+            elif call.op.name == "tile.load" and call.type.dtype in {
+                ir.DataType.FP8E4M3FN,
+                ir.DataType.FP8E8M0,
+            }:
+                result_load_shapes.append(_static_shape(call))
+            elif call.op.name == "tile.tquant_mx":
                 quant_input_shapes.append(_static_shape(call.args[0]))
             elif call.op.name == "tile.store":
                 value_type = call.args[0].type
@@ -91,19 +112,26 @@ def _expanded_packing_ops(
             super().visit_call(call)
 
     _Collector().visit_program(program)
-    return quant_input_shapes, data_store_offsets, scale_store_offsets, transpose_output_shapes
+    return (
+        source_load_shapes,
+        result_load_shapes,
+        quant_input_shapes,
+        data_store_offsets,
+        scale_store_offsets,
+        transpose_output_shapes,
+    )
 
 
 class TestExpandMxPackedQuant:
-    """Packed MX expansion preserves the hardware lifetime boundary between sites."""
+    """Packed MX expansion bounds async lifetimes with explicit pipe drains."""
 
-    def test_memory_reuse_keeps_consecutive_a_b_quant_buffers_disjoint(self):
-        """A/B packed quant in one InCore must not share per-box physical buffers.
+    def test_memory_reuse_is_bounded_by_pipe_all_drains(self):
+        """A/B packed quant may reuse buffers only after a real pipe drain.
 
         PTO load/store/vector pipes execute asynchronously. The store-fused expansion
-        therefore keeps every per-box load, quant result, and scale alive until the
-        original store position. Without those aliases MemoryReuse observes disjoint
-        SSA lifetimes and merges A into B, corrupting the layout-ab device result.
+        keeps each chunk's load, quant result, and scale alive through ``bar_all``.
+        MemoryReuse can then merge A into B after A's drain without merging buffers
+        that are still in flight inside either chunk.
         """
 
         @pl.program
@@ -132,11 +160,20 @@ class TestExpandMxPackedQuant:
                 return a_q_out, a_s_out, b_q_out, b_s_out
 
         expanded = _run_default_through(Before, "ExpandMxPackedQuant")
-        quant_shapes, data_offsets, scale_offsets, transpose_shapes = _expanded_packing_ops(expanded)
+        (
+            source_load_shapes,
+            result_load_shapes,
+            quant_shapes,
+            data_offsets,
+            scale_offsets,
+            transpose_shapes,
+        ) = _expanded_packing_ops(expanded)
 
         # A is split into four [32, 32] source boxes and B into eight. Packed A
         # stores four [16, 64] boxes directly; packed B is assembled in Vec and
         # transposed once to its public [K, N] result layout.
+        assert source_load_shapes == [(16, 64)] * 12
+        assert result_load_shapes == []
         assert quant_shapes == [(32, 32)] * 12
         assert data_offsets == Counter({(0, 0): 1, (0, 64): 1, (16, 0): 1, (16, 64): 1})
         assert scale_offsets == Counter(
@@ -153,14 +190,19 @@ class TestExpandMxPackedQuant:
         )
         assert transpose_shapes == [(128, 64)]
 
-        after = _run_default_through(Before, "MemoryReuse")
-        a_bases, b_bases = _keepalive_bases(after)
+        _, expanded_barriers = _chunk_lifetime_stats(expanded)
+        # One drain for A's four-box chunk, one for B's eight-box chunk, and a
+        # final drain for B's full-tile transpose/store.
+        assert expanded_barriers == 3
 
-        # A has 4 boxes and B has 8. Each box keeps load/data/scale (3 buffers),
-        # plus the final full data and scale reloads for the packed result.
-        assert len(a_bases) == 4 * 3 + 2
-        assert len(b_bases) == 8 * 3 + 2
-        assert a_bases.isdisjoint(b_bases)
+        after = _run_default_through(Before, "MemoryReuse")
+        chunk_groups, barrier_count = _chunk_lifetime_stats(after)
+
+        # Each live chunk has distinct load/data/scale buffers per box. Across
+        # A's drain, B is allowed to reuse at least some of A's physical bases.
+        assert [len(group) for group in chunk_groups] == [4 * 3, 8 * 3, 0]
+        assert chunk_groups[0] & chunk_groups[1]
+        assert barrier_count == 3
 
 
 if __name__ == "__main__":
