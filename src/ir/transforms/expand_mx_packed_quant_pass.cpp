@@ -216,11 +216,13 @@ ExprPtr CreateMxScaleU8Buffer(ExpandBuilder& b, int64_t groups, const Span& span
   auto& reg = OpRegistry::GetInstance();
   auto groups_dim = MakeIndex(groups, span);
   auto one = MakeIndex(1, span);
-  // Plain ND UINT8 (no MX fractal): assemble packs bytes like consecutive GM stores.
+  // UINT8 keeps the operation byte-oriented, while the MX fractal must match
+  // each reinterpreted FP8E8M0 source because assemble lowers through subviews.
   TileView scale_u8_view;
   scale_u8_view.valid_shape = {one, groups_dim};
   scale_u8_view.blayout = TileLayout::row_major;
   scale_u8_view.slayout = TileLayout::none_box;
+  scale_u8_view.fractal = tile_view_semantics::kMXScaleFractal;
   auto scale_u8_type = std::make_shared<TileType>(std::vector<ExprPtr>{one, groups_dim}, DataType::UINT8,
                                                   std::nullopt, scale_u8_view, MemorySpace::Vec);
   auto scale_shape = MakeShape2(1, groups, span);

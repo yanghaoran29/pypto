@@ -602,6 +602,9 @@ Pass InferTileMemorySpace();
  * immediately before each ``tile.matmul_mx`` / ``_acc`` / ``_bias`` and rewrites
  * the matmul to consume the bound scale SSA values.
  *
+ * Applies to all InCore-variant functions (``InCore``, ``AIC``, ``AIV``), including
+ * mixed-kernel cube/vector bodies written directly as AIC/AIV.
+ *
  * Bindings are not reused across consumers because tget mutates a shared
  * physical scale buffer whose aliases cannot be represented by SSA identity.
  * The pass therefore inserts a fresh binding at every consumer even when its
@@ -725,6 +728,17 @@ Pass Simplify();
  * form; this pass materializes its per-box implementation.
  */
 Pass ExpandMxPackedQuant();
+
+/**
+ * @brief Route mixed-kernel MX E8M0 scales through GM instead of V2C.
+ *
+ * Runs immediately after ``ExpandMxPackedQuant``. Rewrites AIV
+ * ``tile.tpush_to_aic`` / AIC ``tile.tpop_from_aiv`` of ``FP8E8M0`` into
+ * ``tile.store`` + ``tensor.view(MX_A_ZZ)`` + ``tile.load(Mat)`` using the
+ * packed ZZ layout. FP8 data V2C is unchanged. Idempotent when no E8M0 V2C
+ * scale traffic remains.
+ */
+Pass LegalizeMixedMxScaleViaGm();
 
 /**
  * @brief Decompose composite tile/distributed ops into primitive ops.

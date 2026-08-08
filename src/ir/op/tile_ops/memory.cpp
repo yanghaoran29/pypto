@@ -496,13 +496,11 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
     CHECK(out_dtype == DataType::UINT8 || out_dtype == DataType::FP8E8M0)
         << "The operator " << op_name
         << " into LeftScale/RightScale requires UINT8 or FP8E8M0 dtype, but got " << out_dtype.ToString();
-    const TileLayout required_layout =
-        space == MemorySpace::LeftScale ? TileLayout::row_major : TileLayout::col_major;
-    CHECK(source_view.blayout == required_layout && source_view.slayout == required_layout &&
+    CHECK(source_view.blayout == source_view.slayout &&
+          (source_view.blayout == TileLayout::row_major || source_view.blayout == TileLayout::col_major) &&
           source_view.fractal == tile_view_semantics::kMXScaleFractal)
         << "The operator " << op_name << " into " << MemorySpaceToString(space)
-        << " requires the source Mat tile to use the matching "
-        << (space == MemorySpace::LeftScale ? "row/row/32" : "col/col/32") << " layout";
+        << " requires the source Mat tile to use a consistent row/row/32 or col/col/32 layout";
     if (out_dtype == DataType::UINT8) {
       out_dtype = DataType::FP8E8M0;
     }

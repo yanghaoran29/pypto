@@ -237,7 +237,6 @@ class TestExpandMxPackedQuant:
                 return q_out, s_out
 
         expanded = _run_default_through(Before, "ExpandMxPackedQuant")
-
         passes.run_verifier()(expanded)
         assert "__FREE_VAR" not in ir.python_print(expanded)
 
@@ -306,9 +305,33 @@ class TestExpandMxPackedQuant:
                 return q_out, s_out
 
         expanded = _run_default_through(Before, "ExpandMxPackedQuant")
+        assemble_fractals: list[tuple[int, int]] = []
+
+        class _AssembleViewCollector(ir.IRVisitor):
+            def visit_call(self, call):
+                if call.op.name == "tile.assemble":
+                    target_type = call.args[0].type
+                    source_type = call.args[1].type
+                    assert isinstance(target_type, ir.TileType)
+                    assert isinstance(source_type, ir.TileType)
+                    target_fractal = (
+                        target_type.tile_view.fractal
+                        if target_type.tile_view is not None
+                        else ir.TileView().fractal
+                    )
+                    source_fractal = (
+                        source_type.tile_view.fractal
+                        if source_type.tile_view is not None
+                        else ir.TileView().fractal
+                    )
+                    assemble_fractals.append((target_fractal, source_fractal))
+                super().visit_call(call)
+
+        _AssembleViewCollector().visit_program(expanded)
 
         passes.run_verifier()(expanded)
         assert "__FREE_VAR" not in ir.python_print(expanded)
+        assert assemble_fractals == [(512, 512), (32, 32)]
 
     def test_b_packing_does_not_reuse_user_tensor_as_scratch(self):
         """A shape-compatible InOut tensor is user data, not compiler scratch."""

@@ -9,6 +9,7 @@
 
 """User-facing A5 runtime tests for MX quantization and matrix multiplication."""
 
+import os
 from typing import Any
 
 import pypto.language as pl
@@ -17,7 +18,15 @@ import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 from pypto.runtime.runner import RunConfig
 
+# MIX_DIAG_MODE: "" (default varying A-scales) | "row" | "group" | "probe" | "probe_data".
+# Default must exercise non-uniform A-scales (all-127 smoke is not a valid oracle).
+# probe / probe_data: unique A (+ group-select B) to decode V2C remaps from out.
+_MIX_DIAG_MODE = os.environ.get("MIX_DIAG_MODE", "").strip().lower()
+
 M, K, N = 16, 64, 32
+MIX_M, MIX_K, MIX_N = 32, 1024, N
+MIX_K_CHUNK = 256
+MIX_K_CHUNKS = MIX_K // MIX_K_CHUNK
 # Multi-box shapes: A-scale [32, 4] = 2x2 [16, 2] boxes; B-scale [4, 64] = 2x4
 # [2, 16] boxes. Packing is no longer a byte-identity for these tensors.
 MB_M, MB_K, MB_N = 32, 128, 64
@@ -25,6 +34,12 @@ BIG_M, BIG_K, BIG_N = MB_M, MB_K, MB_N
 MX_GROUP_SIZE = 32
 SCALE_BLOCK_SIZE = 16
 SCALE_C0_SIZE = 2
+MIX_DATA_SLOT_SIZE = MIX_M * MIX_K_CHUNK
+# Per-chunk packed A-scale from quant_mx(MX_A_ZZ): [1, M*K_chunk/32] via GM.
+MIX_SCALE_ELEMS = MIX_M * MIX_K_CHUNK // MX_GROUP_SIZE
+MIX_SCALE_TOTAL = MIX_M * MIX_K // MX_GROUP_SIZE
+MIX_PIPE_DEPTH = MIX_K_CHUNKS
+MIX_DATA_BUFFER_SIZE = MIX_DATA_SLOT_SIZE * MIX_PIPE_DEPTH
 BIG_G = BIG_M * BIG_K // MX_GROUP_SIZE
 BIG_BG = (BIG_K // MX_GROUP_SIZE) * BIG_N
 
@@ -106,6 +121,60 @@ def _unpack_b_scale(packed: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _mx_a_zz_flat_1x256(logical_mg: torch.Tensor) -> torch.Tensor:
+    """Logical ``[M, K/32]`` → ``quant_mx(MX_A_ZZ)`` flat ``[1, M*K/32]``.
+
+    Not ND/NZ: stacked ``[16, 2]`` boxes via
+    ``reshape(M/16, 16, G/2, 2).permute(0, 2, 1, 3).reshape(1, M*G)``.
+    For one K-chunk (``M=32, G=8``) that is 8 boxes × 32B = ``[1, 256]``.
+    """
+    return _pack_a_scale(logical_mg).reshape(1, -1)
+
+
+def _fp32_atom_transpose_1x256(flat_u8: torch.Tensor) -> torch.Tensor:
+    """Byte permute of ``[1, 256]`` as FP32 ``[8, 8]`` matrix transpose.
+
+    A5 V2C/TINSERT stages ColMajor on the FP32 ``[8, 8]`` send view, which is
+    this 4-byte-atom transpose. Applying it once on V cancels the staging so C
+    receives the original ``[1, 256]`` byte order. Not expressible as MX ND/NZ.
+    """
+    atoms = flat_u8.reshape(-1).to(torch.uint8).view(torch.float32).reshape(8, 8)
+    return atoms.T.contiguous().view(torch.uint8).reshape(1, 256)
+
+
+def _v2c_scale_group_src_index(m: int = MIX_M, g_chunk: int = MIX_K_CHUNK // MX_GROUP_SIZE) -> torch.Tensor:
+    """Per-chunk logical scale index map if V2C applies FP32-atom T and LeftScale unpacks ZZ.
+
+    ``src[m, g]`` is the flat id ``m_src * g_chunk + g_src`` that must sit at
+    ``quant_mx`` logical ``(m, g)`` so that after ``fp32_T(pack(.))`` + ZZ unpack,
+    Cube sees identity scales for the *true* layout. Use with
+    :func:`_gather_a_mx_groups` on the tensor fed to ``quant_mx``, and scatter
+    ``a_q`` back — scale-only input reorder desyncs FP8 data (data path has no
+    FP32-atom T). Prefer cancel-transpose on the ``[1, 256]`` send instead.
+    """
+    assert g_chunk == 8 and m == 32
+    ids = torch.arange(m * g_chunk, dtype=torch.int64).reshape(m, g_chunk)
+    packed = _pack_a_scale(ids)
+    return _unpack_a_scale(
+        _fp32_atom_transpose_1x256(packed.reshape(1, -1).to(torch.uint8)).reshape(m, g_chunk).to(torch.int64)
+    )
+
+
+def _gather_a_mx_groups(a: torch.Tensor, src_index_chunk: torch.Tensor) -> torch.Tensor:
+    """Gather MX groups of ``a`` so each K-chunk follows ``src_index_chunk`` ``[M, 8]``."""
+    rows, cols = a.shape
+    g_total = cols // MX_GROUP_SIZE
+    g_chunk = src_index_chunk.shape[1]
+    blocks = a.reshape(rows, g_total, MX_GROUP_SIZE)
+    out = torch.empty_like(blocks)
+    for c0 in range(0, g_total, g_chunk):
+        idx = src_index_chunk
+        m_src = idx // g_chunk
+        g_src = idx % g_chunk
+        out[:, c0 : c0 + g_chunk, :] = blocks[m_src, c0 + g_src, :]
+    return out.reshape(rows, cols).contiguous()
+
+
 def _matmul_mx_golden(
     a: torch.Tensor,
     a_scale_codes: torch.Tensor,
@@ -133,6 +202,91 @@ def _exact_quantizable_matrix(rows: int, cols: int, *, transpose_pattern: bool =
         exponents = exponents.flip(0)
     scales = torch.pow(2.0, exponents).to(torch.float32)
     return (pattern.reshape(1, 1, MX_GROUP_SIZE) * scales.unsqueeze(-1)).reshape(rows, cols).contiguous()
+
+
+def _diag_row_scale_matrix(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 A with mantissa 1.0 and per-row E8M0 exponents (constant across K-groups).
+
+    Returns ``(a, exp_per_row)`` where ``exp_per_row[m] = (m % 8) - 3`` so
+    ``a[m, :] == 2 ** exp_per_row[m]``. Easy to reverse-engineer which scale row
+    Cube applied: ``actual[m, n] / K ≈ 2 ** e_used`` when B is all ones.
+    """
+    groups = cols // MX_GROUP_SIZE
+    exp_per_row = ((torch.arange(rows) % 8) - 3).to(torch.float32)
+    scales = torch.pow(2.0, exp_per_row).view(rows, 1, 1)
+    a = scales.expand(rows, groups, MX_GROUP_SIZE).reshape(rows, cols).contiguous()
+    return a, exp_per_row
+
+
+def _diag_group_scale_matrix(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 A with mantissa 1.0 and per-K-group exponents (same for every row).
+
+    Returns ``(a, exp_per_group)`` with ``exp_per_group[g] = (g % 8) - 3``.
+    """
+    groups = cols // MX_GROUP_SIZE
+    exp_per_group = ((torch.arange(groups) % 8) - 3).to(torch.float32)
+    scales = torch.pow(2.0, exp_per_group).view(1, groups, 1)
+    a = scales.expand(rows, groups, MX_GROUP_SIZE).reshape(rows, cols).contiguous()
+    return a, exp_per_group
+
+
+def _diag_unique_probe_matrix(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Special A: unique float-safe E8M0 per ``(m,g)`` on the first 8 rows.
+
+    ``code[m, g] = 100 + m * 8 + g`` for ``m,g in 0..7`` (codes 100..163, all
+    distinct and float32-safe). Rows 8..31 and K beyond chunk-0 are 0. Pair with
+    :func:`_diag_group_select_b`: ``out[m,g] = 32 * 2**(code_used-127)``.
+    """
+    g_chunk = MIX_K_CHUNK // MX_GROUP_SIZE
+    assert rows == MIX_M and g_chunk == 8
+    codes_chunk = torch.zeros((rows, g_chunk), dtype=torch.int64)
+    a = torch.zeros((rows, cols), dtype=torch.float32)
+    for m in range(8):
+        for g in range(g_chunk):
+            code = 100 + m * 8 + g
+            codes_chunk[m, g] = code
+            scale = float(2.0 ** (code - 127))
+            lo = g * MX_GROUP_SIZE
+            a[m, lo : lo + MX_GROUP_SIZE] = scale
+    groups = cols // MX_GROUP_SIZE
+    codes_full = torch.zeros((rows, groups), dtype=torch.uint8)
+    codes_full[:, :g_chunk] = codes_chunk.to(torch.uint8)
+    return a, codes_full, codes_chunk.to(torch.uint8)
+
+
+def _diag_group_select_b(k: int = MIX_K, n: int = MIX_N) -> torch.Tensor:
+    """B whose column ``g`` (g<8) is ones only on K-group ``g`` of chunk-0."""
+    b = torch.zeros((k, n), dtype=torch.float32)
+    for g in range(MIX_K_CHUNK // MX_GROUP_SIZE):
+        lo = g * MX_GROUP_SIZE
+        b[lo : lo + MX_GROUP_SIZE, g] = 1.0
+    return b.to(torch.float8_e4m3fn)
+
+
+def _diag_data_tag_matrix(rows: int, cols: int) -> torch.Tensor:
+    """Unit-scale A with one-hot row tags inside each chunk-0 group (data-path probe).
+
+    ``a[m, g*32 + m] = 1``, elsewhere 0 in chunk-0; rest of K zero. All scales → 127.
+    With :func:`_diag_group_select_b`, ``out[m,g]==1`` iff the tag for source row
+    ``m`` still sits in rx row ``m`` group ``g`` (else the 1 moves to another row).
+    """
+    g_chunk = MIX_K_CHUNK // MX_GROUP_SIZE
+    a = torch.zeros((rows, cols), dtype=torch.float32)
+    for m in range(rows):
+        for g in range(g_chunk):
+            a[m, g * MX_GROUP_SIZE + m] = 1.0
+    return a
+
+
+def _host_mx_quant_a(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host mirror of on-chip ``quant_mx`` along K: FP8 data + logical E8M0 codes."""
+    rows, cols = a.shape
+    blocks = a.reshape(rows, cols // MX_GROUP_SIZE, MX_GROUP_SIZE)
+    absmax = blocks.abs().amax(dim=2).clamp(min=1e-30)
+    exp = torch.ceil(torch.log2(absmax)).to(torch.int32)
+    scale_f = torch.pow(2.0, exp.to(torch.float32))
+    a_q = (blocks / scale_f.unsqueeze(-1)).reshape(rows, cols).to(torch.float8_e4m3fn)
+    return a_q, (exp + 127).clamp(0, 254).to(torch.uint8)
 
 
 def _host_prequant_b_nk(b_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -247,6 +401,175 @@ def quantized_matmul_mx_onboard(
     a_q_gm, a_s_gm = _quantized_matmul_mx_quant_a(a, a_q_gm, a_s_gm)
     out = _quantized_matmul_mx_load_mm(a_q_gm, a_s_gm, b, b_scale, out)
     return out
+
+
+@pl.program
+class QuantizedMatmulMxMixedProgram:
+    """Explicit A5 mixed kernel: FP8 data on V2C; A-scale via GM (packed ZZ).
+
+    Orchestration materializes the full A packed ZZ scale once (same shape as
+    onboard), then the Group only ships FP8 data over V2C while AIC loads
+    per-chunk LeftScale from that GM buffer via ``MX_A_ZZ``.
+    """
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def prefetch_a_scales(
+        self,
+        a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
+        a_s_gm: pl.Out[pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0]],
+    ) -> pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0]:
+        _quant, scale = pl.quant_mx(pl.load(a, [0, 0], [MIX_M, MIX_K]), layout=pl.MX_A_ZZ)
+        return pl.store(scale, [0, 0], a_s_gm)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector_quantize(
+        self,
+        a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
+        b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
+        b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
+        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
+    ):
+        data_peer = pl.import_peer_buffer(name="v2c_mx_data_slot", peer_func="cube_matmul")
+        pl.aiv_initialize_pipe(
+            pl.const(0, pl.INT32),
+            data_peer,
+            dir_mask=2,
+            slot_size=MIX_DATA_SLOT_SIZE,
+            id=0,
+        )
+        for chunk in pl.range(0, MIX_K_CHUNKS):
+            k_offset = chunk * MIX_K_CHUNK
+            quant, _scale = pl.quant_mx(
+                pl.load(a, [0, k_offset], [MIX_M, MIX_K_CHUNK]),
+                layout=pl.MX_A_ZZ,
+            )
+            quant_nz = pl.move(
+                quant,
+                target_memory=pl.Mem.Vec,
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            pl.tpush_to_aic(quant_nz, split=0, id=0)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube_matmul(
+        self,
+        a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
+        b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
+        b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
+        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
+    ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
+        data_slot = pl.reserve_buffer(
+            name="v2c_mx_data_slot",
+            size=MIX_DATA_BUFFER_SIZE,
+            base=pl.AUTO,
+        )
+        pl.aic_initialize_pipe(
+            pl.const(0, pl.INT32),
+            data_slot,
+            dir_mask=2,
+            slot_size=MIX_DATA_SLOT_SIZE,
+            id=0,
+        )
+        b_scale_mx = pl.tensor.view(
+            b_scale,
+            [MIX_K_CHUNK // MX_GROUP_SIZE, MIX_N],
+            layout=pl.MX_B_NN,
+        )
+        rhs_scale_mat = pl.load(
+            b_scale_mx,
+            [0, 0],
+            [MIX_K_CHUNK // MX_GROUP_SIZE, MIX_N],
+            target_memory=pl.Mem.Mat,
+        )
+        rhs_scale = pl.move(rhs_scale_mat, target_memory=pl.Mem.RightScale)
+        a_s_mx = pl.tensor.view(
+            a_s_gm,
+            [MIX_M, MIX_K // MX_GROUP_SIZE],
+            layout=pl.MX_A_ZZ,
+        )
+
+        data_mat: pl.Tile[
+            [MIX_M, MIX_K_CHUNK],
+            pl.FP8E4M3FN,
+            pl.Mem.Mat,
+            pl.TileView(
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+                fractal=512,
+            ),
+        ] = pl.tpop_from_aiv(split=0, id=0)
+        scale_mat = pl.load(
+            a_s_mx,
+            [0, 0],
+            [MIX_M, MIX_K_CHUNK // MX_GROUP_SIZE],
+            target_memory=pl.Mem.Mat,
+        )
+        lhs = pl.move(data_mat, target_memory=pl.Mem.Left)
+        lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
+        pl.tfree_to_aiv(data_mat, id=0)
+        rhs = pl.move(
+            pl.load(b, [0, 0], [MIX_K_CHUNK, MIX_N], target_memory=pl.Mem.Mat),
+            target_memory=pl.Mem.Right,
+        )
+        acc = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+
+        for chunk, (acc_iter,) in pl.range(1, MIX_K_CHUNKS, init_values=(acc,)):
+            k_offset = chunk * MIX_K_CHUNK
+            g_offset = chunk * (MIX_K_CHUNK // MX_GROUP_SIZE)
+            data_mat: pl.Tile[
+                [MIX_M, MIX_K_CHUNK],
+                pl.FP8E4M3FN,
+                pl.Mem.Mat,
+                pl.TileView(
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                    fractal=512,
+                ),
+            ] = pl.tpop_from_aiv(split=0, id=0)
+            scale_mat = pl.load(
+                a_s_mx,
+                [0, g_offset],
+                [MIX_M, MIX_K_CHUNK // MX_GROUP_SIZE],
+                target_memory=pl.Mem.Mat,
+            )
+            lhs = pl.move(data_mat, target_memory=pl.Mem.Left)
+            lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
+            pl.tfree_to_aiv(data_mat, id=0)
+            rhs = pl.move(
+                pl.load(b, [k_offset, 0], [MIX_K_CHUNK, MIX_N], target_memory=pl.Mem.Mat),
+                target_memory=pl.Mem.Right,
+            )
+            updated = pl.matmul_mx_acc(acc_iter, lhs, lhs_scale, rhs, rhs_scale)
+            result = pl.yield_(updated)
+        return pl.store(result, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Group)
+    def group_func(
+        self,
+        a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
+        b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
+        b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
+        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
+    ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
+        self.vector_quantize(a, b, b_scale, a_s_gm, out)
+        return self.cube_matmul(a, b, b_scale, a_s_gm, out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
+        b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
+        b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
+        out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
+    ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
+        a_s_gm = pl.create_tensor([1, MIX_SCALE_TOTAL], dtype=pl.FP8E8M0)
+        a_s_gm = self.prefetch_a_scales(a, a_s_gm)
+        return self.group_func(a, b, b_scale, a_s_gm, out)
+
 
 
 @pl.jit.incore
@@ -493,6 +816,68 @@ class TestQuantizedMatmulMx(_JitMxTestCase):
         tensors["out"][:] = torch.matmul(tensors["a"], b_nk.T)
 
 
+class TestQuantizedMatmulMxMixedKernel(TestQuantizedMatmulMx):
+    """AIV quantization and AIC MX matmul within one mixed kernel."""
+
+    __test__ = False
+    shape = (MIX_M, MIX_K, MIX_N)
+
+    def get_program(self) -> Any:
+        return QuantizedMatmulMxMixedProgram
+
+    def get_name(self) -> str:
+        return "quantized_matmul_mx_mixed_32x1024x32"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        # B-scale stays unit (127); A-scales come from on-chip quant_mx and must vary.
+        unit_scale = torch.full(
+            (MIX_K_CHUNK // MX_GROUP_SIZE, MIX_N),
+            127,
+            dtype=torch.uint8,
+        ).view(torch.float8_e8m0fnu)
+        if _MIX_DIAG_MODE == "row":
+            # Mantissa 1.0, scale = 2**((m%8)-3) on every K-group of row m.
+            # With B=ones: expected[m, :] == MIX_K * 2**exp[m].
+            a, _ = _diag_row_scale_matrix(MIX_M, MIX_K)
+            b = torch.ones((MIX_K, MIX_N), dtype=torch.float32).to(torch.float8_e4m3fn)
+        elif _MIX_DIAG_MODE == "group":
+            a, _ = _diag_group_scale_matrix(MIX_M, MIX_K)
+            b = torch.ones((MIX_K, MIX_N), dtype=torch.float32).to(torch.float8_e4m3fn)
+        elif _MIX_DIAG_MODE == "probe":
+            # Unique scales + group-select B → decode LeftScale map from out[m,g].
+            a, _, _ = _diag_unique_probe_matrix(MIX_M, MIX_K)
+            b = _diag_group_select_b()
+        elif _MIX_DIAG_MODE == "probe_data":
+            # Unit scales + one-hot tags + group-select B → decode data remap.
+            a = _diag_data_tag_matrix(MIX_M, MIX_K)
+            b = _diag_group_select_b()
+        else:
+            # Default: per-(m,g) power-of-two A-scales (exponents in {-1,0,1,2}).
+            a = _exact_quantizable_matrix(MIX_M, MIX_K)
+            generator = torch.Generator().manual_seed(29)
+            b = torch.randint(-2, 3, (MIX_K, MIX_N), generator=generator).to(torch.float8_e4m3fn)
+        return [
+            TensorSpec(
+                "a",
+                [MIX_M, MIX_K],
+                DataType.FP32,
+                init_value=a,
+            ),
+            TensorSpec("b", [MIX_K, MIX_N], DataType.FP8E4M3FN, init_value=b),
+            TensorSpec(
+                "b_scale",
+                [1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N],
+                DataType.FP8E8M0,
+                init_value=unit_scale.reshape(1, -1),
+            ),
+            TensorSpec("out", [MIX_M, MIX_N], DataType.FP32, is_output=True),
+        ]
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        tensors["out"][:] = torch.matmul(tensors["a"], tensors["b"].to(torch.float32))
+
+
+@pytest.mark.platforms("a5")
 class TestQuantizedMatmulMxLayoutAB(_JitMxTestCase):
     """Public packed-layout quantization of both MX operands."""
 
@@ -527,6 +912,7 @@ class TestQuantizedMatmulMxLayoutAB(_JitMxTestCase):
 
 
 @pytest.mark.platforms("a5")
+
 class TestMatmulMxOperations:
     """Numerical execution coverage for the Ascend950-only MX matmul path."""
 
@@ -536,6 +922,7 @@ class TestMatmulMxOperations:
             pytest.param(TestMatmulMx, id="base"),
             pytest.param(TestMatmulMxMultibox, id="multibox"),
             pytest.param(TestQuantizedMatmulMx, id="quantized"),
+            pytest.param(TestQuantizedMatmulMxMixedKernel, id="mixed"),
             pytest.param(TestQuantizedMatmulMxLayoutAB, id="layout-ab"),
         ],
     )

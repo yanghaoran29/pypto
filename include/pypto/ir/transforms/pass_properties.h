@@ -209,6 +209,14 @@ inline const PassProperties kInferTileMemorySpaceProperties{
 
 inline const PassProperties kExpandMxPackedQuantProperties{};
 
+// -- Legalize mixed MX scale via GM ------------------------------------------
+//
+// Runs immediately after ExpandMxPackedQuant. Property-preserving; does not
+// require MixedKernelExpanded (handles explicit AIV/AIC and later-expanded
+// InCore the same way once E8M0 V2C scale ops exist).
+
+inline const PassProperties kLegalizeMixedMxScaleViaGmProperties{};
+
 // -- Insert MX scale-address binding pass ------------------------------------
 //
 // Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale

@@ -498,10 +498,10 @@ void BindPass(nb::module_& m) {
   passes.def("insert_mx_scale_addr", &pass::InsertMxScaleAddr,
              "Create a pass that inserts tile.tget_scale_addr before MX matmul consumers\n\n"
              "Requires InferTileMemorySpace first so Left/LeftScale and Right/RightScale\n"
-             "pairs are resolved. Rewrites each matmul_mx family call to consume the bound\n"
-             "scale SSA. Bindings are never reused across MX consumers because\n"
-             "tget_scale_addr mutates a shared physical scale buffer whose aliases are\n"
-             "not represented by SSA identity.");
+             "pairs are resolved. Rewrites InCore/AIC/AIV functions; each matmul_mx family\n"
+             "call consumes the bound scale SSA. Bindings are never reused across MX\n"
+             "consumers because tget_scale_addr mutates a shared physical scale buffer\n"
+             "whose aliases are not represented by SSA identity.");
   passes.def("materialize_tensor_strides", &pass::MaterializeTensorStrides,
              "Create the MaterializeTensorStrides pass (RFC #1300 §2.4).\n\n"
              "Walks every TensorType reachable from the program and rewrites any\n"
@@ -536,6 +536,9 @@ void BindPass(nb::module_& m) {
              "Must run before LowerCompositeOps. B (MX_B_NN) also inserts an INT8 [N,K]->[K,N]\n"
              "transpose. Public pl.quant_mx(layout=...) emits the packed form; this pass\n"
              "materializes its per-box implementation.");
+  passes.def("legalize_mixed_mx_scale_via_gm", &pass::LegalizeMixedMxScaleViaGm,
+             "Rewrite mixed-kernel MX E8M0 scale V2C (tpush/tpop) into GM store + MX_A_ZZ load.\n\n"
+             "Must run immediately after ExpandMxPackedQuant. Leaves FP8 data V2C unchanged.");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
              "Decompose composite tile/distributed ops into primitives via the "
              "composite-lowering registry. Today lowers tile.sin/tile.cos, flat "

@@ -175,6 +175,7 @@ class PassManager:
         )
         tile_pto_passes: tuple[PassFactory, ...] = (
             passes.expand_mx_packed_quant,
+            passes.legalize_mixed_mx_scale_via_gm,
             passes.lower_composite_ops,
             passes.flatten_tile_nd_to_2d,
             # Expand non-native tile.cast (src,dst) pairs into shortest native

@@ -605,6 +605,13 @@ def expand_mx_packed_quant() -> Pass:
     values from ``[N, K]`` to ``[K, N]``.
     """
 
+def legalize_mixed_mx_scale_via_gm() -> Pass:
+    """Route mixed-kernel MX E8M0 scales through GM instead of V2C.
+
+    Runs immediately after :func:`expand_mx_packed_quant`. Rewrites E8M0
+    ``tpush_to_aic`` / ``tpop_from_aiv`` into ``store`` + ``MX_A_ZZ`` ``load``.
+    """
+
 def lower_composite_ops() -> Pass:
     """Decompose composite tile/distributed ops into primitive ops.
 
@@ -961,6 +968,7 @@ __all__ = [
     "split_vector_kernel",
     "simplify",
     "expand_mx_packed_quant",
+    "legalize_mixed_mx_scale_via_gm",
     "lower_composite_ops",
     "materialize_dist_tensor_ctx",
     "flatten_call_expr",
