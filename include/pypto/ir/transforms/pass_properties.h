@@ -209,19 +209,23 @@ inline const PassProperties kInferTileMemorySpaceProperties{
 
 inline const PassProperties kExpandMxPackedQuantProperties{};
 
-// -- Legalize mixed MX scale via GM ------------------------------------------
+// -- Split large-K MX matmul pass --------------------------------------------
 //
-// Runs immediately after ExpandMxPackedQuant. Property-preserving; does not
-// require MixedKernelExpanded (handles explicit AIV/AIC and later-expanded
-// InCore the same way once E8M0 V2C scale ops exist).
+// Runs immediately before InsertMxScaleAddr (after InferTileMemorySpace).
+// Property-preserving rewrite of matmul_mx family ops with static K>64.
 
-inline const PassProperties kLegalizeMixedMxScaleViaGmProperties{};
+inline const PassProperties kSplitLargeKMxMatmulProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred}};
 
 // -- Insert MX scale-address binding pass ------------------------------------
 //
-// Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale
-// and Right/RightScale spaces so tile.tget_scale_addr can be inserted before
-// each MX matmul consumer. Property-preserving (no new IRProperty).
+// Runs immediately after SplitLargeKMxMatmul (itself after InferTileMemorySpace).
+// Requires concrete Left/LeftScale and Right/RightScale spaces so
+// tile.tget_scale_addr can be inserted before each MX matmul consumer.
+// Property-preserving (no new IRProperty).
 
 inline const PassProperties kInsertMxScaleAddrProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,

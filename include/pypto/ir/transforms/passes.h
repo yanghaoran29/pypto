@@ -595,6 +595,24 @@ Pass CanonicalizeTileSlice();
 Pass InferTileMemorySpace();
 
 /**
+ * @brief Split large-K MX matmul into K=64 chunks (matmul_mx + matmul_mx_acc)
+ *
+ * When a ``tile.matmul_mx`` / ``_acc`` / ``_bias`` has a static K dimension
+ * with ``K > 64`` and ``K % 64 == 0``, rewrites it into a sequence of K=64
+ * slices: the first chunk is ``matmul_mx`` (or ``matmul_mx_bias``), and each
+ * remaining chunk is ``matmul_mx_acc``. Scale tiles are sliced by
+ * ``ceil(64/32) = 2`` groups per chunk.
+ *
+ * Idempotent: after the rewrite every MX matmul has K=64 so a second run is a
+ * no-op. Dynamic or non-multiple-of-64 K is left unchanged.
+ *
+ * Requirements:
+ * - Prefer running after ``InferTileMemorySpace`` and before ``InsertMxScaleAddr``
+ *   so each chunk receives its own scale-address bindings.
+ */
+Pass SplitLargeKMxMatmul();
+
+/**
  * @brief Insert tile.tget_scale_addr bindings before MX matmul consumers
  *
  * After InferTileMemorySpace has resolved Left/LeftScale and Right/RightScale
@@ -728,17 +746,6 @@ Pass Simplify();
  * form; this pass materializes its per-box implementation.
  */
 Pass ExpandMxPackedQuant();
-
-/**
- * @brief Route mixed-kernel MX E8M0 scales through GM instead of V2C.
- *
- * Runs immediately after ``ExpandMxPackedQuant``. Rewrites AIV
- * ``tile.tpush_to_aic`` / AIC ``tile.tpop_from_aiv`` of ``FP8E8M0`` into
- * ``tile.store`` + ``tensor.view(MX_A_ZZ)`` + ``tile.load(Mat)`` using the
- * packed ZZ layout. FP8 data V2C is unchanged. Idempotent when no E8M0 V2C
- * scale traffic remains.
- */
-Pass LegalizeMixedMxScaleViaGm();
 
 /**
  * @brief Decompose composite tile/distributed ops into primitive ops.

@@ -70,7 +70,6 @@ struct PassProperties {
 | OutlineClusterScopes | TypeChecked, SSAForm | ClusterOutlined | — |
 | ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
 | ExpandMxPackedQuant | — | — | — |
-| LegalizeMixedMxScaleViaGm | — | — | — |
 | LowerCompositeOps | — | — | — |
 | FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
 | LegalizeTileCast | — | — | — |
@@ -402,13 +401,13 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 `Default` 的 PTO tile 阶段顺序为：
 
 1. [`ExpandMxPackedQuant`](12-expand_mx_packed_quant.md)
-2. [`LegalizeMixedMxScaleViaGm`](13-legalize_mixed_mx_scale_via_gm.md)
-3. [`LowerCompositeOps`](14-lower_composite_ops.md)
-4. [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md)
-5. [`LegalizeTileCast`](16-legalize_tile_cast.md)（把目标 ISA 无法用单条 `pto.tcvt` 表达的 `tile.cast` 展开为原生 cast 链）
-6. [`AutoTileMatmulL0`](17-auto_tile_matmul_l0.md)
-7. [`CanonicalizeTileSlice`](18-canonicalize_tile_slice.md)
-8. `InferTileMemorySpace`
+2. [`LowerCompositeOps`](13-lower_composite_ops.md)
+3. [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md)
+4. [`LegalizeTileCast`](15-legalize_tile_cast.md)（把目标 ISA 无法用单条 `pto.tcvt` 表达的 `tile.cast` 展开为原生 cast 链）
+5. [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)
+6. [`CanonicalizeTileSlice`](17-canonicalize_tile_slice.md)
+7. `InferTileMemorySpace`
+8. [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md)（把静态 K>64 的 MX matmul 切成 K=64 块，使后续 scale 地址绑定按块生效）
 9. [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md)（Ascend950 MX 路径；在内存空间解析后插入内部 scale 地址绑定）
 10. [`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md)（pass 内部已自动归一化语句结构）
 11. [`LowerAutoVectorSplit`](22-lower_auto_vector_split.md)（在用自动拆分下降路径；在 ExpandMixedKernel 之前把 AUTO `pl.split` 混合 InCore 函数转换为显式 `split_aiv` 形态）
@@ -440,13 +439,13 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 37. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
 38. [`InsertCommFence`](48-insert_comm_fence.md)（在每个发布性写入与释放它的 pld.system.notify 之间插入整张 tensor 的 system.cacheinvalid + GM system.fence；跑在最后，使插入的 op 一路到 codegen 都紧邻其 notify）
 
-[`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md) 会根据
+[`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) 会根据
 backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对于当前 PTO
 上要求 `row_major` 的逐元素算子，它会在受约束 use-site 把 `[N, 1]`
 向量操作数改写成 `[1, N]` 的 `tile.reshape`，其 layout 由目标 shape
 自动推导为 `row_major`，并在需要时把结果 reshape 回原始向量 shape。
 
-[`NormalizeReturnOrder`](27-normalize_return_order.md) 对 InCore 函数的 `ReturnStmt::value_` 重新排序，使
+[`NormalizeReturnOrder`](26-normalize_return_order.md) 对 InCore 函数的 `ReturnStmt::value_` 重新排序，使
 `return[i]` 对应声明顺序中第 i 个 `Out`/`InOut` 参数，并同步更新调用点的
 `TupleGetItemExpr` 索引。这样编排代码生成可以直接通过
 `out_indices[i]` 查找输出参数，而不需要追踪 `tile.store`/yield 链。该 pass

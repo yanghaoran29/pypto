@@ -33,8 +33,8 @@ Ascend950 mixed kernel 中，AIV `quant_mx(layout=MX_A_ZZ)` 产出的 A-scale（
 ## 决策
 
 1. Mixed 中 **FP8 data 可继续走 V2C**。
-2. **MX scale 强制走 GM**，字节形态 = [`ExpandMxPackedQuant`](../passes/12-expand_mx_packed_quant.md) 产出的连续 ZZ packed E8M0（`[1, M*K/32]` 或每 chunk `[1, M*K_chunk/32]`），**不再**做 FP32 伪装 / pad / 复杂 reshape。
-3. 新增 pass `LegalizeMixedMxScaleViaGm`（紧接 `expand_mx_packed_quant`）：把将跨核的 packed scale 写成 GM，并在 AIC 侧接 `MX_A_ZZ` load。
+2. **禁止 E8M0 V2C**：[`ExpandMixedKernel`](../passes/23-expand_mixed_kernel.md) 在生成 `tpush_to_aic` 前对 `FP8E8M0` tile 报错；用户须改用 GM + `MX_A_ZZ` load。
+3. **MX scale 强制走 GM**，字节形态 = [`ExpandMxPackedQuant`](../passes/12-expand_mx_packed_quant.md) 产出的连续 ZZ packed E8M0（`[1, M*K/32]` 或每 chunk `[1, M*K_chunk/32]`），**不再**做 FP32 伪装 / pad / 复杂 reshape，也不再使用已删除的 `LegalizeMixedMxScaleViaGm` pass。
 4. 废弃原 `LegalizeV2CMxScaleTransport`（FP32 双对齐伪装）方案。
 
 ## 同步与 ST 形态（v1）
@@ -46,5 +46,4 @@ Ascend950 mixed kernel 中，AIV `quant_mx(layout=MX_A_ZZ)` 产出的 A-scale（
 ## 另请参阅
 
 - [`ExpandMxPackedQuant`](../passes/12-expand_mx_packed_quant.md)
-- [`LegalizeMixedMxScaleViaGm`](../passes/13-legalize_mixed_mx_scale_via_gm.md)
 - [`ExpandMixedKernel`](../passes/23-expand_mixed_kernel.md)（data 边界仍可 V2C；文档编号以 pass 表为准）

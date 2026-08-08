@@ -25,14 +25,14 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 10 | `10-convert_tensor_to_tile_ops.md` | 10th pass |
 | 11 | `11-optimize_orch_tensors.md` | 11th pass |
 | 12 | `12-expand_mx_packed_quant.md` | 12th pass (first tile_pto pass) |
-| 13 | `13-legalize_mixed_mx_scale_via_gm.md` | 13th pass (after ExpandMxPackedQuant; mixed MX E8M0 A-scale V2C → GM + MX_A_ZZ load) |
-| 14 | `14-lower_composite_ops.md` | 14th pass (third tile_pto pass) |
-| 15 | `15-flatten_tile_nd_to_2d.md` | 15th pass |
-| 16 | `16-legalize_tile_cast.md` | Expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt` into the shortest chain of native casts (A5 `INT32->FP16` becomes `INT32->FP32->FP16`); runs between `FlattenTileNdTo2D` and `AutoTileMatmulL0` |
-| 17 | `17-auto_tile_matmul_l0.md` | 17th pass |
-| 18 | `18-canonicalize_tile_slice.md` | Runs immediately after `AutoTileMatmulL0` (lowers Mat/Vec `tile.slice` → `tile.extract`) |
-| 19 | `19-infer_tile_memory_space.md` | 19th pass |
-| 20 | `20-insert_mx_scale_addr.md` | Inserts `tile.tget_scale_addr` before MX matmul consumers after InferTileMemorySpace resolves their memory spaces |
+| 13 | `13-lower_composite_ops.md` | 13th pass (second tile_pto pass) |
+| 14 | `14-flatten_tile_nd_to_2d.md` | 14th pass |
+| 15 | `15-legalize_tile_cast.md` | Expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt` into the shortest chain of native casts (A5 `INT32->FP16` becomes `INT32->FP32->FP16`); runs between `FlattenTileNdTo2D` and `AutoTileMatmulL0` |
+| 16 | `16-auto_tile_matmul_l0.md` | 16th pass |
+| 17 | `17-canonicalize_tile_slice.md` | Runs immediately after `AutoTileMatmulL0` (lowers Mat/Vec `tile.slice` → `tile.extract`) |
+| 18 | `18-infer_tile_memory_space.md` | 18th pass |
+| 19 | `19-split_large_k_mx_matmul.md` | Splits static K>64 MX matmul into K=64 chunks before InsertMxScaleAddr |
+| 20 | `20-insert_mx_scale_addr.md` | Inserts `tile.tget_scale_addr` before MX matmul consumers after InferTileMemorySpace / SplitLargeKMxMatmul |
 | 21 | `21-resolve_backend_op_layouts.md` | 21st pass |
 | 22 | `22-lower_auto_vector_split.md` | Live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form (aiv_shard/aic_gather + halved vector sub-region). ALSO the sole consumer of the first-class `SplitAivScopeStmt` region node (`pl.split_aiv`, nestable/multi-mode): lowers each region in place (region-scoped halving; explicit-boundary bodies passed through unchanged) and erases the scope wrapper. Runs immediately before `ExpandMixedKernel` |
 | 23 | `23-expand_mixed_kernel.md` | 23rd pass (no `SplitAivScopeStmt` survives to here; its single-func-mode transpose check is skipped for functions stamped `split_aiv_region_validated` by pass 22) |

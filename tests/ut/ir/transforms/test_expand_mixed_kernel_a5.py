@@ -1365,12 +1365,8 @@ class TestCrossCoreBoundaries:
 
         ir.assert_structural_equal(After, Expected)
 
-    def test_v2c_mx_scale_staging_preserves_fractal32_layouts(self):
-        """Vec->Mat MX scale staging must not be rewritten to ordinary Mat NZ.
-
-        LeftScale TMov_mx requires a row/row/32 Mat source. The A5 V2C fractal
-        adapter normally forces Mat NZ (col/row); MX staging views must be kept.
-        """
+    def test_rejects_e8m0_v2c_tpush(self):
+        """ExpandMixedKernel must reject FP8E8M0 V->C tpush; use GM + MX_A_ZZ load."""
 
         @pl.program
         class Before:
@@ -1396,34 +1392,8 @@ class TestCrossCoreBoundaries:
                 out_0 = pl.store(a_scale_2d, [0, 0], out_0)
                 return out_0
 
-        After = _expand_raw(Before)
-
-        def _walk(stmt):
-            if isinstance(stmt, ir.SeqStmts):
-                for child in stmt.stmts:
-                    yield from _walk(child)
-                return
-            if isinstance(stmt, ir.AssignStmt):
-                yield stmt
-
-        staging = []
-        for func in After.functions.values():
-            if func.func_type not in (pl.FunctionType.AIC, pl.FunctionType.AIV):
-                continue
-            for stmt in _walk(func.body):
-                tile_type = stmt.var.type
-                if not isinstance(tile_type, ir.TileType) or tile_type.dtype != pl.FP8E8M0:
-                    continue
-                view = tile_type.tile_view
-                if view is None or view.fractal != 32:
-                    continue
-                if tile_type.memory_space == pl.Mem.Mat or stmt.var.name_hint.endswith(("_nz", "_zn")):
-                    staging.append((stmt.var.name_hint, view.blayout, view.slayout, tile_type.memory_space))
-
-        assert staging, "expected MX scale Mat/tpush staging tiles after expand"
-        for name, blayout, slayout, _mem in staging:
-            assert blayout == pl.TileLayout.row_major, name
-            assert slayout == pl.TileLayout.row_major, name
+        with pytest.raises(ValueError, match=re.escape("ExpandMixedKernel rejects FP8E8M0 V->C")):
+            _expand_raw(Before)
 
     def test_v2c_boundary_direct_to_right_uses_nz_transfer_view(self):
         """Direct V->C move to Right must use an NZ bridge tile on Ascend950."""

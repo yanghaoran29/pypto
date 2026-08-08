@@ -542,6 +542,16 @@ def infer_tile_memory_space() -> Pass:
     consumed before the pass returns.
     """
 
+def split_large_k_mx_matmul() -> Pass:
+    """Split large-K ``matmul_mx`` family ops into K=64 chunks.
+
+    When ``tile.matmul_mx`` / ``_acc`` / ``_bias`` has static ``K > 64`` and
+    ``K % 64 == 0``, rewrites it into K=64 slices: first chunk ``matmul_mx``
+    (or ``matmul_mx_bias``), remaining chunks ``matmul_mx_acc``. Scale tiles
+    are sliced by ``ceil(64/32) = 2`` groups per chunk. Idempotent. Run after
+    ``infer_tile_memory_space`` and before ``insert_mx_scale_addr``.
+    """
+
 def insert_mx_scale_addr() -> Pass:
     """Insert ``tile.tget_scale_addr`` before MX matmul consumers.
 
@@ -603,13 +613,6 @@ def expand_mx_packed_quant() -> Pass:
     Handles ``MX_A_ZZ`` and ``MX_B_NN`` scale packing before
     :func:`lower_composite_ops`; the B layout also transposes the quantized
     values from ``[N, K]`` to ``[K, N]``.
-    """
-
-def legalize_mixed_mx_scale_via_gm() -> Pass:
-    """Route mixed-kernel MX E8M0 scales through GM instead of V2C.
-
-    Runs immediately after :func:`expand_mx_packed_quant`. Rewrites E8M0
-    ``tpush_to_aic`` / ``tpop_from_aiv`` into ``store`` + ``MX_A_ZZ`` ``load``.
     """
 
 def lower_composite_ops() -> Pass:
@@ -958,6 +961,7 @@ __all__ = [
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
+    "split_large_k_mx_matmul",
     "insert_mx_scale_addr",
     "materialize_tensor_strides",
     "resolve_backend_op_layouts",
@@ -968,7 +972,6 @@ __all__ = [
     "split_vector_kernel",
     "simplify",
     "expand_mx_packed_quant",
-    "legalize_mixed_mx_scale_via_gm",
     "lower_composite_ops",
     "materialize_dist_tensor_ctx",
     "flatten_call_expr",

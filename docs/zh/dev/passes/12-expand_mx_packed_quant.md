@@ -4,7 +4,7 @@
 
 ## 概述 (Overview)
 
-`ExpandMxPackedQuant` 是面向 InCore 函数的函数级 Pass。它只改写 `tile.tquant_mx(..., layout=MX_A_ZZ)` 和 `tile.tquant_mx(..., layout=MX_B_NN)`；不带 `layout` 的平铺调用留给 [`LowerCompositeOps`](14-lower_composite_ops.md)。不含紧凑 MX 量化的函数在结构上保持不变。
+`ExpandMxPackedQuant` 是面向 InCore 函数的函数级 Pass。它只改写 `tile.tquant_mx(..., layout=MX_A_ZZ)` 和 `tile.tquant_mx(..., layout=MX_B_NN)`；不带 `layout` 的平铺调用留给 [`LowerCompositeOps`](13-lower_composite_ops.md)。不含紧凑 MX 量化的函数在结构上保持不变。
 
 输入必须是静态二维 tile，第一维可被 16 整除，第二维可被 64 整除。每个 16×64 分块先 reshape 为 `[32, 32]`，再由平铺 `tile.tquant_mx` 量化，最后 reshape 回原形状。每个 scale group 对应 32 个输入值。
 
@@ -60,7 +60,8 @@ packed_quant = passes.expand_mx_packed_quant()
 
 ## 另请参阅 (See Also)
 
-- [`LegalizeMixedMxScaleViaGm`](13-legalize_mixed_mx_scale_via_gm.md) — mixed 路径把已打包的 A-scale 经 GM 交给 AIC。
-- [`LowerCompositeOps`](14-lower_composite_ops.md) — 把余下的平铺 `tile.tquant_mx` 下降为原始 destination 形式。
+- [`LowerCompositeOps`](13-lower_composite_ops.md) — 把余下的平铺 `tile.tquant_mx` 下降为原始 destination 形式。
 - [Tile 算子](../ir/05-operators.md) — 公开 MX 量化形状与 dtype 约定。
+- [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md) — 切分大 K 维 MX matmul。
 - [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) — 为后续 MX matmul 消费者物化 scale 地址。
+- [`ExpandMixedKernel`](23-expand_mixed_kernel.md) — 拒绝 `FP8E8M0` V2C；mixed kernel 须经 GM 暂存 MX A-scale。

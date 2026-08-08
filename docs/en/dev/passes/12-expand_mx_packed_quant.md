@@ -4,7 +4,7 @@ Expands packed `tile.tquant_mx` forms into the flat MX quantization operation su
 
 ## Overview
 
-`ExpandMxPackedQuant` is a function-level pass over InCore functions. It rewrites only `tile.tquant_mx(..., layout=MX_A_ZZ)` and `tile.tquant_mx(..., layout=MX_B_NN)` calls; flat calls without `layout` are left for [`LowerCompositeOps`](14-lower_composite_ops.md). Functions without packed MX quantization are structural no-ops.
+`ExpandMxPackedQuant` is a function-level pass over InCore functions. It rewrites only `tile.tquant_mx(..., layout=MX_A_ZZ)` and `tile.tquant_mx(..., layout=MX_B_NN)` calls; flat calls without `layout` are left for [`LowerCompositeOps`](13-lower_composite_ops.md). Functions without packed MX quantization are structural no-ops.
 
 The input must be a static two-dimensional tile whose first dimension is divisible by 16 and whose second dimension is divisible by 64. Each 16×64 box is reshaped to `[32, 32]`, quantized by a flat `tile.tquant_mx`, and reshaped back. Scale groups contain 32 source values.
 
@@ -60,7 +60,8 @@ packed_quant = passes.expand_mx_packed_quant()
 
 ## See Also
 
-- [`LegalizeMixedMxScaleViaGm`](13-legalize_mixed_mx_scale_via_gm.md) — on mixed kernels, routes the packed A-scale to AIC via GM.
-- [`LowerCompositeOps`](14-lower_composite_ops.md) — lowers the remaining flat `tile.tquant_mx` call to its raw destination form.
+- [`LowerCompositeOps`](13-lower_composite_ops.md) — lowers the remaining flat `tile.tquant_mx` call to its raw destination form.
 - [Tile Operators](../ir/05-operators.md) — public MX quantization shapes and dtype contract.
+- [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md) — chunks large-K MX matmul.
 - [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) — materializes scale addresses for later MX matmul consumers.
+- [`ExpandMixedKernel`](23-expand_mixed_kernel.md) — rejects `FP8E8M0` V2C; mixed kernels must stage MX A-scale via GM.

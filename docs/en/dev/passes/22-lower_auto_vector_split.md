@@ -8,7 +8,7 @@ halves only the **vector sub-region** along the split axis, injects
 
 This is the **live auto-split lowering path**: it always runs, immediately
 before `ExpandMixedKernel`. After it runs, every split function reaches
-[`SplitVectorKernel`](25-split_vector_kernel.md) already `split_aiv`-marked,
+[`SplitVectorKernel`](24-split_vector_kernel.md) already `split_aiv`-marked,
 so that pass only stamps attributes (its split_aiv arm) — its former per-op
 halving driver was deleted, and the halving machinery now lives solely in
 `split_axis_utils`, shared by this pass.
@@ -95,7 +95,7 @@ case the single function-level mode cannot. Region-local `tile_vars` /
 an out-of-region full-width op. Statements **outside** any region are emitted
 full-width. After all regions are lowered, the scope wrappers are dropped and the
 function is stamped `split_aiv` + `split_aiv_region_validated` (the latter signals
-[`ExpandMixedKernel`](23-expand_mixed_kernel.md) to skip its single-func-mode
+[`ExpandMixedKernel`](22-expand_mixed_kernel.md) to skip its single-func-mode
 transpose check — this pass validates each region's transpose hazard with the
 correct per-region split axis instead).
 
@@ -139,7 +139,7 @@ Three region body shapes are handled, selected by the region's `split_` mode:
   carries the lane). A `tile.aiv_shard` / `tile.aic_gather` inside a `None` region
   is rejected (nothing to shard without a split axis) — both by the `AivSplitValid`
   verifier and by an always-on guard here. The function is still stamped
-  `split_aiv`, so downstream [`ExpandMixedKernel`](23-expand_mixed_kernel.md) /
+  `split_aiv`, so downstream [`ExpandMixedKernel`](22-expand_mixed_kernel.md) /
   `SplitVectorKernel` dispatch it to **both** AIV lanes (via `dual_aiv_dispatch`)
   and **not** the lane-0-only no-split replay (which is only for non-`split_aiv`
   kernels) — so both lanes run the full body. Use this when the region's tiles
@@ -257,7 +257,7 @@ the region out of the enclosing scope.
 
 The guard is also what makes the `split_aiv_region_validated` stamp trustworthy:
 the attrs are written only once every region has actually been consumed, so
-[`ExpandMixedKernel`](23-expand_mixed_kernel.md) skipping its own func-mode check
+[`ExpandMixedKernel`](22-expand_mixed_kernel.md) skipping its own func-mode check
 on the strength of that stamp is always backed by a real per-region validation.
 Without it a scope-nested region passed through unlowered *and* un-validated
 while still being stamped "region validated", and the failure surfaced much later
@@ -464,10 +464,10 @@ end-to-end `pl.split` golden scenarios in
 
 ## Related
 
-- [`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md) — runs
+- [`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) — runs
   immediately before.
-- [`ExpandMixedKernel`](23-expand_mixed_kernel.md) — runs immediately after;
+- [`ExpandMixedKernel`](22-expand_mixed_kernel.md) — runs immediately after;
   folds `tile.aiv_shard` / `tile.aic_gather` into split-stamped `tpush`/`tpop`.
-- [`SplitVectorKernel`](25-split_vector_kernel.md) — downstream; only stamps
+- [`SplitVectorKernel`](24-split_vector_kernel.md) — downstream; only stamps
   attrs for the `split_aiv` functions this pass produces, plus the no-split
   dual-AIV path.

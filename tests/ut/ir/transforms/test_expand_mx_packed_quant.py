@@ -373,14 +373,8 @@ class TestExpandMxPackedQuant:
         assert unrelated.unique_id not in store_target_ids
         passes.run_verifier()(expanded)
 
-    def test_memory_reuse_is_bounded_by_pipe_all_drains(self):
-        """A/B packed quant may reuse buffers only after a real pipe drain.
-
-        PTO load/store/vector pipes execute asynchronously. The store-fused expansion
-        keeps each chunk's load, quant result, and scale alive through ``bar_all``.
-        MemoryReuse can then merge A into B after A's drain without merging buffers
-        that are still in flight inside either chunk.
-        """
+    def test_rejects_packed_quant_when_k_gt_64(self):
+        """ExpandMxPackedQuant requires kb==1 (K==64); large-K uses chunk quant."""
 
         @pl.program
         class Before:
@@ -388,19 +382,47 @@ class TestExpandMxPackedQuant:
             def kernel(
                 self,
                 a: pl.Tensor[[32, 128], pl.FP32],
-                b_nk: pl.Tensor[[64, 128], pl.FP32],
                 a_q_out: pl.Out[pl.Tensor[[32, 128], pl.FP8E4M3FN]],
                 a_s_out: pl.Out[pl.Tensor[[1, 128], pl.FP8E8M0]],
-                b_q_out: pl.Out[pl.Tensor[[128, 64], pl.FP8E4M3FN]],
-                b_s_out: pl.Out[pl.Tensor[[1, 256], pl.FP8E8M0]],
-            ) -> tuple[
-                pl.Tensor[[32, 128], pl.FP8E4M3FN],
-                pl.Tensor[[1, 128], pl.FP8E8M0],
-                pl.Tensor[[128, 64], pl.FP8E4M3FN],
-                pl.Tensor[[1, 256], pl.FP8E8M0],
-            ]:
+            ) -> tuple[pl.Tensor[[32, 128], pl.FP8E4M3FN], pl.Tensor[[1, 128], pl.FP8E8M0]]:
                 a_q, a_s = pl.quant_mx(pl.load(a, [0, 0], [32, 128]), layout=pl.MX_A_ZZ)
-                b_q, b_s = pl.quant_mx(pl.load(b_nk, [0, 0], [64, 128]), layout=pl.MX_B_NN)
+                a_q_out = pl.store(a_q, [0, 0], a_q_out)
+                a_s_out = pl.store(a_s, [0, 0], a_s_out)
+                return a_q_out, a_s_out
+
+        with pytest.raises(Exception, match=r"single K-box|K=64"):
+            _run_default_through(Before, "ExpandMxPackedQuant")
+
+    def test_memory_reuse_is_bounded_by_pipe_all_drains(self):
+        """A/B packed quant may reuse buffers only after a real pipe drain.
+
+        PTO load/store/vector pipes execute asynchronously. The store-fused expansion
+        keeps each chunk's load, quant result, and scale alive through ``bar_all``.
+        MemoryReuse can then merge A into B after A's drain without merging buffers
+        that are still in flight inside either chunk.
+
+        Shapes use K=64 (kb==1): Expand rejects multi-K-box packed quant.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[32, 64], pl.FP32],
+                b_nk: pl.Tensor[[64, 64], pl.FP32],
+                a_q_out: pl.Out[pl.Tensor[[32, 64], pl.FP8E4M3FN]],
+                a_s_out: pl.Out[pl.Tensor[[1, 64], pl.FP8E8M0]],
+                b_q_out: pl.Out[pl.Tensor[[64, 64], pl.FP8E4M3FN]],
+                b_s_out: pl.Out[pl.Tensor[[1, 128], pl.FP8E8M0]],
+            ) -> tuple[
+                pl.Tensor[[32, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 64], pl.FP8E8M0],
+                pl.Tensor[[64, 64], pl.FP8E4M3FN],
+                pl.Tensor[[1, 128], pl.FP8E8M0],
+            ]:
+                a_q, a_s = pl.quant_mx(pl.load(a, [0, 0], [32, 64]), layout=pl.MX_A_ZZ)
+                b_q, b_s = pl.quant_mx(pl.load(b_nk, [0, 0], [64, 64]), layout=pl.MX_B_NN)
                 a_q_out = pl.store(a_q, [0, 0], a_q_out)
                 a_s_out = pl.store(a_s, [0, 0], a_s_out)
                 b_q_out = pl.store(b_q, [0, 0], b_q_out)
@@ -417,29 +439,16 @@ class TestExpandMxPackedQuant:
             transpose_shapes,
         ) = _expanded_packing_ops(expanded)
 
-        # A is split into four [32, 32] source boxes and B into eight. Packed A
-        # stores four [16, 64] boxes directly; packed B is assembled in Vec and
-        # transposed once to its public [K, N] result layout.
-        assert source_load_shapes == [(16, 64)] * 12
+        # A: 2 M-boxes; B: 4 N-boxes; each box is [16,64] load + [32,32] flat quant.
+        assert source_load_shapes == [(16, 64)] * 6
         assert result_load_shapes == []
-        assert quant_shapes == [(32, 32)] * 12
-        assert data_offsets == Counter({(0, 0): 1, (0, 64): 1, (16, 0): 1, (16, 64): 1})
-        assert scale_offsets == Counter(
-            {
-                (0, 0): 2,
-                (0, 32): 2,
-                (0, 64): 2,
-                (0, 96): 2,
-                (0, 128): 1,
-                (0, 160): 1,
-                (0, 192): 1,
-                (0, 224): 1,
-            }
-        )
-        assert transpose_shapes == [(128, 64)]
+        assert quant_shapes == [(32, 32)] * 6
+        assert data_offsets == Counter({(0, 0): 1, (16, 0): 1})
+        assert scale_offsets == Counter({(0, 0): 2, (0, 32): 2, (0, 64): 1, (0, 96): 1})
+        assert transpose_shapes == [(64, 64)]
 
         _, expanded_barriers = _chunk_lifetime_stats(expanded)
-        # One drain for A's four-box chunk, one for B's eight-box chunk, and a
+        # One drain for A's two-box chunk, one for B's four-box chunk, and a
         # final drain for B's full-tile transpose/store.
         assert expanded_barriers == 3
 
@@ -448,7 +457,7 @@ class TestExpandMxPackedQuant:
 
         # Each live chunk has distinct load/data/scale buffers per box. Across
         # A's drain, B is allowed to reuse at least some of A's physical bases.
-        assert [len(group) for group in chunk_groups] == [4 * 3, 8 * 3, 0]
+        assert [len(group) for group in chunk_groups] == [2 * 3, 4 * 3, 0]
         assert chunk_groups[0] & chunk_groups[1]
         assert barrier_count == 3
 

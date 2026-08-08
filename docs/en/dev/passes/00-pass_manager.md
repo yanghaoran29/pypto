@@ -70,7 +70,6 @@ struct PassProperties {
 | OutlineClusterScopes | TypeChecked, SSAForm | ClusterOutlined | — |
 | ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
 | ExpandMxPackedQuant | — | — | — |
-| LegalizeMixedMxScaleViaGm | — | — | — |
 | LowerCompositeOps | — | — | — |
 | FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
 | LegalizeTileCast | — | — | — |
@@ -402,13 +401,13 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 The PTO-oriented tile stage of `Default` is:
 
 1. [`ExpandMxPackedQuant`](12-expand_mx_packed_quant.md)
-2. [`LegalizeMixedMxScaleViaGm`](13-legalize_mixed_mx_scale_via_gm.md)
-3. [`LowerCompositeOps`](14-lower_composite_ops.md)
-4. [`FlattenTileNdTo2D`](15-flatten_tile_nd_to_2d.md)
-5. [`LegalizeTileCast`](16-legalize_tile_cast.md) (expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt`)
-6. [`AutoTileMatmulL0`](17-auto_tile_matmul_l0.md)
-7. [`CanonicalizeTileSlice`](18-canonicalize_tile_slice.md)
-8. `InferTileMemorySpace`
+2. [`LowerCompositeOps`](13-lower_composite_ops.md)
+3. [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md)
+4. [`LegalizeTileCast`](15-legalize_tile_cast.md) (expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt`)
+5. [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)
+6. [`CanonicalizeTileSlice`](17-canonicalize_tile_slice.md)
+7. `InferTileMemorySpace`
+8. [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md) (splits static K>64 MX matmul into K=64 chunks so later scale-addr binds apply per chunk)
 9. [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) (Ascend950 MX path; inserts internal scale-address bindings after memory spaces are resolved)
 10. [`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md) (self-normalizes statement structure internally)
 11. [`LowerAutoVectorSplit`](22-lower_auto_vector_split.md) (live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form before ExpandMixedKernel)
@@ -440,7 +439,7 @@ The PTO-oriented tile stage of `Default` is:
 37. [`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
 38. [`InsertCommFence`](48-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
 
-[`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md) repairs
+[`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
 For the current PTO row-major elementwise ops, it rewrites `[N, 1]` vector
 operands into `[1, N] row_major` `tile.reshape` operations at the
@@ -448,7 +447,7 @@ constrained use site, where row-major is inferred from the target shape.
 It then reshapes the result back to the original vector shape when
 needed.
 
-[`NormalizeReturnOrder`](27-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
+[`NormalizeReturnOrder`](26-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
 `return[i]` corresponds to the i-th `Out`/`InOut` parameter in declaration order,
 and updates `TupleGetItemExpr` indices at call sites accordingly. This lets
 orchestration codegen map tuple element indices to output parameters with a

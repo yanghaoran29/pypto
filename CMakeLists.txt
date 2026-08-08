@@ -181,8 +181,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/flatten_call_expr_pass.cpp
     src/ir/transforms/infer_tile_memory_space_pass.cpp
     src/ir/transforms/insert_mx_scale_addr_pass.cpp
+    src/ir/transforms/split_large_k_mx_matmul_pass.cpp
     src/ir/transforms/expand_mx_packed_quant_pass.cpp
-    src/ir/transforms/legalize_mixed_mx_scale_via_gm_pass.cpp
     src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp

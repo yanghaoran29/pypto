@@ -24,7 +24,7 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 ## 运行时机 (When It Runs)
 
-`LowerCompositeOps` 是 `Default` 流水线 `tile_pto_passes` 的**第三个 Pass**，也是编号第 14 的 Pass（见 `python/pypto/ir/pass_manager.py`）。它紧跟 [`LegalizeMixedMxScaleViaGm`](13-legalize_mixed_mx_scale_via_gm.md)（后者又紧跟 [`ExpandMxPackedQuant`](12-expand_mx_packed_quant.md)），并位于 `FlattenTileNdTo2D` 之前。此时所有 tensor 级三角调用 (`tensor.sin`、`tensor.cos`) 已经被转换注册表 (conversion registry) 改写成 tile 等价物 (`tile.sin`、`tile.cos`)，紧凑 MX 量化也已展开为平铺 `tile.tquant_mx`。在 `FlattenTileNdTo2D` 之前完成三角函数降级，可以让本 Pass 与 2D 展平规则解耦——展开生成的所有基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）在任意 rank 下都有定义良好的语义。
+`LowerCompositeOps` 是 `Default` 流水线 `tile_pto_passes` 的**第二个 Pass**，也是编号第 13 的 Pass（见 `python/pypto/ir/pass_manager.py`）。它紧跟 [`ExpandMxPackedQuant`](12-expand_mx_packed_quant.md)，并位于 `FlattenTileNdTo2D` 之前。此时所有 tensor 级三角调用 (`tensor.sin`、`tensor.cos`) 已经被转换注册表 (conversion registry) 改写成 tile 等价物 (`tile.sin`、`tile.cos`)，紧凑 MX 量化也已展开为平铺 `tile.tquant_mx`。在 `FlattenTileNdTo2D` 之前完成三角函数降级，可以让本 Pass 与 2D 展平规则解耦——展开生成的所有基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）在任意 rank 下都有定义良好的语义。
 
 更早的公共流水线已经执行 `FlattenCallExpr`，因此在 `tile.tquant_mx` 降级前，tuple consumer 已稳定为 `element = TupleGetItem(tuple_var, index)` 形态。
 

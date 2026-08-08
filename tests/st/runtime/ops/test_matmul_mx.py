@@ -24,24 +24,27 @@ from pypto.runtime.runner import RunConfig
 _MIX_DIAG_MODE = os.environ.get("MIX_DIAG_MODE", "").strip().lower()
 
 M, K, N = 16, 64, 32
-MIX_M, MIX_K, MIX_N = 32, 1024, N
-MIX_K_CHUNK = 256
+MIX_M, MIX_K, MIX_N = 32, 128, N
+MIX_K_CHUNK = 64
 MIX_K_CHUNKS = MIX_K // MIX_K_CHUNK
 # Multi-box shapes: A-scale [32, 4] = 2x2 [16, 2] boxes; B-scale [4, 64] = 2x4
 # [2, 16] boxes. Packing is no longer a byte-identity for these tensors.
-MB_M, MB_K, MB_N = 32, 128, 64
-BIG_M, BIG_K, BIG_N = MB_M, MB_K, MB_N
+MB_M, MB_K, MB_N = 32, 64, 64
+# layout-ab uses single K-box packed quant (ExpandMxPackedQuant kb==1).
+# Host-packed multi-box scales stay on MB_* via matmul_mx_multibox.
+LAYOUT_M, LAYOUT_K, LAYOUT_N = 32, 64, 64
 MX_GROUP_SIZE = 32
 SCALE_BLOCK_SIZE = 16
 SCALE_C0_SIZE = 2
 MIX_DATA_SLOT_SIZE = MIX_M * MIX_K_CHUNK
 # Per-chunk packed A-scale from quant_mx(MX_A_ZZ): [1, M*K_chunk/32] via GM.
 MIX_SCALE_ELEMS = MIX_M * MIX_K_CHUNK // MX_GROUP_SIZE
-MIX_SCALE_TOTAL = MIX_M * MIX_K // MX_GROUP_SIZE
+# Per-chunk packed scales live in rows of [MIX_K_CHUNKS, MIX_SCALE_ELEMS]
+# (concat into [1, M*K/32] is NOT full MX_A_ZZ — see Phase0).
 MIX_PIPE_DEPTH = MIX_K_CHUNKS
 MIX_DATA_BUFFER_SIZE = MIX_DATA_SLOT_SIZE * MIX_PIPE_DEPTH
-BIG_G = BIG_M * BIG_K // MX_GROUP_SIZE
-BIG_BG = (BIG_K // MX_GROUP_SIZE) * BIG_N
+LAYOUT_G = LAYOUT_M * LAYOUT_K // MX_GROUP_SIZE
+LAYOUT_BG = (LAYOUT_K // MX_GROUP_SIZE) * LAYOUT_N
 
 
 def _pack_a_scale(scale_codes: torch.Tensor) -> torch.Tensor:
@@ -145,14 +148,10 @@ def _fp32_atom_transpose_1x256(flat_u8: torch.Tensor) -> torch.Tensor:
 def _v2c_scale_group_src_index(m: int = MIX_M, g_chunk: int = MIX_K_CHUNK // MX_GROUP_SIZE) -> torch.Tensor:
     """Per-chunk logical scale index map if V2C applies FP32-atom T and LeftScale unpacks ZZ.
 
-    ``src[m, g]`` is the flat id ``m_src * g_chunk + g_src`` that must sit at
-    ``quant_mx`` logical ``(m, g)`` so that after ``fp32_T(pack(.))`` + ZZ unpack,
-    Cube sees identity scales for the *true* layout. Use with
-    :func:`_gather_a_mx_groups` on the tensor fed to ``quant_mx``, and scatter
-    ``a_q`` back — scale-only input reorder desyncs FP8 data (data path has no
-    FP32-atom T). Prefer cancel-transpose on the ``[1, 256]`` send instead.
+    Legacy helper from the V2C-scale experiments; only defined for the old
+    ``MIX_K_CHUNK=256`` geometry (``g_chunk==8``).
     """
-    assert g_chunk == 8 and m == 32
+    assert g_chunk == 8 and m == 32, "V2C scale remap helper only supports MIX_K_CHUNK=256"
     ids = torch.arange(m * g_chunk, dtype=torch.int64).reshape(m, g_chunk)
     packed = _pack_a_scale(ids)
     return _unpack_a_scale(
@@ -238,7 +237,9 @@ def _diag_unique_probe_matrix(rows: int, cols: int) -> tuple[torch.Tensor, torch
     :func:`_diag_group_select_b`: ``out[m,g] = 32 * 2**(code_used-127)``.
     """
     g_chunk = MIX_K_CHUNK // MX_GROUP_SIZE
-    assert rows == MIX_M and g_chunk == 8
+    # Probe modes were written for MIX_K_CHUNK=256 (8 groups); keep that geometry.
+    assert rows == MIX_M
+    assert g_chunk >= 2
     codes_chunk = torch.zeros((rows, g_chunk), dtype=torch.int64)
     a = torch.zeros((rows, cols), dtype=torch.float32)
     for m in range(8):
@@ -405,21 +406,27 @@ def quantized_matmul_mx_onboard(
 
 @pl.program
 class QuantizedMatmulMxMixedProgram:
-    """Explicit A5 mixed kernel: FP8 data on V2C; A-scale via GM (packed ZZ).
+    """Explicit A5 mixed kernel: FP8 data on V2C; A-scale via per-chunk GM.
 
-    Orchestration materializes the full A packed ZZ scale once (same shape as
-    onboard), then the Group only ships FP8 data over V2C while AIC loads
-    per-chunk LeftScale from that GM buffer via ``MX_A_ZZ``.
+    ``MIX_K=128`` / ``MIX_K_CHUNK=64`` (2 chunks). Each chunk has its own
+    packed ZZ scale tensor viewed as ``MX_A_ZZ`` ``[M, 2]`` (Phase0-C).
     """
 
     @pl.function(type=pl.FunctionType.AIV)
     def prefetch_a_scales(
         self,
         a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
-        a_s_gm: pl.Out[pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0]],
-    ) -> pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0]:
-        _quant, scale = pl.quant_mx(pl.load(a, [0, 0], [MIX_M, MIX_K]), layout=pl.MX_A_ZZ)
-        return pl.store(scale, [0, 0], a_s_gm)
+        a_s0_gm: pl.Out[pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0]],
+        a_s1_gm: pl.Out[pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0]],
+    ):
+        _q0, s0 = pl.quant_mx(pl.load(a, [0, 0], [MIX_M, MIX_K_CHUNK]), layout=pl.MX_A_ZZ)
+        _q1, s1 = pl.quant_mx(
+            pl.load(a, [0, MIX_K_CHUNK], [MIX_M, MIX_K_CHUNK]),
+            layout=pl.MX_A_ZZ,
+        )
+        a_s0_gm = pl.store(s0, [0, 0], a_s0_gm)
+        a_s1_gm = pl.store(s1, [0, 0], a_s1_gm)
+        return a_s0_gm, a_s1_gm
 
     @pl.function(type=pl.FunctionType.AIV)
     def vector_quantize(
@@ -427,7 +434,8 @@ class QuantizedMatmulMxMixedProgram:
         a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
         b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
         b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
-        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        a_s0_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
+        a_s1_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
         out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
     ):
         data_peer = pl.import_peer_buffer(name="v2c_mx_data_slot", peer_func="cube_matmul")
@@ -458,7 +466,8 @@ class QuantizedMatmulMxMixedProgram:
         a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
         b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
         b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
-        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        a_s0_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
+        a_s1_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
         out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
     ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
         data_slot = pl.reserve_buffer(
@@ -473,23 +482,10 @@ class QuantizedMatmulMxMixedProgram:
             slot_size=MIX_DATA_SLOT_SIZE,
             id=0,
         )
-        b_scale_mx = pl.tensor.view(
-            b_scale,
-            [MIX_K_CHUNK // MX_GROUP_SIZE, MIX_N],
-            layout=pl.MX_B_NN,
-        )
-        rhs_scale_mat = pl.load(
-            b_scale_mx,
-            [0, 0],
-            [MIX_K_CHUNK // MX_GROUP_SIZE, MIX_N],
-            target_memory=pl.Mem.Mat,
-        )
-        rhs_scale = pl.move(rhs_scale_mat, target_memory=pl.Mem.RightScale)
-        a_s_mx = pl.tensor.view(
-            a_s_gm,
-            [MIX_M, MIX_K // MX_GROUP_SIZE],
-            layout=pl.MX_A_ZZ,
-        )
+        g_chunk = MIX_K_CHUNK // MX_GROUP_SIZE
+        b_scale_mx = pl.tensor.view(b_scale, [g_chunk, MIX_N], layout=pl.MX_B_NN)
+        a_s0 = pl.tensor.view(a_s0_gm, [MIX_M, g_chunk], layout=pl.MX_A_ZZ)
+        a_s1 = pl.tensor.view(a_s1_gm, [MIX_M, g_chunk], layout=pl.MX_A_ZZ)
 
         data_mat: pl.Tile[
             [MIX_M, MIX_K_CHUNK],
@@ -502,10 +498,7 @@ class QuantizedMatmulMxMixedProgram:
             ),
         ] = pl.tpop_from_aiv(split=0, id=0)
         scale_mat = pl.load(
-            a_s_mx,
-            [0, 0],
-            [MIX_M, MIX_K_CHUNK // MX_GROUP_SIZE],
-            target_memory=pl.Mem.Mat,
+            a_s0, [0, 0], [MIX_M, g_chunk], target_memory=pl.Mem.Mat
         )
         lhs = pl.move(data_mat, target_memory=pl.Mem.Left)
         lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
@@ -514,11 +507,18 @@ class QuantizedMatmulMxMixedProgram:
             pl.load(b, [0, 0], [MIX_K_CHUNK, MIX_N], target_memory=pl.Mem.Mat),
             target_memory=pl.Mem.Right,
         )
+        # Reload RightScale immediately before each matmul: address reuse can
+        # otherwise sink a hoisted move past InsertMxScaleAddr's tget_scale_addr.
+        rhs_scale = pl.move(
+            pl.load(b_scale_mx, [0, 0], [g_chunk, MIX_N], target_memory=pl.Mem.Mat),
+            target_memory=pl.Mem.RightScale,
+        )
         acc = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
 
+        # MIX_K=128 → one acc iteration; a_s1 is the second independent ZZ pack
+        # (Phase0-C: not a concat into a full MX_A_ZZ view).
         for chunk, (acc_iter,) in pl.range(1, MIX_K_CHUNKS, init_values=(acc,)):
             k_offset = chunk * MIX_K_CHUNK
-            g_offset = chunk * (MIX_K_CHUNK // MX_GROUP_SIZE)
             data_mat: pl.Tile[
                 [MIX_M, MIX_K_CHUNK],
                 pl.FP8E4M3FN,
@@ -530,17 +530,22 @@ class QuantizedMatmulMxMixedProgram:
                 ),
             ] = pl.tpop_from_aiv(split=0, id=0)
             scale_mat = pl.load(
-                a_s_mx,
-                [0, g_offset],
-                [MIX_M, MIX_K_CHUNK // MX_GROUP_SIZE],
-                target_memory=pl.Mem.Mat,
+                a_s1, [0, 0], [MIX_M, g_chunk], target_memory=pl.Mem.Mat
             )
             lhs = pl.move(data_mat, target_memory=pl.Mem.Left)
             lhs_scale = pl.move(scale_mat, target_memory=pl.Mem.LeftScale)
             pl.tfree_to_aiv(data_mat, id=0)
             rhs = pl.move(
-                pl.load(b, [k_offset, 0], [MIX_K_CHUNK, MIX_N], target_memory=pl.Mem.Mat),
+                pl.load(
+                    b, [k_offset, 0], [MIX_K_CHUNK, MIX_N], target_memory=pl.Mem.Mat
+                ),
                 target_memory=pl.Mem.Right,
+            )
+            rhs_scale = pl.move(
+                pl.load(
+                    b_scale_mx, [0, 0], [g_chunk, MIX_N], target_memory=pl.Mem.Mat
+                ),
+                target_memory=pl.Mem.RightScale,
             )
             updated = pl.matmul_mx_acc(acc_iter, lhs, lhs_scale, rhs, rhs_scale)
             result = pl.yield_(updated)
@@ -552,11 +557,12 @@ class QuantizedMatmulMxMixedProgram:
         a: pl.Tensor[[MIX_M, MIX_K], pl.FP32],
         b: pl.Tensor[[MIX_K, MIX_N], pl.FP8E4M3FN],
         b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
-        a_s_gm: pl.Tensor[[1, MIX_SCALE_TOTAL], pl.FP8E8M0],
+        a_s0_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
+        a_s1_gm: pl.Tensor[[1, MIX_SCALE_ELEMS], pl.FP8E8M0],
         out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
     ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
-        self.vector_quantize(a, b, b_scale, a_s_gm, out)
-        return self.cube_matmul(a, b, b_scale, a_s_gm, out)
+        self.vector_quantize(a, b, b_scale, a_s0_gm, a_s1_gm, out)
+        return self.cube_matmul(a, b, b_scale, a_s0_gm, a_s1_gm, out)
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(
@@ -566,24 +572,25 @@ class QuantizedMatmulMxMixedProgram:
         b_scale: pl.Tensor[[1, MIX_K_CHUNK // MX_GROUP_SIZE * MIX_N], pl.FP8E8M0],
         out: pl.Out[pl.Tensor[[MIX_M, MIX_N], pl.FP32]],
     ) -> pl.Tensor[[MIX_M, MIX_N], pl.FP32]:
-        a_s_gm = pl.create_tensor([1, MIX_SCALE_TOTAL], dtype=pl.FP8E8M0)
-        a_s_gm = self.prefetch_a_scales(a, a_s_gm)
-        return self.group_func(a, b, b_scale, a_s_gm, out)
+        a_s0_gm = pl.create_tensor([1, MIX_SCALE_ELEMS], dtype=pl.FP8E8M0)
+        a_s1_gm = pl.create_tensor([1, MIX_SCALE_ELEMS], dtype=pl.FP8E8M0)
+        a_s0_gm, a_s1_gm = self.prefetch_a_scales(a, a_s0_gm, a_s1_gm)
+        return self.group_func(a, b, b_scale, a_s0_gm, a_s1_gm, out)
 
 
 
 @pl.jit.incore
 def _quantized_matmul_mx_layout_quant_ab(
-    a: pl.Tensor[[BIG_M, BIG_K], pl.FP32],
-    b_nk: pl.Tensor[[BIG_N, BIG_K], pl.FP32],
-    a_q_gm: pl.Out[pl.Tensor[[BIG_M, BIG_K], pl.FP8E4M3FN]],
-    a_s_gm: pl.Out[pl.Tensor[[1, BIG_G], pl.FP8E8M0]],
-    b_q_gm: pl.Out[pl.Tensor[[BIG_K, BIG_N], pl.FP8E4M3FN]],
-    b_s_gm: pl.Out[pl.Tensor[[1, BIG_BG], pl.FP8E8M0]],
+    a: pl.Tensor[[LAYOUT_M, LAYOUT_K], pl.FP32],
+    b_nk: pl.Tensor[[LAYOUT_N, LAYOUT_K], pl.FP32],
+    a_q_gm: pl.Out[pl.Tensor[[LAYOUT_M, LAYOUT_K], pl.FP8E4M3FN]],
+    a_s_gm: pl.Out[pl.Tensor[[1, LAYOUT_G], pl.FP8E8M0]],
+    b_q_gm: pl.Out[pl.Tensor[[LAYOUT_K, LAYOUT_N], pl.FP8E4M3FN]],
+    b_s_gm: pl.Out[pl.Tensor[[1, LAYOUT_BG], pl.FP8E8M0]],
 ):
-    """Quantize multi-box A and B through the two public packed layouts."""
-    a_q, a_s = pl.quant_mx(pl.load(a, [0, 0], [BIG_M, BIG_K]), layout=pl.MX_A_ZZ)
-    b_q, b_s = pl.quant_mx(pl.load(b_nk, [0, 0], [BIG_N, BIG_K]), layout=pl.MX_B_NN)
+    """Quantize single-K-box A and B through the two public packed layouts."""
+    a_q, a_s = pl.quant_mx(pl.load(a, [0, 0], [LAYOUT_M, LAYOUT_K]), layout=pl.MX_A_ZZ)
+    b_q, b_s = pl.quant_mx(pl.load(b_nk, [0, 0], [LAYOUT_N, LAYOUT_K]), layout=pl.MX_B_NN)
     a_q_gm = pl.store(a_q, [0, 0], a_q_gm)
     a_s_gm = pl.store(a_s, [0, 0], a_s_gm)
     b_q_gm = pl.store(b_q, [0, 0], b_q_gm)
@@ -593,30 +600,30 @@ def _quantized_matmul_mx_layout_quant_ab(
 
 @pl.jit.incore
 def _quantized_matmul_mx_layout_mm(
-    a_q_gm: pl.Tensor[[BIG_M, BIG_K], pl.FP8E4M3FN],
-    a_s_gm: pl.Tensor[[1, BIG_G], pl.FP8E8M0],
-    b_q_gm: pl.Tensor[[BIG_K, BIG_N], pl.FP8E4M3FN],
-    b_s_gm: pl.Tensor[[1, BIG_BG], pl.FP8E8M0],
-    out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
-    out_acc: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+    a_q_gm: pl.Tensor[[LAYOUT_M, LAYOUT_K], pl.FP8E4M3FN],
+    a_s_gm: pl.Tensor[[1, LAYOUT_G], pl.FP8E8M0],
+    b_q_gm: pl.Tensor[[LAYOUT_K, LAYOUT_N], pl.FP8E4M3FN],
+    b_s_gm: pl.Tensor[[1, LAYOUT_BG], pl.FP8E8M0],
+    out: pl.Out[pl.Tensor[[LAYOUT_M, LAYOUT_N], pl.FP32]],
+    out_acc: pl.Out[pl.Tensor[[LAYOUT_M, LAYOUT_N], pl.FP32]],
 ):
     """Cube ``matmul_mx`` + ``matmul_mx_acc`` over continuous ZZ/NN scales."""
-    a_s_mx = pl.tensor.view(a_s_gm, [BIG_M, BIG_K // MX_GROUP_SIZE], layout=pl.MX_A_ZZ)
-    b_s_mx = pl.tensor.view(b_s_gm, [BIG_K // MX_GROUP_SIZE, BIG_N], layout=pl.MX_B_NN)
+    a_s_mx = pl.tensor.view(a_s_gm, [LAYOUT_M, LAYOUT_K // MX_GROUP_SIZE], layout=pl.MX_A_ZZ)
+    b_s_mx = pl.tensor.view(b_s_gm, [LAYOUT_K // MX_GROUP_SIZE, LAYOUT_N], layout=pl.MX_B_NN)
     lhs = pl.move(
-        pl.load(a_q_gm, [0, 0], [BIG_M, BIG_K], target_memory=pl.Mem.Mat),
+        pl.load(a_q_gm, [0, 0], [LAYOUT_M, LAYOUT_K], target_memory=pl.Mem.Mat),
         target_memory=pl.Mem.Left,
     )
     lhs_scale = pl.move(
-        pl.load(a_s_mx, [0, 0], [BIG_M, BIG_K // MX_GROUP_SIZE], target_memory=pl.Mem.Mat),
+        pl.load(a_s_mx, [0, 0], [LAYOUT_M, LAYOUT_K // MX_GROUP_SIZE], target_memory=pl.Mem.Mat),
         target_memory=pl.Mem.LeftScale,
     )
     rhs = pl.move(
-        pl.load(b_q_gm, [0, 0], [BIG_K, BIG_N], target_memory=pl.Mem.Mat),
+        pl.load(b_q_gm, [0, 0], [LAYOUT_K, LAYOUT_N], target_memory=pl.Mem.Mat),
         target_memory=pl.Mem.Right,
     )
     rhs_scale = pl.move(
-        pl.load(b_s_mx, [0, 0], [BIG_K // MX_GROUP_SIZE, BIG_N], target_memory=pl.Mem.Mat),
+        pl.load(b_s_mx, [0, 0], [LAYOUT_K // MX_GROUP_SIZE, LAYOUT_N], target_memory=pl.Mem.Mat),
         target_memory=pl.Mem.RightScale,
     )
     base = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
@@ -628,16 +635,16 @@ def _quantized_matmul_mx_layout_mm(
 
 @pl.jit
 def quantized_matmul_mx_layout_ab_onboard(
-    a: pl.Tensor[[BIG_M, BIG_K], pl.FP32],
-    b_nk: pl.Tensor[[BIG_N, BIG_K], pl.FP32],
-    out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
-    out_acc: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+    a: pl.Tensor[[LAYOUT_M, LAYOUT_K], pl.FP32],
+    b_nk: pl.Tensor[[LAYOUT_N, LAYOUT_K], pl.FP32],
+    out: pl.Out[pl.Tensor[[LAYOUT_M, LAYOUT_N], pl.FP32]],
+    out_acc: pl.Out[pl.Tensor[[LAYOUT_M, LAYOUT_N], pl.FP32]],
 ):
-    """Public multi-box A/B quantization followed by MX matmul and accumulation."""
-    a_q_gm = pl.create_tensor([BIG_M, BIG_K], dtype=pl.FP8E4M3FN)
-    a_s_gm = pl.create_tensor([1, BIG_G], dtype=pl.FP8E8M0)
-    b_q_gm = pl.create_tensor([BIG_K, BIG_N], dtype=pl.FP8E4M3FN)
-    b_s_gm = pl.create_tensor([1, BIG_BG], dtype=pl.FP8E8M0)
+    """Public single-K-box A/B quantization followed by MX matmul and accumulation."""
+    a_q_gm = pl.create_tensor([LAYOUT_M, LAYOUT_K], dtype=pl.FP8E4M3FN)
+    a_s_gm = pl.create_tensor([1, LAYOUT_G], dtype=pl.FP8E8M0)
+    b_q_gm = pl.create_tensor([LAYOUT_K, LAYOUT_N], dtype=pl.FP8E4M3FN)
+    b_s_gm = pl.create_tensor([1, LAYOUT_BG], dtype=pl.FP8E8M0)
     a_q_gm, a_s_gm, b_q_gm, b_s_gm = _quantized_matmul_mx_layout_quant_ab(
         a, b_nk, a_q_gm, a_s_gm, b_q_gm, b_s_gm
     )
@@ -745,7 +752,7 @@ class TestMatmulMxMultibox(TestMatmulMx):
     entry = matmul_mx_multibox_onboard
 
     def get_name(self) -> str:
-        return "matmul_mx_multibox_32x128x64"
+        return "matmul_mx_multibox_32x64x64"
 
     def define_tensors(self) -> list[TensorSpec]:
         generator = torch.Generator().manual_seed(23)
@@ -826,7 +833,7 @@ class TestQuantizedMatmulMxMixedKernel(TestQuantizedMatmulMx):
         return QuantizedMatmulMxMixedProgram
 
     def get_name(self) -> str:
-        return "quantized_matmul_mx_mixed_32x1024x32"
+        return "quantized_matmul_mx_mixed_32x128x32"
 
     def define_tensors(self) -> list[TensorSpec]:
         # B-scale stays unit (127); A-scales come from on-chip quant_mx and must vary.
@@ -888,21 +895,24 @@ class TestQuantizedMatmulMxLayoutAB(_JitMxTestCase):
         super().__init__(RunConfig(rtol=1e-5, atol=1e-3), platform=platform)
 
     def get_name(self) -> str:
-        return "quantized_matmul_mx_layout_ab_32x128x64"
+        return "quantized_matmul_mx_layout_ab_32x64x64"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
             TensorSpec(
-                "a", [BIG_M, BIG_K], DataType.FP32, init_value=_exact_quantizable_matrix(BIG_M, BIG_K)
+                "a",
+                [LAYOUT_M, LAYOUT_K],
+                DataType.FP32,
+                init_value=_exact_quantizable_matrix(LAYOUT_M, LAYOUT_K),
             ),
             TensorSpec(
                 "b_nk",
-                [BIG_N, BIG_K],
+                [LAYOUT_N, LAYOUT_K],
                 DataType.FP32,
-                init_value=_exact_quantizable_matrix(BIG_N, BIG_K, transpose_pattern=True),
+                init_value=_exact_quantizable_matrix(LAYOUT_N, LAYOUT_K, transpose_pattern=True),
             ),
-            TensorSpec("out", [BIG_M, BIG_N], DataType.FP32, is_output=True),
-            TensorSpec("out_acc", [BIG_M, BIG_N], DataType.FP32, is_output=True),
+            TensorSpec("out", [LAYOUT_M, LAYOUT_N], DataType.FP32, is_output=True),
+            TensorSpec("out_acc", [LAYOUT_M, LAYOUT_N], DataType.FP32, is_output=True),
         ]
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:

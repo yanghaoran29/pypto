@@ -18,6 +18,12 @@
  * source ``tile.load``, then per-box ``tile.load`` + flat ``tquant_mx`` +
  * ``tile.store`` into the consumer GM buffers. Vec ``slice``/``assemble`` packing
  * is only a fallback when stores are not visible and is less reliable on A5.
+ *
+ * Packed layout quant accepts only a single K-box (``kb == 1``, i.e. ``K == 64``).
+ * Phase0 showed that concatenating per-chunk packed scales is not byte-identical
+ * to a full-K MX_A_ZZ pack, so multi-K-box expand is not a safe substitute for
+ * large-K matmul. Use per-chunk ``quant_mx(K=64)`` plus ``SplitLargeKMxMatmul``
+ * (or an explicit ``matmul_mx`` / ``matmul_mx_acc`` chain) for K>64.
  */
 
 #include <any>
@@ -315,26 +321,21 @@ FusedStoreReplacement MakeFusedStoreReplacement(const ExprPtr& tensor_result) { 
 ExpansionResult ExpandMxAZzStoreFused(const ResolvedTileLoad& ld, int64_t m, int64_t k,
                                       const StoreSite& q_store, const StoreSite& s_store, ExpandBuilder& b,
                                       const Span& span) {
+  // kb==1 only (enforced by CheckPackShape): M-box loop, linear scale columns.
+  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_A_ZZ expand requires K=" << kMxPackTileK;
   const int64_t mb = m / kMxPackTileM;
-  const int64_t kb = k / kMxPackTileK;
   ExprPtr q_t = q_store.tensor;
   ExprPtr s_t = s_store.tensor;
   std::vector<ExprPtr> chunk_tiles;
-  const int64_t box_count = mb * kb;
-  int64_t boxes_done = 0;
   for (int64_t mi = 0; mi < mb; ++mi) {
-    for (int64_t ki = 0; ki < kb; ++ki) {
-      auto box = LoadBox(ld, mi * kMxPackTileM, ki * kMxPackTileK, b, span);
-      auto qq = QuantizeBox(box, b, span);
-      chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
-      q_t = StoreTile(qq.q_mk, q_store.row0 + mi * kMxPackTileM, q_store.col0 + ki * kMxPackTileK, q_t, b,
-                      span);
-      s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + (mi * kb + ki) * kMxPackBoxRows, s_t, b, span);
-      ++boxes_done;
-      if (boxes_done % kMxPackReuseChunkBoxes == 0 || boxes_done == box_count) {
-        b.DrainChunk(chunk_tiles, span);
-        chunk_tiles.clear();
-      }
+    auto box = LoadBox(ld, mi * kMxPackTileM, 0, b, span);
+    auto qq = QuantizeBox(box, b, span);
+    chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
+    q_t = StoreTile(qq.q_mk, q_store.row0 + mi * kMxPackTileM, q_store.col0, q_t, b, span);
+    s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + mi * kMxPackBoxRows, s_t, b, span);
+    if ((mi + 1) % kMxPackReuseChunkBoxes == 0 || mi + 1 == mb) {
+      b.DrainChunk(chunk_tiles, span);
+      chunk_tiles.clear();
     }
   }
   return {nullptr, nullptr, q_t, s_t};
@@ -344,8 +345,8 @@ ExpansionResult ExpandMxBNnStoreFused(const ResolvedTileLoad& ld, int64_t n, int
                                       const StoreSite& q_store, const StoreSite& s_store, ExpandBuilder& b,
                                       const Span& span) {
   auto& reg = OpRegistry::GetInstance();
+  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_B_NN expand requires K=" << kMxPackTileK;
   const int64_t nb = n / kMxPackTileM;
-  const int64_t kb = k / kMxPackTileK;
 
   // The [N,K] transpose input is compiler-owned temporary storage.  Reusing a
   // shape-compatible Out/InOut parameter would silently overwrite user data.
@@ -368,24 +369,18 @@ ExpansionResult ExpandMxBNnStoreFused(const ResolvedTileLoad& ld, int64_t n, int
 
   ExprPtr s_t = s_store.tensor;
   std::vector<ExprPtr> chunk_tiles;
-  const int64_t box_count = nb * kb;
-  int64_t boxes_done = 0;
   for (int64_t ni = 0; ni < nb; ++ni) {
-    for (int64_t ki = 0; ki < kb; ++ki) {
-      auto box = LoadBox(ld, ni * kMxPackTileM, ki * kMxPackTileK, b, span);
-      auto qq = QuantizeBox(box, b, span);
-      chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
-      nk_t = b.Bind(
-          "nk_q",
-          reg.Create("tile.assemble", {nk_t, qq.q_mk, MakeShape2(ni * kMxPackTileM, ki * kMxPackTileK, span)},
-                     {}, span),
-          span);
-      s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + (ni * kb + ki) * kMxPackBoxRows, s_t, b, span);
-      ++boxes_done;
-      if (boxes_done % kMxPackReuseChunkBoxes == 0 || boxes_done == box_count) {
-        b.DrainChunk(chunk_tiles, span);
-        chunk_tiles.clear();
-      }
+    auto box = LoadBox(ld, ni * kMxPackTileM, 0, b, span);
+    auto qq = QuantizeBox(box, b, span);
+    chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
+    nk_t = b.Bind(
+        "nk_q",
+        reg.Create("tile.assemble", {nk_t, qq.q_mk, MakeShape2(ni * kMxPackTileM, 0, span)}, {}, span),
+        span);
+    s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + ni * kMxPackBoxRows, s_t, b, span);
+    if ((ni + 1) % kMxPackReuseChunkBoxes == 0 || ni + 1 == nb) {
+      b.DrainChunk(chunk_tiles, span);
+      chunk_tiles.clear();
     }
   }
 
@@ -405,33 +400,29 @@ ExpansionResult ExpandMxBNnStoreFused(const ResolvedTileLoad& ld, int64_t n, int
 std::pair<ExprPtr, ExprPtr> ExpandMxAZzAssemble(const ExprPtr& src, const std::optional<ResolvedTileLoad>& ld,
                                                 int64_t m, int64_t k, ExpandBuilder& b, const Span& span) {
   auto& reg = OpRegistry::GetInstance();
+  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_A_ZZ assemble requires K=" << kMxPackTileK;
   const int64_t mb = m / kMxPackTileM;
-  const int64_t kb = k / kMxPackTileK;
   const int64_t groups = m * k / kMxPackGroup;
 
   auto q_u8 = CreatePlainU8Buffer(b, m, k, "q_u8", span);
   auto s_u8 = CreateMxScaleU8Buffer(b, groups, span);
 
   for (int64_t mi = 0; mi < mb; ++mi) {
-    for (int64_t ki = 0; ki < kb; ++ki) {
-      ExprPtr box = ld ? LoadBox(*ld, mi * kMxPackTileM, ki * kMxPackTileK, b, span)
-                       : SliceBox(src, mi * kMxPackTileM, ki * kMxPackTileK, b, span);
-      auto qq = QuantizeBox(box, b, span);
-      auto q_mk_u8 = b.Bind(
-          "qmk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
-      q_u8 = b.Bind(
-          "q_u8",
-          reg.Create("tile.assemble", {q_u8, q_mk_u8, MakeShape2(mi * kMxPackTileM, ki * kMxPackTileK, span)},
-                     {}, span),
-          span);
-      auto s_box_u8 = b.Bind(
-          "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
-      s_u8 =
-          b.Bind("s_u8",
-                 reg.Create("tile.assemble",
-                            {s_u8, s_box_u8, MakeShape2(0, (mi * kb + ki) * kMxPackBoxRows, span)}, {}, span),
-                 span);
-    }
+    ExprPtr box = ld ? LoadBox(*ld, mi * kMxPackTileM, 0, b, span)
+                     : SliceBox(src, mi * kMxPackTileM, 0, b, span);
+    auto qq = QuantizeBox(box, b, span);
+    auto q_mk_u8 = b.Bind(
+        "qmk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
+    q_u8 = b.Bind(
+        "q_u8",
+        reg.Create("tile.assemble", {q_u8, q_mk_u8, MakeShape2(mi * kMxPackTileM, 0, span)}, {}, span),
+        span);
+    auto s_box_u8 = b.Bind(
+        "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
+    s_u8 = b.Bind(
+        "s_u8",
+        reg.Create("tile.assemble", {s_u8, s_box_u8, MakeShape2(0, mi * kMxPackBoxRows, span)}, {}, span),
+        span);
   }
   auto q_acc =
       b.Bind("q", reg.Create("tile.reinterpret_view", {q_u8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
@@ -442,33 +433,29 @@ std::pair<ExprPtr, ExprPtr> ExpandMxAZzAssemble(const ExprPtr& src, const std::o
 std::pair<ExprPtr, ExprPtr> ExpandMxBNnAssemble(const ExprPtr& src, const std::optional<ResolvedTileLoad>& ld,
                                                 int64_t n, int64_t k, ExpandBuilder& b, const Span& span) {
   auto& reg = OpRegistry::GetInstance();
+  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_B_NN assemble requires K=" << kMxPackTileK;
   const int64_t nb = n / kMxPackTileM;
-  const int64_t kb = k / kMxPackTileK;
   const int64_t groups = (k / kMxPackGroup) * n;
 
   auto nk_u8 = CreatePlainU8Buffer(b, n, k, "nk_u8", span);
   auto s_u8 = CreateMxScaleU8Buffer(b, groups, span);
 
   for (int64_t ni = 0; ni < nb; ++ni) {
-    for (int64_t ki = 0; ki < kb; ++ki) {
-      ExprPtr box = ld ? LoadBox(*ld, ni * kMxPackTileM, ki * kMxPackTileK, b, span)
-                       : SliceBox(src, ni * kMxPackTileM, ki * kMxPackTileK, b, span);
-      auto qq = QuantizeBox(box, b, span);
-      auto q_nk_u8 = b.Bind(
-          "qnk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
-      nk_u8 = b.Bind(
-          "nk_u8",
-          reg.Create("tile.assemble",
-                     {nk_u8, q_nk_u8, MakeShape2(ni * kMxPackTileM, ki * kMxPackTileK, span)}, {}, span),
-          span);
-      auto s_box_u8 = b.Bind(
-          "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
-      s_u8 =
-          b.Bind("s_u8",
-                 reg.Create("tile.assemble",
-                            {s_u8, s_box_u8, MakeShape2(0, (ni * kb + ki) * kMxPackBoxRows, span)}, {}, span),
-                 span);
-    }
+    ExprPtr box = ld ? LoadBox(*ld, ni * kMxPackTileM, 0, b, span)
+                     : SliceBox(src, ni * kMxPackTileM, 0, b, span);
+    auto qq = QuantizeBox(box, b, span);
+    auto q_nk_u8 = b.Bind(
+        "qnk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
+    nk_u8 = b.Bind(
+        "nk_u8",
+        reg.Create("tile.assemble", {nk_u8, q_nk_u8, MakeShape2(ni * kMxPackTileM, 0, span)}, {}, span),
+        span);
+    auto s_box_u8 = b.Bind(
+        "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
+    s_u8 = b.Bind(
+        "s_u8",
+        reg.Create("tile.assemble", {s_u8, s_box_u8, MakeShape2(0, ni * kMxPackBoxRows, span)}, {}, span),
+        span);
   }
 
   auto nk_q = b.Bind(
@@ -488,6 +475,14 @@ void CheckPackShape(TensorLayout layout, int64_t d0, int64_t d1, const Span& spa
   CHECK_SPAN(d0 % kMxPackTileM == 0 && d1 % kMxPackTileK == 0, span)
       << "tile.tquant_mx(layout=" << name << ") requires dim0%" << kMxPackTileM << "==0 and dim1%"
       << kMxPackTileK << "==0, got [" << d0 << ", " << d1 << "]";
+  // kb==1 only: multi-K-box packed expand is not a substitute for large-K matmul
+  // (Phase0: concat of chunk packs ≠ full MX_A_ZZ). Chunk quant + SplitLargeKMxMatmul.
+  CHECK_SPAN(d1 == kMxPackTileK, span)
+      << "tile.tquant_mx(layout=" << name << ") currently supports only a single K-box "
+         "(K="
+      << kMxPackTileK << "), got K=" << d1
+      << "; quantize each K=" << kMxPackTileK
+      << " chunk separately and use SplitLargeKMxMatmul / matmul_mx_acc for K>" << kMxPackTileK;
 }
 
 class ExpandMxPackedQuantMutator : public IRMutator {

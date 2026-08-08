@@ -495,6 +495,12 @@ void BindPass(nb::module_& m) {
              "The dead tile.slice is then dropped, unifying Mat->Left/Right on pto.textract.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
+  passes.def("split_large_k_mx_matmul", &pass::SplitLargeKMxMatmul,
+             "Create a pass that splits large-K MX matmul into K=64 chunks\n\n"
+             "When tile.matmul_mx / _acc / _bias has static K>64 and K%64==0, rewrites\n"
+             "it into K=64 slices: first chunk matmul_mx (or matmul_mx_bias), remaining\n"
+             "chunks matmul_mx_acc. Scale tiles are sliced by ceil(64/32)=2 groups.\n"
+             "Run after InferTileMemorySpace and before InsertMxScaleAddr.");
   passes.def("insert_mx_scale_addr", &pass::InsertMxScaleAddr,
              "Create a pass that inserts tile.tget_scale_addr before MX matmul consumers\n\n"
              "Requires InferTileMemorySpace first so Left/LeftScale and Right/RightScale\n"
@@ -536,9 +542,6 @@ void BindPass(nb::module_& m) {
              "Must run before LowerCompositeOps. B (MX_B_NN) also inserts an INT8 [N,K]->[K,N]\n"
              "transpose. Public pl.quant_mx(layout=...) emits the packed form; this pass\n"
              "materializes its per-box implementation.");
-  passes.def("legalize_mixed_mx_scale_via_gm", &pass::LegalizeMixedMxScaleViaGm,
-             "Rewrite mixed-kernel MX E8M0 scale V2C (tpush/tpop) into GM store + MX_A_ZZ load.\n\n"
-             "Must run immediately after ExpandMxPackedQuant. Leaves FP8 data V2C unchanged.");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
              "Decompose composite tile/distributed ops into primitives via the "
              "composite-lowering registry. Today lowers tile.sin/tile.cos, flat "

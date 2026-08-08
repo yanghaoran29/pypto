@@ -6,7 +6,7 @@ vector→cube 边界插入 `tile.aic_gather`，仅对**向量子区域**沿拆�
 `tile.get_subblock_idx()`，并在函数上打 `split` + `split_aiv` 标记。
 
 这是**唯一的自动拆分下降路径**：它始终运行，紧邻 `ExpandMixedKernel` 之前。运行后
-每个拆分函数到达 [`SplitVectorKernel`](25-split_vector_kernel.md) 时都已带
+每个拆分函数到达 [`SplitVectorKernel`](24-split_vector_kernel.md) 时都已带
 `split_aiv` 标记，因此该 pass 只打属性（其 split_aiv 分支）——其旧的逐算子折半驱动
 已被删除，折半机制现仅存于 `split_axis_utils`，由本 pass 共享。
 
@@ -77,7 +77,7 @@ result = passes.lower_auto_vector_split()(program)
 的多模式情形。区域局部的 `tile_vars` / `var_replacements` 映射保证折半后的变量不会泄漏
 到同级区域或区域外的全宽算子。任何区域**之外**的语句以全宽发出。所有区域下降后，作用域
 包装被丢弃，函数被打上 `split_aiv` + `split_aiv_region_validated`（后者通知
-[`ExpandMixedKernel`](23-expand_mixed_kernel.md) 跳过其单一函数级模式的转置检查——
+[`ExpandMixedKernel`](22-expand_mixed_kernel.md) 跳过其单一函数级模式的转置检查——
 改由本 pass 用每个区域正确的拆分轴校验各自的转置风险）。
 
 函数级 AUTO split（`optimizations=[pl.split(mode)]`，包括 `SplitMode.NONE`）与显式
@@ -106,7 +106,7 @@ pipe 大小，不标注任何拆分。该检查在更早的
   **原样透传区域体**（不折半、不本地化偏移、不注入 `subblock_idx`；作者的
   `aiv_id = get_subblock_idx()` 绑定已携带 lane 信息）。`None` 区域内的 `tile.aiv_shard` /
   `tile.aic_gather` 会被拒绝（无拆分轴可切分）——由 `AivSplitValid` 校验器与此处的常开保护
-  共同拦截。该函数仍会被标记 `split_aiv`，因此下游 [`ExpandMixedKernel`](23-expand_mixed_kernel.md) /
+  共同拦截。该函数仍会被标记 `split_aiv`，因此下游 [`ExpandMixedKernel`](22-expand_mixed_kernel.md) /
   `SplitVectorKernel` 会把它派发到**两个** AIV lane（经由 `dual_aiv_dispatch`），而**非**
   lane-0-only 的非拆分 replay（后者只针对非 `split_aiv` 核）——故两个 lane 都运行完整函数体。
   当区域的 tile 无法折半（单位维）或归约必须保持全宽时使用本模式。
@@ -208,7 +208,7 @@ def f(self, a: pl.Tensor[[128, 128], pl.FP32],
 `@pl.jit`（Opaque）让 pass 8 提取该 scope，或把区域移出外围 scope。
 
 该守卫也正是 `split_aiv_region_validated` 标记可信的依据：只有当每个区域都确实被消费后才写入
-attrs，因此 [`ExpandMixedKernel`](23-expand_mixed_kernel.md) 凭该标记跳过自身的 func-mode
+attrs，因此 [`ExpandMixedKernel`](22-expand_mixed_kernel.md) 凭该标记跳过自身的 func-mode
 检查时，背后总有一次真实的逐区域校验。若无此守卫，被 scope 包裹的区域会既未下降、又未校验，
 却仍被标记为“已完成区域校验”，问题要到很晚才以 PTO codegen 的内部断言
 （`SplitAivScopeStmt reached PTO codegen`）暴露。
@@ -394,8 +394,8 @@ golden 场景（`test_lower_auto_vector_split_golden`）。
 
 ## 相关
 
-- [`ResolveBackendOpLayouts`](21-resolve_backend_op_layouts.md) —— 紧邻其前运行。
-- [`ExpandMixedKernel`](23-expand_mixed_kernel.md) —— 紧邻其后运行；把
+- [`ResolveBackendOpLayouts`](20-resolve_backend_op_layouts.md) —— 紧邻其前运行。
+- [`ExpandMixedKernel`](22-expand_mixed_kernel.md) —— 紧邻其后运行；把
   `tile.aiv_shard` / `tile.aic_gather` 折叠为带拆分标记的 `tpush`/`tpop`。
-- [`SplitVectorKernel`](25-split_vector_kernel.md) —— 下游；仅为本 pass 产生的
+- [`SplitVectorKernel`](24-split_vector_kernel.md) —— 下游；仅为本 pass 产生的
   `split_aiv` 函数打属性，外加无拆分 dual-AIV 路径。
