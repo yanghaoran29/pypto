@@ -595,24 +595,6 @@ Pass CanonicalizeTileSlice();
 Pass InferTileMemorySpace();
 
 /**
- * @brief Split large-K MX matmul into K=64 chunks (matmul_mx + matmul_mx_acc)
- *
- * When a ``tile.matmul_mx`` / ``_acc`` / ``_bias`` has a static K dimension
- * with ``K > 64`` and ``K % 64 == 0``, rewrites it into a sequence of K=64
- * slices: the first chunk is ``matmul_mx`` (or ``matmul_mx_bias``), and each
- * remaining chunk is ``matmul_mx_acc``. Scale tiles are sliced by
- * ``ceil(64/32) = 2`` groups per chunk.
- *
- * Idempotent: after the rewrite every MX matmul has K=64 so a second run is a
- * no-op. Dynamic or non-multiple-of-64 K is left unchanged.
- *
- * Requirements:
- * - Prefer running after ``InferTileMemorySpace`` and before ``InsertMxScaleAddr``
- *   so each chunk receives its own scale-address bindings.
- */
-Pass SplitLargeKMxMatmul();
-
-/**
  * @brief Insert tile.tget_scale_addr bindings before MX matmul consumers
  *
  * After InferTileMemorySpace has resolved Left/LeftScale and Right/RightScale
@@ -738,8 +720,12 @@ Pass RunVerifier(const IRPropertySet& properties);
 Pass Simplify();
 
 /**
- * @brief Expand ``tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`` into per-box flat
- *        quant + continuous ZZ/NN scale assembly (B also INT8-transposes to [K,N]).
+ * @brief Early MX legalization: K-split then expand packed ``tile.tquant_mx``.
+ *
+ * Phase 1 splits static K>64 ``matmul_mx`` (and co-splits feeding packed
+ * ``tquant_mx(layout)``) into K=64 chunks. Phase 2 expands
+ * ``tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`` into per-box flat quant +
+ * continuous ZZ/NN scale assembly (B also INT8-transposes to [K,N]).
  *
  * Must run before ``LowerCompositeOps`` so expanded flat ``tile.tquant_mx`` calls
  * still receive DPS lowering. Public ``pl.quant_mx(layout=...)`` emits the packed

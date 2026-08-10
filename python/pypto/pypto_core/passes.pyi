@@ -542,16 +542,6 @@ def infer_tile_memory_space() -> Pass:
     consumed before the pass returns.
     """
 
-def split_large_k_mx_matmul() -> Pass:
-    """Split large-K ``matmul_mx`` family ops into K=64 chunks.
-
-    When ``tile.matmul_mx`` / ``_acc`` / ``_bias`` has static ``K > 64`` and
-    ``K % 64 == 0``, rewrites it into K=64 slices: first chunk ``matmul_mx``
-    (or ``matmul_mx_bias``), remaining chunks ``matmul_mx_acc``. Scale tiles
-    are sliced by ``ceil(64/32) = 2`` groups per chunk. Idempotent. Run after
-    ``infer_tile_memory_space`` and before ``insert_mx_scale_addr``.
-    """
-
 def insert_mx_scale_addr() -> Pass:
     """Insert ``tile.tget_scale_addr`` before MX matmul consumers.
 
@@ -608,11 +598,13 @@ def simplify() -> Pass:
     """Create a pass that simplifies expressions and statements using algebraic rules and bound analysis."""
 
 def expand_mx_packed_quant() -> Pass:
-    """Expand packed-layout MX quantization into per-box flat quantization.
+    """K-split large-K MX quant/matmul, then expand packed quantization.
 
-    Handles ``MX_A_ZZ`` and ``MX_B_NN`` scale packing before
-    :func:`lower_composite_ops`; the B layout also transposes the quantized
-    values from ``[N, K]`` to ``[K, N]``.
+    Phase 1 splits static ``K>64`` ``matmul_mx`` (and co-splits feeding packed
+    ``tquant_mx(layout)``) into K=64 chunks. Phase 2 expands ``MX_A_ZZ`` /
+    ``MX_B_NN`` into per-box flat quant + ZZ/NN scales before
+    :func:`lower_composite_ops`; the B layout also transposes quantized values
+    from ``[N, K]`` to ``[K, N]``.
     """
 
 def lower_composite_ops() -> Pass:
@@ -961,7 +953,6 @@ __all__ = [
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
-    "split_large_k_mx_matmul",
     "insert_mx_scale_addr",
     "materialize_tensor_strides",
     "resolve_backend_op_layouts",

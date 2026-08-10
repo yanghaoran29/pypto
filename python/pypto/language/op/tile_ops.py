@@ -1206,6 +1206,10 @@ def quant_mx(
     ExpandMxPackedQuant lowers ``layout=MX_*`` into per-box flat quant + continuous
     ZZ/NN scale assembly (B also INT8-transposes to ``[K,N]``).
 
+    Scales stay packed-flat ``[1, G]``. Pass them directly to ``matmul_mx*``;
+    ExpandMxPackedQuant inserts ``tile.reshape`` to logical ``[M, K/32]`` /
+    ``[K/32, N]`` before later MX passes. Frontend code should not reshape scales.
+
     Args:
         src: Source tile (FP16/FP32/BF16, 2D).
             ``MX_A_ZZ``: ``[M, K]`` with ``M%16==0``, ``K%64==0``.
@@ -1323,6 +1327,10 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
 
 def matmul_mx(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
     """MX block-scale matrix multiplication.
+
+    Scales accept logical ``[M, K/32]`` / ``[K/32, N]`` or packed-flat
+    ``[1, M*K/32]`` / ``[1, N*K/32]`` from ``quant_mx(layout=...)``. Flat scales
+    are reshaped by ExpandMxPackedQuant; do not insert that reshape in frontend.
 
     Args:
         lhs: Left-hand side data tile (FP8E4M3FN)

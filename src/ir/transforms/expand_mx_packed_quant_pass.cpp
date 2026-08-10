@@ -11,19 +11,15 @@
 
 /**
  * @file expand_mx_packed_quant_pass.cpp
- * @brief Expand ``tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`` into per-box flat
- *        quant + continuous ZZ/NN scale packing (B also INT8-transposes to [K,N]).
+ * @brief Early MX legalization: K-split large packed quant + matmul_mx, then
+ *        expand ``tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`` into per-box flat
+ *        quant + Vec assemble (B also INT8-transposes to [K,N]).
  *
- * Preferred lowering matches the onboard-proven rearrange recipe: resolve the
- * source ``tile.load``, then per-box ``tile.load`` + flat ``tquant_mx`` +
- * ``tile.store`` into the consumer GM buffers. Vec ``slice``/``assemble`` packing
- * is only a fallback when stores are not visible and is less reliable on A5.
- *
- * Packed layout quant accepts only a single K-box (``kb == 1``, i.e. ``K == 64``).
- * Phase0 showed that concatenating per-chunk packed scales is not byte-identical
- * to a full-K MX_A_ZZ pack, so multi-K-box expand is not a safe substitute for
- * large-K matmul. Use per-chunk ``quant_mx(K=64)`` plus ``SplitLargeKMxMatmul``
- * (or an explicit ``matmul_mx`` / ``matmul_mx_acc`` chain) for K>64.
+ * Phase 1: co-split packed quant↔matmul or matmul-only slice (K>64, %64==0)
+ *         — matmul path may rewrite to chunk layout (byte order differs from full pack).
+ * Phase 2: reshape remaining packed-flat matmul scales ``[1,G]`` → ``[M,G]`` / ``[G,N]``.
+ * Phase 3: expand packed quant via per-box assemble; isolated large-K keeps host full-pack
+ *         order (mb/nb outer, kb inner), matching ``_pack_a_scale`` / ``_pack_b_scale``.
  */
 
 #include <any>
@@ -55,6 +51,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -65,25 +62,11 @@ namespace {
 constexpr int64_t kMxPackTileM = 16;
 constexpr int64_t kMxPackTileK = 64;
 constexpr int64_t kMxPackGroup = 32;
-constexpr int64_t kMxPackBoxRows = kMxPackTileM * (kMxPackTileK / kMxPackGroup);  // 32
+constexpr int64_t kMxChunkGroups = kMxPackTileK / kMxPackGroup;  // 2
+constexpr int64_t kMxPackBoxRows = kMxPackTileM * kMxChunkGroups;  // 32
 constexpr int64_t kMxPackReuseChunkBoxes = 16;
 
-std::optional<TensorLayout> GetMxPackLayout(const CallPtr& call) {
-  if (!call || !IsOp(call, "tile.tquant_mx")) {
-    return std::nullopt;
-  }
-  for (const auto& [key, value] : call->kwargs_) {
-    if (key != "layout") {
-      continue;
-    }
-    auto layout = AnyCast<TensorLayout>(value, "kwarg key: layout");
-    CHECK(layout == TensorLayout::MX_A_ZZ || layout == TensorLayout::MX_B_NN)
-        << "tile.tquant_mx layout must be MX_A_ZZ or MX_B_NN (ND/None are not allowed), got "
-        << TensorLayoutToString(layout);
-    return layout;
-  }
-  return std::nullopt;
-}
+using DefMap = std::unordered_map<const Var*, ExprPtr>;
 
 ExprPtr MakeIndex(int64_t value, const Span& span) {
   return std::make_shared<ConstInt>(value, DataType::INDEX, span);
@@ -99,15 +82,39 @@ const Var* GetVarIdentity(const ExprPtr& expr) {
   return nullptr;
 }
 
-bool ConstOffset2(const ExprPtr& offsets, int64_t* r, int64_t* c) {
-  auto tup = As<MakeTuple>(offsets);
+bool ConstInt2(const ExprPtr& tup_expr, int64_t* a, int64_t* b) {
+  auto tup = As<MakeTuple>(tup_expr);
   if (!tup || tup->elements_.size() != 2) return false;
-  auto a = As<ConstInt>(tup->elements_[0]);
-  auto b = As<ConstInt>(tup->elements_[1]);
-  if (!a || !b) return false;
-  *r = a->value_;
-  *c = b->value_;
+  auto x = As<ConstInt>(tup->elements_[0]);
+  auto y = As<ConstInt>(tup->elements_[1]);
+  if (!x || !y) return false;
+  *a = x->value_;
+  *b = y->value_;
   return true;
+}
+
+ExprPtr FollowDefs(ExprPtr expr, const DefMap& defs, int max_depth = 8) {
+  for (int d = 0; d < max_depth && expr; ++d) {
+    const Var* v = GetVarIdentity(expr);
+    if (!v) return expr;
+    auto it = defs.find(v);
+    if (it == defs.end()) return expr;
+    expr = it->second;
+  }
+  return expr;
+}
+
+std::optional<TensorLayout> GetMxPackLayout(const CallPtr& call) {
+  if (!call || !IsOp(call, "tile.tquant_mx")) return std::nullopt;
+  for (const auto& [key, value] : call->kwargs_) {
+    if (key != "layout") continue;
+    auto layout = AnyCast<TensorLayout>(value, "kwarg key: layout");
+    CHECK(layout == TensorLayout::MX_A_ZZ || layout == TensorLayout::MX_B_NN)
+        << "tile.tquant_mx layout must be MX_A_ZZ or MX_B_NN (ND/None are not allowed), got "
+        << TensorLayoutToString(layout);
+    return layout;
+  }
+  return std::nullopt;
 }
 
 struct ResolvedTileLoad {
@@ -117,34 +124,526 @@ struct ResolvedTileLoad {
   std::vector<std::pair<std::string, std::any>> kwargs;
 };
 
-std::optional<ResolvedTileLoad> ResolveTileLoad(ExprPtr expr,
-                                                const std::unordered_map<const Var*, ExprPtr>& defs) {
-  for (int depth = 0; depth < 8 && expr; ++depth) {
+std::optional<ResolvedTileLoad> ResolveTileLoad(ExprPtr expr, const DefMap& defs) {
+  for (int d = 0; d < 8 && expr; ++d) {
     if (auto call = As<Call>(expr); call && IsOp(call, "tile.load")) {
       CHECK(call->args_.size() >= 4) << "tile.load expects tensor, offsets, shapes, valid_shape";
       int64_t r = 0;
       int64_t c = 0;
-      // Dynamic base offsets cannot be folded into the per-box reloads.  They
-      // are still valid inputs: leave the aggregate load in place and let the
-      // caller use the slice/assemble fallback.
-      if (!ConstOffset2(call->args_[1], &r, &c)) return std::nullopt;
-      ResolvedTileLoad out;
-      out.tensor = call->args_[0];
-      out.row0 = r;
-      out.col0 = c;
-      out.kwargs = call->kwargs_;
-      return out;
+      if (!ConstInt2(call->args_[1], &r, &c)) return std::nullopt;
+      return ResolvedTileLoad{call->args_[0], r, c, call->kwargs_};
     }
-    if (const Var* v = GetVarIdentity(expr)) {
-      auto it = defs.find(v);
-      if (it == defs.end()) return std::nullopt;
-      expr = it->second;
-      continue;
-    }
-    return std::nullopt;
+    const Var* v = GetVarIdentity(expr);
+    if (!v) return std::nullopt;
+    auto it = defs.find(v);
+    if (it == defs.end()) return std::nullopt;
+    expr = it->second;
   }
   return std::nullopt;
 }
+
+AssignStmtPtr Bind(const std::string& name, const ExprPtr& expr, const Span& span) {
+  return std::make_shared<AssignStmt>(std::make_shared<Var>(name, expr->GetType(), span), expr, span);
+}
+
+FunctionPtr WithBody(const FunctionPtr& func, const StmtPtr& body) {
+  if (body.get() == func->body_.get()) return func;
+  return std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
+                                    func->return_types_, body, func->span_, func->func_type_,
+                                    func->level_, func->role_, func->attrs_);
+}
+
+void CollectDefs(const StmtPtr& body, DefMap* defs) {
+  class C : public IRVisitor {
+   public:
+    DefMap* defs;
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      (*defs)[op->var_.get()] = op->value_;
+      IRVisitor::VisitStmt_(op);
+    }
+  } c;
+  c.defs = defs;
+  c.VisitStmt(body);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 1: K-split helpers + flat-scale legalize
+// -----------------------------------------------------------------------------
+
+enum class MxMatmulKind { kBase, kAcc, kBias };
+
+std::optional<MxMatmulKind> ClassifyMxMatmul(const CallPtr& call) {
+  if (IsOp(call, "tile.matmul_mx")) return MxMatmulKind::kBase;
+  if (IsOp(call, "tile.matmul_mx_acc")) return MxMatmulKind::kAcc;
+  if (IsOp(call, "tile.matmul_mx_bias")) return MxMatmulKind::kBias;
+  return std::nullopt;
+}
+
+struct MxOperands {
+  ExprPtr acc;
+  ExprPtr lhs;
+  ExprPtr lhs_scale;
+  ExprPtr rhs;
+  ExprPtr rhs_scale;
+  ExprPtr bias;
+  int64_t m = 0;
+  int64_t k = 0;
+  int64_t n = 0;
+};
+
+std::optional<MxOperands> ParseMxOperands(const CallPtr& call, MxMatmulKind kind) {
+  MxOperands ops;
+  size_t lhs_i = 0;
+  if (kind == MxMatmulKind::kAcc) {
+    if (call->args_.size() != 5) return std::nullopt;
+    ops.acc = call->args_[0];
+    lhs_i = 1;
+  } else if (kind == MxMatmulKind::kBias) {
+    if (call->args_.size() != 5) return std::nullopt;
+    ops.bias = call->args_[4];
+  } else if (call->args_.size() != 4) {
+    return std::nullopt;
+  }
+  ops.lhs = call->args_[lhs_i];
+  ops.lhs_scale = call->args_[lhs_i + 1];
+  ops.rhs = call->args_[lhs_i + 2];
+  ops.rhs_scale = call->args_[lhs_i + 3];
+  auto lhs_ty = As<TileType>(ops.lhs->GetType());
+  auto rhs_ty = As<TileType>(ops.rhs->GetType());
+  if (!lhs_ty || !rhs_ty || lhs_ty->shape_.size() != 2 || rhs_ty->shape_.size() != 2) return std::nullopt;
+  auto m = As<ConstInt>(lhs_ty->shape_[0]);
+  auto k = As<ConstInt>(lhs_ty->shape_[1]);
+  auto n = As<ConstInt>(rhs_ty->shape_[1]);
+  if (!m || !k || !n) return std::nullopt;
+  ops.m = m->value_;
+  ops.k = k->value_;
+  ops.n = n->value_;
+  return ops;
+}
+
+/// ``[1, rows*cols]`` packed flat from ``quant_mx(layout)`` (else nullopt).
+std::optional<std::pair<int64_t, int64_t>> PackedFlatLogicalShape(const TileTypePtr& scale, int64_t rows,
+                                                                 int64_t cols) {
+  if (!scale || scale->shape_.size() != 2) return std::nullopt;
+  auto r = As<ConstInt>(scale->shape_[0]);
+  auto c = As<ConstInt>(scale->shape_[1]);
+  if (!r || !c || r->value_ != 1 || c->value_ != rows * cols) return std::nullopt;
+  return std::make_pair(rows, cols);
+}
+
+class LegalizeFlatMxScaleMutator : public IRMutator {
+ public:
+  StmtPtr RewriteBody(const StmtPtr& body) {
+    if (As<SeqStmts>(body)) return VisitStmt(body);
+    auto visited = VisitStmt(body);
+    auto assign = As<AssignStmt>(visited);
+    auto call = assign ? As<Call>(assign->value_) : nullptr;
+    if (!assign || !call) return visited;
+    std::vector<StmtPtr> stmts;
+    if (!TryRewrite(assign, call, stmts)) return visited;
+    return SeqStmts::Flatten(std::move(stmts), body->span_);
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    bool changed = false;
+    std::vector<StmtPtr> new_stmts;
+    new_stmts.reserve(op->stmts_.size());
+    for (const auto& stmt : op->stmts_) {
+      auto rewritten = IRMutator::VisitStmt(stmt);
+      auto assign = As<AssignStmt>(rewritten);
+      auto call = assign ? As<Call>(assign->value_) : nullptr;
+      if (assign && call) {
+        std::vector<StmtPtr> expansion;
+        if (TryRewrite(assign, call, expansion)) {
+          changed = true;
+          new_stmts.insert(new_stmts.end(), expansion.begin(), expansion.end());
+          continue;
+        }
+      }
+      changed = changed || rewritten.get() != stmt.get();
+      new_stmts.push_back(rewritten);
+    }
+    return changed ? SeqStmts::Flatten(std::move(new_stmts), op->span_) : op;
+  }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto then_b = RewriteBody(op->then_body_);
+    std::optional<StmtPtr> else_b = op->else_body_;
+    if (op->else_body_) else_b = RewriteBody(*op->else_body_);
+    if (then_b.get() == op->then_body_.get() &&
+        (!op->else_body_ || else_b->get() == op->else_body_->get())) {
+      return op;
+    }
+    auto result = MutableCopy(op);
+    result->then_body_ = std::move(then_b);
+    result->else_body_ = std::move(else_b);
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override { return VisitLoop(op); }
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return VisitLoop(op); }
+
+ private:
+  template <typename LoopPtr>
+  StmtPtr VisitLoop(const LoopPtr& op) {
+    auto body = RewriteBody(op->body_);
+    if (body.get() == op->body_.get()) return op;
+    auto result = MutableCopy(op);
+    result->body_ = std::move(body);
+    return result;
+  }
+
+  bool TryRewrite(const AssignStmtPtr& assign, const CallPtr& call, std::vector<StmtPtr>& out) {
+    auto kind = ClassifyMxMatmul(call);
+    if (!kind) return false;
+    auto ops = ParseMxOperands(call, *kind);
+    if (!ops) return false;
+
+    auto lhs_ty = As<TileType>(ops->lhs_scale->GetType());
+    auto rhs_ty = As<TileType>(ops->rhs_scale->GetType());
+    const int64_t g = ops->k / kMxPackGroup;
+    auto lhs_flat = PackedFlatLogicalShape(lhs_ty, ops->m, g);
+    auto rhs_flat = PackedFlatLogicalShape(rhs_ty, g, ops->n);
+    if (!lhs_flat && !rhs_flat) return false;
+
+    const Span& span = call->span_;
+    const std::string base = assign->var_->name_hint_;
+    auto& reg = OpRegistry::GetInstance();
+    ExprPtr lhs_s = ops->lhs_scale;
+    ExprPtr rhs_s = ops->rhs_scale;
+    if (lhs_flat) {
+      auto reshaped =
+          reg.Create("tile.reshape", {lhs_s, MakeShape2(lhs_flat->first, lhs_flat->second, span)}, {}, span);
+      auto as = Bind(base + "_ls_2d", reshaped, span);
+      out.push_back(as);
+      lhs_s = as->var_;
+    }
+    if (rhs_flat) {
+      auto reshaped =
+          reg.Create("tile.reshape", {rhs_s, MakeShape2(rhs_flat->first, rhs_flat->second, span)}, {}, span);
+      auto as = Bind(base + "_rs_2d", reshaped, span);
+      out.push_back(as);
+      rhs_s = as->var_;
+    }
+
+    CallPtr mx_call;
+    if (*kind == MxMatmulKind::kBase) {
+      mx_call = reg.Create("tile.matmul_mx", {ops->lhs, lhs_s, ops->rhs, rhs_s}, {}, span);
+    } else if (*kind == MxMatmulKind::kBias) {
+      mx_call = reg.Create("tile.matmul_mx_bias", {ops->lhs, lhs_s, ops->rhs, rhs_s, ops->bias}, {}, span);
+    } else {
+      mx_call = reg.Create("tile.matmul_mx_acc", {ops->acc, ops->lhs, lhs_s, ops->rhs, rhs_s}, {}, span);
+    }
+    out.push_back(std::make_shared<AssignStmt>(assign->var_, mx_call, span));
+    return true;
+  }
+};
+
+struct PackedQuantSite {
+  CallPtr quant_call;
+  TensorLayout layout = TensorLayout::ND;
+  ExprPtr src;
+  int64_t d0 = 0;
+  int64_t k = 0;
+  std::unordered_set<const Var*> chain_vars;
+};
+
+const Var* PeelTupleGet(ExprPtr expr, int index, const DefMap& defs) {
+  expr = FollowDefs(expr, defs);
+  auto get = As<TupleGetItemExpr>(expr);
+  return (get && get->index_ == index) ? GetVarIdentity(get->tuple_) : nullptr;
+}
+
+/// Co-split requires data/scale to be direct ``TupleGetItem(quant, 0/1)`` (no user reshape).
+std::optional<PackedQuantSite> ResolvePackedQuantSite(const ExprPtr& data, const ExprPtr& scale,
+                                                      TensorLayout expect, const DefMap& defs) {
+  const Var* data_t = PeelTupleGet(data, 0, defs);
+  const Var* scale_t = PeelTupleGet(scale, 1, defs);
+  if (!data_t || data_t != scale_t) return std::nullopt;
+  auto q_it = defs.find(data_t);
+  if (q_it == defs.end()) return std::nullopt;
+  auto q_call = As<Call>(q_it->second);
+  auto layout = GetMxPackLayout(q_call);
+  if (!layout || *layout != expect || q_call->args_.empty()) return std::nullopt;
+
+  auto src_ty = As<TileType>(q_call->args_[0]->GetType());
+  if (!src_ty || src_ty->shape_.size() != 2) return std::nullopt;
+  auto d0 = As<ConstInt>(src_ty->shape_[0]);
+  auto k = As<ConstInt>(src_ty->shape_[1]);
+  if (!d0 || !k || k->value_ <= kMxPackTileK || (k->value_ % kMxPackTileK) != 0) return std::nullopt;
+
+  PackedQuantSite site;
+  site.quant_call = q_call;
+  site.layout = expect;
+  site.src = q_call->args_[0];
+  site.d0 = d0->value_;
+  site.k = k->value_;
+  site.chain_vars.insert(data_t);
+  if (const Var* v = GetVarIdentity(data)) site.chain_vars.insert(v);
+  if (const Var* v = GetVarIdentity(scale)) site.chain_vars.insert(v);
+  for (const auto& [var, val] : defs) {
+    if (auto get = As<TupleGetItemExpr>(val); get && GetVarIdentity(get->tuple_) == data_t) {
+      site.chain_vars.insert(var);
+    }
+  }
+  return site;
+}
+
+bool ChainOnlyUsedByMatmul(const PackedQuantSite& site, const ExprPtr& data_op, const ExprPtr& scale_op,
+                           const Call* matmul_call, const StmtPtr& body) {
+  std::unordered_set<const Var*> ops;
+  if (auto* x = GetVarIdentity(data_op)) ops.insert(x);
+  if (auto* x = GetVarIdentity(scale_op)) ops.insert(x);
+
+  class OpOnly : public IRVisitor {
+   public:
+    std::unordered_set<const Var*>* ops;
+    std::unordered_map<const Var*, int> uses;
+    void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
+    void VisitExpr_(const VarPtr& op) override {
+      if (ops->count(op.get())) uses[op.get()]++;
+    }
+    void VisitExpr_(const IterArgPtr& op) override {
+      if (ops->count(op.get())) uses[op.get()]++;
+    }
+  } oc;
+  oc.ops = &ops;
+  oc.VisitStmt(body);
+  for (const Var* x : ops) {
+    if (oc.uses[x] != 1) return false;
+  }
+
+  class Ext : public IRVisitor {
+   public:
+    const std::unordered_set<const Var*>* chain;
+    const Call* matmul = nullptr;
+    bool bad = false;
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      if (auto c = As<Call>(op->value_); c && c.get() == matmul) return;
+      if (chain->count(op->var_.get())) return;
+      VisitExpr(op->value_);
+    }
+    void VisitExpr_(const VarPtr& op) override {
+      if (chain->count(op.get())) bad = true;
+    }
+    void VisitExpr_(const IterArgPtr& op) override {
+      if (chain->count(op.get())) bad = true;
+    }
+  } ext;
+  ext.chain = &site.chain_vars;
+  ext.matmul = matmul_call;
+  ext.VisitStmt(body);
+  return !ext.bad;
+}
+
+std::pair<ExprPtr, ExprPtr> EmitPackedQuantChunk(const PackedQuantSite& site, int64_t k0,
+                                                 const std::string& prefix, const DefMap& defs,
+                                                 const Span& span, std::vector<StmtPtr>& out) {
+  auto& reg = OpRegistry::GetInstance();
+  auto push = [&](const std::string& n, const ExprPtr& e) {
+    auto as = Bind(prefix + n, e, span);
+    out.push_back(as);
+    return as->var_;
+  };
+
+  ExprPtr src_chunk;
+  if (auto ld = ResolveTileLoad(site.src, defs)) {
+    auto shape = MakeShape2(site.d0, kMxPackTileK, span);
+    src_chunk = reg.Create("tile.load",
+                           {ld->tensor, MakeShape2(ld->row0, ld->col0 + k0, span), shape, shape},
+                           ld->kwargs, span);
+  } else {
+    src_chunk = reg.Create(
+        "tile.slice", {site.src, MakeShape2(site.d0, kMxPackTileK, span), MakeShape2(0, k0, span)}, {},
+        span);
+  }
+  auto src = push("_src", src_chunk);
+  auto pair = push("_tq", reg.Create("tile.tquant_mx", {src}, site.quant_call->kwargs_, span));
+  auto q = push("_q", std::make_shared<TupleGetItemExpr>(pair, 0, span));
+  auto s = push("_s", std::make_shared<TupleGetItemExpr>(pair, 1, span));
+  auto s2_shape = site.layout == TensorLayout::MX_A_ZZ ? MakeShape2(site.d0, kMxChunkGroups, span)
+                                                       : MakeShape2(kMxChunkGroups, site.d0, span);
+  auto s2 = push("_s2", reg.Create("tile.reshape", {s, s2_shape}, {}, span));
+
+  // Vec→Mat staging so Infer can insert Mat→Left / Mat→LeftScale.
+  auto q_mat = push("_q_mat", reg.Create("tile.move", {q}, {{"target_memory", MemorySpace::Mat}}, span));
+  const TileLayout sl =
+      site.layout == TensorLayout::MX_A_ZZ ? TileLayout::row_major : TileLayout::col_major;
+  auto s_mat = push("_s_mat", reg.Create("tile.move", {s2},
+                                         {{"target_memory", MemorySpace::Mat},
+                                          {"blayout", sl},
+                                          {"slayout", sl}},
+                                         span));
+  return {q_mat, s_mat};
+}
+
+class KSplitMxMutator : public IRMutator {
+ public:
+  explicit KSplitMxMutator(const StmtPtr& whole_body) : whole_body_(whole_body) {
+    CollectDefs(whole_body_, &defs_);
+  }
+
+  StmtPtr RewriteBody(const StmtPtr& body) {
+    if (As<SeqStmts>(body)) return VisitStmt(body);
+    auto visited = VisitStmt(body);
+    auto assign = As<AssignStmt>(visited);
+    auto call = assign ? As<Call>(assign->value_) : nullptr;
+    if (!assign || !call) return visited;
+    std::vector<StmtPtr> stmts;
+    std::unordered_set<const Var*> dead;
+    if (!TryRewrite(assign, call, stmts, dead)) return visited;
+    return SeqStmts::Flatten(std::move(stmts), body->span_);
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    struct Plan {
+      size_t index;
+      std::vector<StmtPtr> expansion;
+      std::unordered_set<const Var*> dead;
+    };
+    std::vector<Plan> plans;
+    std::unordered_set<const Var*> all_dead;
+    for (size_t i = 0; i < op->stmts_.size(); ++i) {
+      auto assign = As<AssignStmt>(op->stmts_[i]);
+      auto call = assign ? As<Call>(assign->value_) : nullptr;
+      if (!assign || !call) continue;
+      std::vector<StmtPtr> expansion;
+      std::unordered_set<const Var*> dead;
+      if (TryRewrite(assign, call, expansion, dead)) {
+        all_dead.insert(dead.begin(), dead.end());
+        plans.push_back(Plan{i, std::move(expansion), std::move(dead)});
+      }
+    }
+    bool changed = !plans.empty();
+    std::vector<StmtPtr> new_stmts;
+    new_stmts.reserve(op->stmts_.size());
+    size_t pi = 0;
+    for (size_t i = 0; i < op->stmts_.size(); ++i) {
+      if (auto assign = As<AssignStmt>(op->stmts_[i]); assign && all_dead.count(assign->var_.get())) {
+        changed = true;
+        continue;
+      }
+      if (pi < plans.size() && plans[pi].index == i) {
+        new_stmts.insert(new_stmts.end(), plans[pi].expansion.begin(), plans[pi].expansion.end());
+        ++pi;
+        changed = true;
+        continue;
+      }
+      auto rewritten = IRMutator::VisitStmt(op->stmts_[i]);
+      changed = changed || rewritten.get() != op->stmts_[i].get();
+      new_stmts.push_back(rewritten);
+    }
+    return changed ? SeqStmts::Flatten(std::move(new_stmts), op->span_) : op;
+  }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto then_b = RewriteBody(op->then_body_);
+    std::optional<StmtPtr> else_b = op->else_body_;
+    if (op->else_body_) else_b = RewriteBody(*op->else_body_);
+    if (then_b.get() == op->then_body_.get() &&
+        (!op->else_body_ || else_b->get() == op->else_body_->get())) {
+      return op;
+    }
+    auto result = MutableCopy(op);
+    result->then_body_ = std::move(then_b);
+    result->else_body_ = std::move(else_b);
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override { return VisitLoop(op); }
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return VisitLoop(op); }
+
+ private:
+  template <typename LoopPtr>
+  StmtPtr VisitLoop(const LoopPtr& op) {
+    auto body = RewriteBody(op->body_);
+    if (body.get() == op->body_.get()) return op;
+    auto result = MutableCopy(op);
+    result->body_ = std::move(body);
+    return result;
+  }
+
+  bool TryRewrite(const AssignStmtPtr& assign, const CallPtr& call, std::vector<StmtPtr>& out,
+                  std::unordered_set<const Var*>& dead) {
+    auto kind = ClassifyMxMatmul(call);
+    if (!kind) return false;
+    auto ops = ParseMxOperands(call, *kind);
+    if (!ops || ops->k <= kMxPackTileK || (ops->k % kMxPackTileK) != 0) return false;
+
+    auto take_site = [&](auto site_opt, const ExprPtr& d, const ExprPtr& s) {
+      if (site_opt && ChainOnlyUsedByMatmul(*site_opt, d, s, call.get(), whole_body_)) return site_opt;
+      return std::optional<PackedQuantSite>{};
+    };
+    auto lhs_site = take_site(ResolvePackedQuantSite(ops->lhs, ops->lhs_scale, TensorLayout::MX_A_ZZ, defs_),
+                              ops->lhs, ops->lhs_scale);
+    auto rhs_site = take_site(ResolvePackedQuantSite(ops->rhs, ops->rhs_scale, TensorLayout::MX_B_NN, defs_),
+                              ops->rhs, ops->rhs_scale);
+    if (lhs_site) dead.insert(lhs_site->chain_vars.begin(), lhs_site->chain_vars.end());
+    if (rhs_site) dead.insert(rhs_site->chain_vars.begin(), rhs_site->chain_vars.end());
+
+    const Span& span = call->span_;
+    const std::string base = assign->var_->name_hint_;
+    auto& reg = OpRegistry::GetInstance();
+    const int64_t chunks = ops->k / kMxPackTileK;
+    ExprPtr acc = ops->acc;
+
+    auto push_slice = [&](const std::string& n, const ExprPtr& src, int64_t d0, int64_t d1, int64_t o0,
+                          int64_t o1) {
+      auto as = Bind(n, reg.Create("tile.slice", {src, MakeShape2(d0, d1, span), MakeShape2(o0, o1, span)},
+                                   {}, span),
+                     span);
+      out.push_back(as);
+      return as->var_;
+    };
+
+    for (int64_t ci = 0; ci < chunks; ++ci) {
+      const int64_t k0 = ci * kMxPackTileK;
+      const int64_t g0 = ci * kMxChunkGroups;
+      const std::string p = base + "_k" + std::to_string(ci);
+      ExprPtr lhs;
+      ExprPtr lhs_s;
+      ExprPtr rhs;
+      ExprPtr rhs_s;
+      if (lhs_site) {
+        std::tie(lhs, lhs_s) = EmitPackedQuantChunk(*lhs_site, k0, p + "_a", defs_, span, out);
+      } else {
+        lhs = push_slice(p + "_lhs", ops->lhs, ops->m, kMxPackTileK, 0, k0);
+        lhs_s = push_slice(p + "_ls", ops->lhs_scale, ops->m, kMxChunkGroups, 0, g0);
+      }
+      if (rhs_site) {
+        std::tie(rhs, rhs_s) = EmitPackedQuantChunk(*rhs_site, k0, p + "_b", defs_, span, out);
+      } else {
+        rhs = push_slice(p + "_rhs", ops->rhs, kMxPackTileK, ops->n, k0, 0);
+        rhs_s = push_slice(p + "_rs", ops->rhs_scale, kMxChunkGroups, ops->n, g0, 0);
+      }
+
+      CallPtr mx_call;
+      if (ci == 0 && *kind == MxMatmulKind::kBase) {
+        mx_call = reg.Create("tile.matmul_mx", {lhs, lhs_s, rhs, rhs_s}, {}, span);
+      } else if (ci == 0 && *kind == MxMatmulKind::kBias) {
+        mx_call = reg.Create("tile.matmul_mx_bias", {lhs, lhs_s, rhs, rhs_s, ops->bias}, {}, span);
+      } else {
+        INTERNAL_CHECK_SPAN(acc, span) << "Internal error: MX K-split missing accumulator";
+        mx_call = reg.Create("tile.matmul_mx_acc", {acc, lhs, lhs_s, rhs, rhs_s}, {}, span);
+      }
+      VarPtr out_var = (ci + 1 == chunks)
+                           ? assign->var_
+                           : std::make_shared<Var>(p + "_acc", mx_call->GetType(), span);
+      out.push_back(std::make_shared<AssignStmt>(out_var, mx_call, span));
+      acc = out_var;
+    }
+    return true;
+  }
+
+  StmtPtr whole_body_;
+  DefMap defs_;
+};
+
+// -----------------------------------------------------------------------------
+// Phase 2: Expand packed quant (kb==1)
+// -----------------------------------------------------------------------------
 
 class ExpandBuilder {
  public:
@@ -152,64 +651,55 @@ class ExpandBuilder {
       : base_name_(std::move(base_name)), temp_counter_(temp_counter) {}
 
   ExprPtr Bind(const std::string& qualifier, const ExprPtr& expr, const Span& span) {
-    auto var = std::make_shared<Var>(MakeTempName(qualifier), expr->GetType(), span);
+    auto var = std::make_shared<Var>(
+        auto_name::BuildName(auto_name::GetBaseName(base_name_), qualifier, "tmp",
+                             static_cast<int>(temp_counter_++)),
+        expr->GetType(), span);
     stmts_.push_back(std::make_shared<AssignStmt>(var, expr, span));
     return var;
   }
 
   void DrainChunk(const std::vector<ExprPtr>& tiles, const Span& span,
                   const std::string& qualifier = "chunk_keep") {
-    for (const auto& tile : tiles) {
-      Bind(qualifier, tile, span);
-    }
-    auto barrier = OpRegistry::GetInstance().Create("system.bar_all", {}, span);
-    stmts_.push_back(std::make_shared<EvalStmt>(barrier, span));
+    for (const auto& tile : tiles) Bind(qualifier, tile, span);
+    stmts_.push_back(
+        std::make_shared<EvalStmt>(OpRegistry::GetInstance().Create("system.bar_all", {}, span), span));
   }
 
   std::vector<StmtPtr> TakeStmts() { return std::move(stmts_); }
 
  private:
-  std::string MakeTempName(const std::string& qualifier) {
-    return auto_name::BuildName(auto_name::GetBaseName(base_name_), qualifier, "tmp",
-                                static_cast<int>(temp_counter_++));
-  }
-
   std::string base_name_;
   std::size_t& temp_counter_;
   std::vector<StmtPtr> stmts_;
 };
 
 ExprPtr LoadBox(const ResolvedTileLoad& ld, int64_t row, int64_t col, ExpandBuilder& b, const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
   auto shape = MakeShape2(kMxPackTileM, kMxPackTileK, span);
-  return b.Bind(
-      "box",
-      reg.Create("tile.load", {ld.tensor, MakeShape2(ld.row0 + row, ld.col0 + col, span), shape, shape},
-                 ld.kwargs, span),
-      span);
+  return b.Bind("box",
+                OpRegistry::GetInstance().Create(
+                    "tile.load", {ld.tensor, MakeShape2(ld.row0 + row, ld.col0 + col, span), shape, shape},
+                    ld.kwargs, span),
+                span);
 }
 
 ExprPtr SliceBox(const ExprPtr& src, int64_t row, int64_t col, ExpandBuilder& b, const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  return b.Bind(
-      "box",
-      reg.Create("tile.slice",
-                 {src, MakeShape2(kMxPackTileM, kMxPackTileK, span), MakeShape2(row, col, span)}, {}, span),
-      span);
+  return b.Bind("box",
+                OpRegistry::GetInstance().Create(
+                    "tile.slice",
+                    {src, MakeShape2(kMxPackTileM, kMxPackTileK, span), MakeShape2(row, col, span)}, {},
+                    span),
+                span);
 }
 
-struct BoxQuant {
-  ExprPtr q_mk;  // [16, 64] FP8
-  ExprPtr s;     // [1, 32] E8M0
-};
-
-BoxQuant QuantizeBox(const ExprPtr& box, ExpandBuilder& b, const Span& span) {
+std::pair<ExprPtr, ExprPtr> QuantizeBox(const ExprPtr& box, ExpandBuilder& b, const Span& span) {
   auto& reg = OpRegistry::GetInstance();
-  auto box32 = b.Bind(
-      "box32", reg.Create("tile.reshape", {box, MakeShape2(kMxPackBoxRows, kMxPackGroup, span)}, {}, span),
-      span);
-  std::string mode = "mxfp8_e4m3";
-  auto pair = b.Bind("tq", reg.Create("tile.tquant_mx", {box32}, {{"mode", mode}}, span), span);
+  auto box32 =
+      b.Bind("box32", reg.Create("tile.reshape", {box, MakeShape2(kMxPackBoxRows, kMxPackGroup, span)},
+                                 {}, span),
+             span);
+  auto pair = b.Bind("tq", reg.Create("tile.tquant_mx", {box32}, {{"mode", std::string("mxfp8_e4m3")}}, span),
+                     span);
   auto q_box = b.Bind("qb", std::make_shared<TupleGetItemExpr>(pair, 0, span), span);
   auto s_box = b.Bind("sb", std::make_shared<TupleGetItemExpr>(pair, 1, span), span);
   auto q_mk = b.Bind(
@@ -218,49 +708,8 @@ BoxQuant QuantizeBox(const ExprPtr& box, ExpandBuilder& b, const Span& span) {
   return {q_mk, s_box};
 }
 
-ExprPtr CreateMxScaleU8Buffer(ExpandBuilder& b, int64_t groups, const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  auto groups_dim = MakeIndex(groups, span);
-  auto one = MakeIndex(1, span);
-  // UINT8 keeps the operation byte-oriented, while the MX fractal must match
-  // each reinterpreted FP8E8M0 source because assemble lowers through subviews.
-  TileView scale_u8_view;
-  scale_u8_view.valid_shape = {one, groups_dim};
-  scale_u8_view.blayout = TileLayout::row_major;
-  scale_u8_view.slayout = TileLayout::none_box;
-  scale_u8_view.fractal = tile_view_semantics::kMXScaleFractal;
-  auto scale_u8_type = std::make_shared<TileType>(std::vector<ExprPtr>{one, groups_dim}, DataType::UINT8,
-                                                  std::nullopt, scale_u8_view, MemorySpace::Vec);
-  auto scale_shape = MakeShape2(1, groups, span);
-  auto raw_create = As<Call>(reg.Create(
-      "tile.create", {scale_shape}, {{"dtype", DataType::UINT8}, {"target_memory", MemorySpace::Vec}}, span));
-  INTERNAL_CHECK_SPAN(raw_create, span) << "Internal error: MX scale tile.create did not produce a Call";
-  auto typed = std::make_shared<Call>(raw_create->op_, raw_create->args_, raw_create->kwargs_,
-                                      raw_create->attrs_, scale_u8_type, span);
-  return b.Bind("s_u8", typed, span);
-}
-
-ExprPtr ReinterpretMxScaleBuffer(const ExprPtr& scale_u8, int64_t groups, ExpandBuilder& b,
-                                 const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  auto one = MakeIndex(1, span);
-  auto groups_dim = MakeIndex(groups, span);
-  auto raw = As<Call>(reg.Create("tile.reinterpret_view", {scale_u8}, {{"dtype", DataType::FP8E8M0}}, span));
-  INTERNAL_CHECK_SPAN(raw, span) << "Internal error: MX scale reinterpret_view did not produce a Call";
-
-  TileView scale_view;
-  scale_view.valid_shape = {one, groups_dim};
-  scale_view.blayout = TileLayout::row_major;
-  scale_view.slayout = TileLayout::none_box;
-  scale_view.fractal = tile_view_semantics::kMXScaleFractal;
-  auto scale_type = std::make_shared<TileType>(std::vector<ExprPtr>{one, groups_dim}, DataType::FP8E8M0,
-                                               std::nullopt, scale_view, MemorySpace::Vec);
-  auto typed = std::make_shared<Call>(raw->op_, raw->args_, raw->kwargs_, raw->attrs_, scale_type, span);
-  return b.Bind("s", typed, span);
-}
-
-ExprPtr CreatePlainU8Buffer(ExpandBuilder& b, int64_t rows, int64_t cols, const std::string& name,
-                            const Span& span) {
+ExprPtr CreateTypedU8(ExpandBuilder& b, int64_t rows, int64_t cols, bool mx_scale, const std::string& name,
+                      const Span& span) {
   auto& reg = OpRegistry::GetInstance();
   auto r = MakeIndex(rows, span);
   auto c = MakeIndex(cols, span);
@@ -268,206 +717,33 @@ ExprPtr CreatePlainU8Buffer(ExpandBuilder& b, int64_t rows, int64_t cols, const 
   view.valid_shape = {r, c};
   view.blayout = TileLayout::row_major;
   view.slayout = TileLayout::none_box;
-  auto type = std::make_shared<TileType>(std::vector<ExprPtr>{r, c}, DataType::UINT8, std::nullopt, view,
-                                         MemorySpace::Vec);
-  auto shape = MakeShape2(rows, cols, span);
-  auto raw = As<Call>(reg.Create("tile.create", {shape},
+  if (mx_scale) view.fractal = tile_view_semantics::kMXScaleFractal;
+  auto type =
+      std::make_shared<TileType>(std::vector<ExprPtr>{r, c}, DataType::UINT8, std::nullopt, view,
+                                 MemorySpace::Vec);
+  auto raw = As<Call>(reg.Create("tile.create", {MakeShape2(rows, cols, span)},
                                  {{"dtype", DataType::UINT8}, {"target_memory", MemorySpace::Vec}}, span));
-  INTERNAL_CHECK_SPAN(raw, span) << "Internal error: quant tile.create did not produce a Call";
-  auto typed = std::make_shared<Call>(raw->op_, raw->args_, raw->kwargs_, raw->attrs_, type, span);
-  return b.Bind(name, typed, span);
+  INTERNAL_CHECK_SPAN(raw, span) << "Internal error: tile.create did not produce a Call";
+  return b.Bind(name, std::make_shared<Call>(raw->op_, raw->args_, raw->kwargs_, raw->attrs_, type, span),
+                span);
 }
 
-ExprPtr StoreTile(const ExprPtr& tile, int64_t row, int64_t col, const ExprPtr& tensor, ExpandBuilder& b,
-                  const Span& span) {
+ExprPtr ReinterpretMxScaleBuffer(const ExprPtr& scale_u8, int64_t groups, ExpandBuilder& b,
+                                 const Span& span) {
   auto& reg = OpRegistry::GetInstance();
-  return b.Bind("st", reg.Create("tile.store", {tile, MakeShape2(row, col, span), tensor}, {}, span), span);
-}
-
-struct StoreSite {
-  ExprPtr tensor;
-  int64_t row0 = 0;
-  int64_t col0 = 0;
-  const Var* result_var = nullptr;  // LHS of the store assign
-  const Var* stored_tile_var = nullptr;
-  const SeqStmts* parent_seq = nullptr;
-  size_t stmt_index = 0;
-};
-
-struct MxPackSite {
-  const Var* quant_var = nullptr;
-  TensorLayout layout = TensorLayout::ND;
-  ExprPtr src;
-  const SeqStmts* parent_seq = nullptr;
-  size_t stmt_index = 0;
-  std::optional<StoreSite> q_store;
-  std::optional<StoreSite> s_store;
-  bool outputs_are_store_only = false;
-};
-
-struct ExpansionResult {
-  ExprPtr quant;  // tile result (loaded back or assembled)
-  ExprPtr scale;
-  ExprPtr q_store_result;  // final stored tensor (if store-fused)
-  ExprPtr s_store_result;
-};
-
-struct FusedStoreReplacement {
-  ExprPtr tensor_result;
-};
-
-FusedStoreReplacement MakeFusedStoreReplacement(const ExprPtr& tensor_result) { return {tensor_result}; }
-
-ExpansionResult ExpandMxAZzStoreFused(const ResolvedTileLoad& ld, int64_t m, int64_t k,
-                                      const StoreSite& q_store, const StoreSite& s_store, ExpandBuilder& b,
-                                      const Span& span) {
-  // kb==1 only (enforced by CheckPackShape): M-box loop, linear scale columns.
-  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_A_ZZ expand requires K=" << kMxPackTileK;
-  const int64_t mb = m / kMxPackTileM;
-  ExprPtr q_t = q_store.tensor;
-  ExprPtr s_t = s_store.tensor;
-  std::vector<ExprPtr> chunk_tiles;
-  for (int64_t mi = 0; mi < mb; ++mi) {
-    auto box = LoadBox(ld, mi * kMxPackTileM, 0, b, span);
-    auto qq = QuantizeBox(box, b, span);
-    chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
-    q_t = StoreTile(qq.q_mk, q_store.row0 + mi * kMxPackTileM, q_store.col0, q_t, b, span);
-    s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + mi * kMxPackBoxRows, s_t, b, span);
-    if ((mi + 1) % kMxPackReuseChunkBoxes == 0 || mi + 1 == mb) {
-      b.DrainChunk(chunk_tiles, span);
-      chunk_tiles.clear();
-    }
-  }
-  return {nullptr, nullptr, q_t, s_t};
-}
-
-ExpansionResult ExpandMxBNnStoreFused(const ResolvedTileLoad& ld, int64_t n, int64_t k,
-                                      const StoreSite& q_store, const StoreSite& s_store, ExpandBuilder& b,
-                                      const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_B_NN expand requires K=" << kMxPackTileK;
-  const int64_t nb = n / kMxPackTileM;
-
-  // The [N,K] transpose input is compiler-owned temporary storage.  Reusing a
-  // shape-compatible Out/InOut parameter would silently overwrite user data.
-  auto nk_rows = MakeIndex(n, span);
-  auto nk_cols = MakeIndex(k, span);
-  TileView nk_view;
-  nk_view.valid_shape = {nk_rows, nk_cols};
-  nk_view.blayout = TileLayout::row_major;
-  nk_view.slayout = TileLayout::none_box;
-  auto nk_type = std::make_shared<TileType>(std::vector<ExprPtr>{nk_rows, nk_cols}, DataType::FP8E4M3FN,
-                                            std::nullopt, nk_view, MemorySpace::Vec);
-  auto nk_shape = MakeShape2(n, k, span);
-  auto raw_nk =
-      As<Call>(reg.Create("tile.create", {nk_shape},
-                          {{"dtype", DataType::FP8E4M3FN}, {"target_memory", MemorySpace::Vec}}, span));
-  INTERNAL_CHECK_SPAN(raw_nk, span) << "Internal error: B quant tile.create did not produce a Call";
-  auto typed_nk =
-      std::make_shared<Call>(raw_nk->op_, raw_nk->args_, raw_nk->kwargs_, raw_nk->attrs_, nk_type, span);
-  ExprPtr nk_t = b.Bind("nk_q", typed_nk, span);
-
-  ExprPtr s_t = s_store.tensor;
-  std::vector<ExprPtr> chunk_tiles;
-  for (int64_t ni = 0; ni < nb; ++ni) {
-    auto box = LoadBox(ld, ni * kMxPackTileM, 0, b, span);
-    auto qq = QuantizeBox(box, b, span);
-    chunk_tiles.insert(chunk_tiles.end(), {box, qq.q_mk, qq.s});
-    nk_t = b.Bind(
-        "nk_q",
-        reg.Create("tile.assemble", {nk_t, qq.q_mk, MakeShape2(ni * kMxPackTileM, 0, span)}, {}, span),
-        span);
-    s_t = StoreTile(qq.s, s_store.row0, s_store.col0 + ni * kMxPackBoxRows, s_t, b, span);
-    if ((ni + 1) % kMxPackReuseChunkBoxes == 0 || ni + 1 == nb) {
-      b.DrainChunk(chunk_tiles, span);
-      chunk_tiles.clear();
-    }
-  }
-
-  ExprPtr nk_q = nk_t;
-  auto nk_i8 =
-      b.Bind("nk_i8", reg.Create("tile.reinterpret_view", {nk_q}, {{"dtype", DataType::INT8}}, span), span);
-  auto kn_i8 = b.Bind(
-      "kn_i8", reg.Create("tile.transpose", {nk_i8, MakeIndex(0, span), MakeIndex(1, span)}, {}, span), span);
-  auto kn_q = b.Bind(
-      "kn_q", reg.Create("tile.reinterpret_view", {kn_i8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
-  ExprPtr q_t = StoreTile(kn_q, q_store.row0, q_store.col0, q_store.tensor, b, span);
-  b.DrainChunk({nk_q, kn_q}, span, "transpose_keep");
-
-  return {nullptr, nullptr, q_t, s_t};
-}
-
-std::pair<ExprPtr, ExprPtr> ExpandMxAZzAssemble(const ExprPtr& src, const std::optional<ResolvedTileLoad>& ld,
-                                                int64_t m, int64_t k, ExpandBuilder& b, const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_A_ZZ assemble requires K=" << kMxPackTileK;
-  const int64_t mb = m / kMxPackTileM;
-  const int64_t groups = m * k / kMxPackGroup;
-
-  auto q_u8 = CreatePlainU8Buffer(b, m, k, "q_u8", span);
-  auto s_u8 = CreateMxScaleU8Buffer(b, groups, span);
-
-  for (int64_t mi = 0; mi < mb; ++mi) {
-    ExprPtr box = ld ? LoadBox(*ld, mi * kMxPackTileM, 0, b, span)
-                     : SliceBox(src, mi * kMxPackTileM, 0, b, span);
-    auto qq = QuantizeBox(box, b, span);
-    auto q_mk_u8 = b.Bind(
-        "qmk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
-    q_u8 = b.Bind(
-        "q_u8",
-        reg.Create("tile.assemble", {q_u8, q_mk_u8, MakeShape2(mi * kMxPackTileM, 0, span)}, {}, span),
-        span);
-    auto s_box_u8 = b.Bind(
-        "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
-    s_u8 = b.Bind(
-        "s_u8",
-        reg.Create("tile.assemble", {s_u8, s_box_u8, MakeShape2(0, mi * kMxPackBoxRows, span)}, {}, span),
-        span);
-  }
-  auto q_acc =
-      b.Bind("q", reg.Create("tile.reinterpret_view", {q_u8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
-  auto s_acc = ReinterpretMxScaleBuffer(s_u8, groups, b, span);
-  return {q_acc, s_acc};
-}
-
-std::pair<ExprPtr, ExprPtr> ExpandMxBNnAssemble(const ExprPtr& src, const std::optional<ResolvedTileLoad>& ld,
-                                                int64_t n, int64_t k, ExpandBuilder& b, const Span& span) {
-  auto& reg = OpRegistry::GetInstance();
-  INTERNAL_CHECK_SPAN(k == kMxPackTileK, span) << "Internal error: MX_B_NN assemble requires K=" << kMxPackTileK;
-  const int64_t nb = n / kMxPackTileM;
-  const int64_t groups = (k / kMxPackGroup) * n;
-
-  auto nk_u8 = CreatePlainU8Buffer(b, n, k, "nk_u8", span);
-  auto s_u8 = CreateMxScaleU8Buffer(b, groups, span);
-
-  for (int64_t ni = 0; ni < nb; ++ni) {
-    ExprPtr box = ld ? LoadBox(*ld, ni * kMxPackTileM, 0, b, span)
-                     : SliceBox(src, ni * kMxPackTileM, 0, b, span);
-    auto qq = QuantizeBox(box, b, span);
-    auto q_nk_u8 = b.Bind(
-        "qnk_u8", reg.Create("tile.reinterpret_view", {qq.q_mk}, {{"dtype", DataType::UINT8}}, span), span);
-    nk_u8 = b.Bind(
-        "nk_u8",
-        reg.Create("tile.assemble", {nk_u8, q_nk_u8, MakeShape2(ni * kMxPackTileM, 0, span)}, {}, span),
-        span);
-    auto s_box_u8 = b.Bind(
-        "sb_u8", reg.Create("tile.reinterpret_view", {qq.s}, {{"dtype", DataType::UINT8}}, span), span);
-    s_u8 = b.Bind(
-        "s_u8",
-        reg.Create("tile.assemble", {s_u8, s_box_u8, MakeShape2(0, ni * kMxPackBoxRows, span)}, {}, span),
-        span);
-  }
-
-  auto nk_q = b.Bind(
-      "nk_q", reg.Create("tile.reinterpret_view", {nk_u8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
-  auto nk_i8 =
-      b.Bind("nk_i8", reg.Create("tile.reinterpret_view", {nk_q}, {{"dtype", DataType::INT8}}, span), span);
-  auto kn_i8 = b.Bind(
-      "kn_i8", reg.Create("tile.transpose", {nk_i8, MakeIndex(0, span), MakeIndex(1, span)}, {}, span), span);
-  auto kn_q = b.Bind(
-      "kn_q", reg.Create("tile.reinterpret_view", {kn_i8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
-  auto s_acc = ReinterpretMxScaleBuffer(s_u8, groups, b, span);
-  return {kn_q, s_acc};
+  auto raw = As<Call>(reg.Create("tile.reinterpret_view", {scale_u8}, {{"dtype", DataType::FP8E8M0}}, span));
+  INTERNAL_CHECK_SPAN(raw, span) << "Internal error: MX scale reinterpret_view did not produce a Call";
+  auto one = MakeIndex(1, span);
+  auto groups_dim = MakeIndex(groups, span);
+  TileView scale_view;
+  scale_view.valid_shape = {one, groups_dim};
+  scale_view.blayout = TileLayout::row_major;
+  scale_view.slayout = TileLayout::none_box;
+  scale_view.fractal = tile_view_semantics::kMXScaleFractal;
+  auto scale_type = std::make_shared<TileType>(std::vector<ExprPtr>{one, groups_dim}, DataType::FP8E8M0,
+                                               std::nullopt, scale_view, MemorySpace::Vec);
+  return b.Bind("s", std::make_shared<Call>(raw->op_, raw->args_, raw->kwargs_, raw->attrs_, scale_type, span),
+                span);
 }
 
 void CheckPackShape(TensorLayout layout, int64_t d0, int64_t d1, const Span& span) {
@@ -475,14 +751,74 @@ void CheckPackShape(TensorLayout layout, int64_t d0, int64_t d1, const Span& spa
   CHECK_SPAN(d0 % kMxPackTileM == 0 && d1 % kMxPackTileK == 0, span)
       << "tile.tquant_mx(layout=" << name << ") requires dim0%" << kMxPackTileM << "==0 and dim1%"
       << kMxPackTileK << "==0, got [" << d0 << ", " << d1 << "]";
-  // kb==1 only: multi-K-box packed expand is not a substitute for large-K matmul
-  // (Phase0: concat of chunk packs ≠ full MX_A_ZZ). Chunk quant + SplitLargeKMxMatmul.
-  CHECK_SPAN(d1 == kMxPackTileK, span)
-      << "tile.tquant_mx(layout=" << name << ") currently supports only a single K-box "
-         "(K="
-      << kMxPackTileK << "), got K=" << d1
-      << "; quantize each K=" << kMxPackTileK
-      << " chunk separately and use SplitLargeKMxMatmul / matmul_mx_acc for K>" << kMxPackTileK;
+}
+
+std::pair<ExprPtr, ExprPtr> ExpandMxPackedAssemble(TensorLayout layout, const ExprPtr& src,
+                                                   const std::optional<ResolvedTileLoad>& ld, int64_t d0,
+                                                   int64_t k, ExpandBuilder& b, const Span& span) {
+  auto& reg = OpRegistry::GetInstance();
+  INTERNAL_CHECK_SPAN(k > 0 && (k % kMxPackTileK) == 0, span)
+      << "Internal error: MX packed assemble requires K%" << kMxPackTileK << "==0, got K=" << k;
+  // Full-pack order matches host _pack_a_scale / _pack_b_scale: (mb|nb outer, kb inner).
+  // Co-split (Phase 1) uses chunk-cat order instead when quant feeds matmul_mx.
+  const int64_t mboxes = d0 / kMxPackTileM;
+  const int64_t kboxes = k / kMxPackTileK;
+  const int64_t total_boxes = mboxes * kboxes;
+  const int64_t groups = d0 * k / kMxPackGroup;
+  const bool is_a = layout == TensorLayout::MX_A_ZZ;
+
+  auto q_u8 = CreateTypedU8(b, d0, k, false, is_a ? "q_u8" : "nk_u8", span);
+  auto s_u8 = CreateTypedU8(b, 1, groups, true, "s_u8", span);
+
+  std::vector<ExprPtr> chunk_tiles;
+  int64_t box_i = 0;
+  for (int64_t mb = 0; mb < mboxes; ++mb) {
+    for (int64_t kb = 0; kb < kboxes; ++kb) {
+      const int64_t row = mb * kMxPackTileM;
+      const int64_t col = kb * kMxPackTileK;
+      const int64_t box_id = mb * kboxes + kb;
+      ExprPtr box = ld ? LoadBox(*ld, row, col, b, span) : SliceBox(src, row, col, b, span);
+      auto [q_mk, s_box] = QuantizeBox(box, b, span);
+      chunk_tiles.insert(chunk_tiles.end(), {box, q_mk, s_box});
+
+      auto q_box_u8 =
+          b.Bind(is_a ? "qmk_u8" : "qnk_u8",
+                 reg.Create("tile.reinterpret_view", {q_mk}, {{"dtype", DataType::UINT8}}, span), span);
+      q_u8 = b.Bind(is_a ? "q_u8" : "nk_u8",
+                    reg.Create("tile.assemble", {q_u8, q_box_u8, MakeShape2(row, col, span)}, {}, span),
+                    span);
+      auto s_box_u8 =
+          b.Bind("sb_u8", reg.Create("tile.reinterpret_view", {s_box}, {{"dtype", DataType::UINT8}}, span),
+                 span);
+      s_u8 = b.Bind("s_u8",
+                    reg.Create("tile.assemble",
+                               {s_u8, s_box_u8, MakeShape2(0, box_id * kMxPackBoxRows, span)}, {}, span),
+                    span);
+      ++box_i;
+      if (box_i % kMxPackReuseChunkBoxes == 0 || box_i == total_boxes) {
+        b.DrainChunk(chunk_tiles, span);
+        chunk_tiles.clear();
+      }
+    }
+  }
+
+  auto s_acc = ReinterpretMxScaleBuffer(s_u8, groups, b, span);
+  if (is_a) {
+    return {b.Bind("q", reg.Create("tile.reinterpret_view", {q_u8}, {{"dtype", DataType::FP8E4M3FN}}, span),
+                   span),
+            s_acc};
+  }
+  auto nk_q =
+      b.Bind("nk_q", reg.Create("tile.reinterpret_view", {q_u8}, {{"dtype", DataType::FP8E4M3FN}}, span),
+             span);
+  auto nk_i8 =
+      b.Bind("nk_i8", reg.Create("tile.reinterpret_view", {nk_q}, {{"dtype", DataType::INT8}}, span), span);
+  auto kn_i8 = b.Bind(
+      "kn_i8", reg.Create("tile.transpose", {nk_i8, MakeIndex(0, span), MakeIndex(1, span)}, {}, span), span);
+  auto kn_q = b.Bind(
+      "kn_q", reg.Create("tile.reinterpret_view", {kn_i8}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
+  b.DrainChunk({nk_q, kn_q}, span, "transpose_keep");
+  return {kn_q, s_acc};
 }
 
 class ExpandMxPackedQuantMutator : public IRMutator {
@@ -499,48 +835,22 @@ class ExpandMxPackedQuantMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    // Store-fused expansion reloads every box directly from the source tensor.
-    // Drop the aggregate tile.load when the collector proved that packed quant
-    // was its only consumer, while retaining the definition for LoadBox
-    // resolution below.
-    if (dead_source_loads_.count(op->var_.get()) != 0) {
-      def_map_[op->var_.get()] = op->value_;
-      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
-    }
-
-    // Both tuple projections are dead after their only consumers (the two
-    // stores) were fused into the expansion.
-    if (dead_result_aliases_.count(op->var_.get()) != 0) {
-      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
-    }
-
-    // Remap stores that were already emitted by a fused expand. Per-box async
-    // lifetimes are bounded by the PIPE_ALL chunk drains emitted inside the
-    // expansion.
-    if (auto it = store_results_.find(op->var_.get()); it != store_results_.end()) {
-      def_map_[op->var_.get()] = it->second.tensor_result;
-      return std::make_shared<AssignStmt>(op->var_, it->second.tensor_result, op->span_);
-    }
-
     auto call = As<Call>(op->value_);
     auto layout = GetMxPackLayout(call);
-    if (!layout.has_value()) {
+    if (!layout) {
       if (!call) {
         if (const Var* source = GetVarIdentity(op->value_)) {
           if (auto it = tuple_outputs_.find(source); it != tuple_outputs_.end()) {
             tuple_outputs_[op->var_.get()] = it->second;
             auto tuple_value =
                 std::make_shared<MakeTuple>(std::vector<ExprPtr>{it->second[0], it->second[1]}, op->span_);
-            auto stmt = std::make_shared<AssignStmt>(op->var_, tuple_value, op->span_);
             def_map_[op->var_.get()] = tuple_value;
-            return stmt;
+            return std::make_shared<AssignStmt>(op->var_, tuple_value, op->span_);
           }
         }
       }
       auto new_stmt = IRMutator::VisitStmt_(op);
-      if (auto as = As<AssignStmt>(new_stmt)) {
-        def_map_[as->var_.get()] = as->value_;
-      }
+      if (auto as = As<AssignStmt>(new_stmt)) def_map_[as->var_.get()] = as->value_;
       return new_stmt;
     }
 
@@ -554,322 +864,36 @@ class ExpandMxPackedQuantMutator : public IRMutator {
     INTERNAL_CHECK_SPAN(d0 && d1, span) << "Internal error: MX packed quant expand requires static shape";
     CheckPackShape(*layout, d0->value_, d1->value_, span);
 
-    auto resolved = ResolveTileLoad(src, def_map_);
     ExpandBuilder builder(op->var_->name_hint_, temp_counter_);
-
-    // Prefer store-fused expand when both consumer stores were recorded.
-    auto site_it = pack_sites_.find(op->var_.get());
-    const bool can_fuse = site_it != pack_sites_.end() && site_it->second.q_store &&
-                          site_it->second.s_store && site_it->second.outputs_are_store_only &&
-                          resolved.has_value();
-
-    ExpansionResult outs;
-    if (can_fuse) {
-      const auto& site = site_it->second;
-      if (*layout == TensorLayout::MX_A_ZZ) {
-        outs = ExpandMxAZzStoreFused(*resolved, d0->value_, d1->value_, *site.q_store, *site.s_store, builder,
-                                     span);
-      } else {
-        outs = ExpandMxBNnStoreFused(*resolved, d0->value_, d1->value_, *site.q_store, *site.s_store, builder,
-                                     span);
-      }
-      if (site.q_store->result_var) {
-        store_results_[site.q_store->result_var] = MakeFusedStoreReplacement(outs.q_store_result);
-      }
-      if (site.s_store->result_var) {
-        store_results_[site.s_store->result_var] = MakeFusedStoreReplacement(outs.s_store_result);
-      }
-    } else {
-      auto pair = (*layout == TensorLayout::MX_A_ZZ)
-                      ? ExpandMxAZzAssemble(src, resolved, d0->value_, d1->value_, builder, span)
-                      : ExpandMxBNnAssemble(src, resolved, d0->value_, d1->value_, builder, span);
-      outs.quant = pair.first;
-      outs.scale = pair.second;
-    }
-
+    auto [quant, scale] =
+        ExpandMxPackedAssemble(*layout, src, ResolveTileLoad(src, def_map_), d0->value_, d1->value_,
+                               builder, span);
     auto stmts = builder.TakeStmts();
-    if (can_fuse && site_it->second.outputs_are_store_only) {
-      return std::make_shared<SeqStmts>(std::move(stmts), span);
-    }
-
-    tuple_outputs_[op->var_.get()] = {outs.quant, outs.scale};
-    auto tuple_val = std::make_shared<MakeTuple>(std::vector<ExprPtr>{outs.quant, outs.scale}, span);
+    tuple_outputs_[op->var_.get()] = {quant, scale};
+    auto tuple_val = std::make_shared<MakeTuple>(std::vector<ExprPtr>{quant, scale}, span);
     stmts.push_back(std::make_shared<AssignStmt>(op->var_, tuple_val, span));
     def_map_[op->var_.get()] = tuple_val;
     return std::make_shared<SeqStmts>(std::move(stmts), span);
   }
 
-  void SetPackSites(std::unordered_map<const Var*, MxPackSite> sites) { pack_sites_ = std::move(sites); }
-
-  void SetDeadSourceLoads(std::unordered_set<const Var*> loads) { dead_source_loads_ = std::move(loads); }
-
-  void SetDeadResultAliases(std::unordered_set<const Var*> aliases) {
-    dead_result_aliases_ = std::move(aliases);
-  }
-
  private:
   std::size_t temp_counter_ = 0;
   std::unordered_map<const Var*, std::array<ExprPtr, 2>> tuple_outputs_;
-  std::unordered_map<const Var*, ExprPtr> def_map_;
-  std::unordered_map<const Var*, MxPackSite> pack_sites_;
-  std::unordered_map<const Var*, FusedStoreReplacement> store_results_;
-  std::unordered_set<const Var*> dead_source_loads_;
-  std::unordered_set<const Var*> dead_result_aliases_;
-};
-
-class CollectMxPackSites : public IRVisitor {
- public:
-  explicit CollectMxPackSites(const std::vector<VarPtr>& params) {
-    for (const auto& param : params) {
-      function_params_.insert(param.get());
-    }
-  }
-
-  void VisitStmt_(const SeqStmtsPtr& op) override {
-    const SeqStmts* saved_seq = current_seq_;
-    const size_t saved_index = current_stmt_index_;
-    current_seq_ = op.get();
-    for (size_t i = 0; i < op->stmts_.size(); ++i) {
-      current_stmt_index_ = i;
-      VisitStmt(op->stmts_[i]);
-    }
-    current_seq_ = saved_seq;
-    current_stmt_index_ = saved_index;
-  }
-
-  void VisitExpr_(const VarPtr& op) override {
-    ++use_counts_[op.get()];
-    IRVisitor::VisitExpr_(op);
-  }
-
-  void VisitStmt_(const AssignStmtPtr& op) override {
-    def_map_[op->var_.get()] = op->value_;
-
-    if (auto layout = GetMxPackLayout(As<Call>(op->value_))) {
-      MxPackSite site;
-      site.quant_var = op->var_.get();
-      site.layout = *layout;
-      site.src = As<Call>(op->value_)->args_[0];
-      site.parent_seq = current_seq_;
-      site.stmt_index = current_stmt_index_;
-      sites_.emplace(op->var_.get(), std::move(site));
-      VisitExpr(op->value_);
-      return;
-    }
-
-    auto call = As<Call>(op->value_);
-    if (call && IsOp(call, "tile.store") && call->args_.size() >= 3) {
-      TryAttachStore(op, call);
-    }
-    // The assignment target is a definition, not a use.  Visiting the default
-    // AssignStmt traversal would count it and prevent single-consumer source
-    // loads from being recognized as dead.
-    VisitExpr(op->value_);
-  }
-
-  std::unordered_map<const Var*, MxPackSite> TakeSites() { return std::move(sites_); }
-
-  void DiscardUnsafeStoreSites() {
-    for (auto& [_, site] : sites_) {
-      if (!IsSafeStoreFusion(site)) {
-        site.q_store.reset();
-        site.s_store.reset();
-      }
-    }
-  }
-
-  std::unordered_set<const Var*> FindDeadSourceLoads() const {
-    std::unordered_set<const Var*> result;
-    for (const auto& [_, site] : sites_) {
-      if (!site.outputs_are_store_only) continue;
-      if (!ResolveTileLoad(site.src, def_map_)) continue;
-      const Var* source = GetVarIdentity(site.src);
-      if (!source) continue;
-      auto use_it = use_counts_.find(source);
-      if (use_it == use_counts_.end() || use_it->second != 1) continue;
-      auto def_it = def_map_.find(source);
-      auto load = def_it == def_map_.end() ? nullptr : As<Call>(def_it->second);
-      if (load && IsOp(load, "tile.load")) result.insert(source);
-    }
-    return result;
-  }
-
-  std::unordered_set<const Var*> MarkStoreOnlyOutputs() {
-    std::unordered_set<const Var*> result;
-    for (auto& [_, site] : sites_) {
-      if (!site.q_store || !site.s_store) continue;
-      // Projection aliases can be removed only when the mutator will take the
-      // store-fused path.  A transformed source such as abs(tile.load(...))
-      // falls back to tile.slice/assemble and still needs both aliases for the
-      // original stores.
-      if (!ResolveTileLoad(site.src, def_map_)) continue;
-      const Var* q_var = site.q_store->stored_tile_var;
-      const Var* s_var = site.s_store->stored_tile_var;
-      if (!IsExclusiveProjection(q_var, site.quant_var, 0) ||
-          !IsExclusiveProjection(s_var, site.quant_var, 1)) {
-        continue;
-      }
-      auto tuple_uses = use_counts_.find(site.quant_var);
-      if (tuple_uses == use_counts_.end() || tuple_uses->second != 2) continue;
-      site.outputs_are_store_only = true;
-      result.insert(q_var);
-      result.insert(s_var);
-    }
-    return result;
-  }
-
- private:
-  class VarUseFinder : public IRVisitor {
-   public:
-    explicit VarUseFinder(const Var* target) : target_(target) {}
-
-    void VisitExpr_(const VarPtr& op) override {
-      if (op.get() == target_) used_ = true;
-      IRVisitor::VisitExpr_(op);
-    }
-
-    [[nodiscard]] bool used() const { return used_; }
-
-   private:
-    const Var* target_;
-    bool used_ = false;
-  };
-
-  static bool StmtUsesVar(const StmtPtr& stmt, const Var* target) {
-    VarUseFinder finder(target);
-    finder.VisitStmt(stmt);
-    return finder.used();
-  }
-
-  static bool HasInterveningUse(const MxPackSite& site, const StoreSite& store) {
-    const Var* tensor = GetVarIdentity(store.tensor);
-    if (!tensor || !site.parent_seq) return true;
-    for (size_t i = site.stmt_index + 1; i < store.stmt_index; ++i) {
-      if (StmtUsesVar(site.parent_seq->stmts_[i], tensor)) return true;
-    }
-    return false;
-  }
-
-  bool IsSafeStoreFusion(const MxPackSite& site) const {
-    if (!site.q_store || !site.s_store || !site.parent_seq) return false;
-    const auto& q_store = *site.q_store;
-    const auto& s_store = *site.s_store;
-    if (q_store.parent_seq != site.parent_seq || s_store.parent_seq != site.parent_seq) return false;
-    if (q_store.stmt_index <= site.stmt_index || s_store.stmt_index <= site.stmt_index) return false;
-
-    // Fusion emits the destination writes at the quantization site.  Do not
-    // move either write across an intervening read/update of that same tensor;
-    // the replacement AssignStmt remains at the old store site, but the GM
-    // side effect itself would otherwise become observable too early.
-    if (HasInterveningUse(site, q_store) || HasInterveningUse(site, s_store)) return false;
-
-    // The fused implementation reloads the source one box at a time.  If a
-    // destination is also the source tensor, those writes could clobber boxes
-    // that the original aggregate load had already captured.
-    auto source_load = ResolveTileLoad(site.src, def_map_);
-    if (!source_load) return false;
-    const Var* source_tensor = GetVarIdentity(source_load->tensor);
-    const Var* q_tensor = GetVarIdentity(q_store.tensor);
-    const Var* s_tensor = GetVarIdentity(s_store.tensor);
-    return !source_tensor || (source_tensor != q_tensor && source_tensor != s_tensor);
-  }
-
-  bool IsExclusiveProjection(const Var* projection, const Var* tuple, int index) const {
-    if (!projection) return false;
-    auto uses = use_counts_.find(projection);
-    if (uses == use_counts_.end() || uses->second != 1) return false;
-    auto def = def_map_.find(projection);
-    if (def == def_map_.end()) return false;
-    auto get = As<TupleGetItemExpr>(def->second);
-    return get && get->index_ == index && GetVarIdentity(get->tuple_) == tuple;
-  }
-
-  void TryAttachStore(const AssignStmtPtr& op, const CallPtr& store_call) {
-    ExprPtr tile = store_call->args_[0];
-    int index = -1;
-    const Var* quant_var = nullptr;
-
-    if (auto get = As<TupleGetItemExpr>(tile)) {
-      quant_var = GetVarIdentity(get->tuple_);
-      index = get->index_;
-    } else if (const Var* tv = GetVarIdentity(tile)) {
-      // Follow aliases: q = tuple[0]
-      auto it = def_map_.find(tv);
-      if (it != def_map_.end()) {
-        if (auto get = As<TupleGetItemExpr>(it->second)) {
-          quant_var = GetVarIdentity(get->tuple_);
-          index = get->index_;
-        }
-      }
-    }
-    if (!quant_var || (index != 0 && index != 1)) return;
-    auto sit = sites_.find(quant_var);
-    if (sit == sites_.end()) return;
-    if (!current_seq_ || sit->second.parent_seq != current_seq_) return;
-
-    // Moving the store to the quantization site is safe only for destination
-    // buffers that already exist at function entry.  A later SSA tensor value
-    // would become a free variable, and an intervening update would be
-    // reordered across the fused store.
-    const Var* store_tensor = GetVarIdentity(store_call->args_[2]);
-    if (!store_tensor || function_params_.count(store_tensor) == 0) return;
-
-    int64_t r = 0;
-    int64_t c = 0;
-    if (!ConstOffset2(store_call->args_[1], &r, &c)) return;
-    StoreSite ss;
-    ss.tensor = store_call->args_[2];
-    ss.row0 = r;
-    ss.col0 = c;
-    ss.result_var = op->var_.get();
-    ss.stored_tile_var = GetVarIdentity(tile);
-    ss.parent_seq = current_seq_;
-    ss.stmt_index = current_stmt_index_;
-    if (index == 0) {
-      sit->second.q_store = ss;
-    } else {
-      sit->second.s_store = ss;
-    }
-  }
-
-  std::unordered_map<const Var*, ExprPtr> def_map_;
-  std::unordered_map<const Var*, MxPackSite> sites_;
-  std::unordered_map<const Var*, size_t> use_counts_;
-  std::unordered_set<const Var*> function_params_;
-  const SeqStmts* current_seq_ = nullptr;
-  size_t current_stmt_index_ = 0;
+  DefMap def_map_;
 };
 
 }  // namespace
 
 Pass ExpandMxPackedQuant() {
   auto pass_func = [](const FunctionPtr& func) -> FunctionPtr {
-    if (!func || !func->body_) {
-      return func;
-    }
-    if (!IsInCoreType(func->func_type_)) {
-      return func;
-    }
-    CollectMxPackSites collector(func->params_);
-    collector.VisitStmt(func->body_);
-    collector.DiscardUnsafeStoreSites();
-    auto dead_result_aliases = collector.MarkStoreOnlyOutputs();
-    auto dead_source_loads = collector.FindDeadSourceLoads();
-    auto sites = collector.TakeSites();
-    if (sites.empty()) {
-      return func;
-    }
-    ExpandMxPackedQuantMutator mutator;
-    mutator.SetPackSites(std::move(sites));
-    mutator.SetDeadSourceLoads(std::move(dead_source_loads));
-    mutator.SetDeadResultAliases(std::move(dead_result_aliases));
-    auto new_body = mutator.VisitStmt(func->body_);
-    if (new_body.get() == func->body_.get()) {
-      return func;
-    }
-    return std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
-                                      func->return_types_, new_body, func->span_, func->func_type_,
-                                      func->level_, func->role_, func->attrs_);
+    if (!func || !func->body_ || !IsInCoreType(func->func_type_)) return func;
+    // K-split first so co-split sees direct TupleGetItem(quant, 1) flat scales.
+    KSplitMxMutator split(func->body_);
+    auto after_split = WithBody(func, split.RewriteBody(func->body_));
+    LegalizeFlatMxScaleMutator legalize;
+    auto after_legalize = WithBody(after_split, legalize.RewriteBody(after_split->body_));
+    ExpandMxPackedQuantMutator expand;
+    return WithBody(after_legalize, expand.VisitStmt(after_legalize->body_));
   };
   return CreateFunctionPass(pass_func, "ExpandMxPackedQuant", kExpandMxPackedQuantProperties);
 }

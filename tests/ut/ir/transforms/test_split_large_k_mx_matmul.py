@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for SplitLargeKMxMatmul pass."""
+"""Unit tests for ExpandMxPackedQuant Phase-1 K-split of large-K MX matmul."""
 
 import pypto.language as pl
 import pytest
@@ -21,12 +21,12 @@ def _reset_backend():
     backend.reset_for_testing()
 
 
-class TestSplitLargeKMxMatmul:
-    """SplitLargeKMxMatmul rewrites static K>64 MX matmul into K=64 chunks."""
+class TestExpandMxPackedQuantKSplit:
+    """Phase-1 K-split rewrites static K>64 MX matmul into K=64 chunks."""
 
     @staticmethod
     def _run(program):
-        return passes.split_large_k_mx_matmul()(passes.infer_tile_memory_space()(program))
+        return passes.expand_mx_packed_quant()(program)
 
     @staticmethod
     def _collect_calls(program, op_name: str):
@@ -93,7 +93,7 @@ class TestSplitLargeKMxMatmul:
         assert len(slices) == 8
 
         # Idempotent: second run must not invent more chunks.
-        twice = passes.split_large_k_mx_matmul()(after)
+        twice = passes.expand_mx_packed_quant()(after)
         assert len(self._collect_calls(twice, "tile.matmul_mx")) == 1
         assert len(self._collect_calls(twice, "tile.matmul_mx_acc")) == 1
 

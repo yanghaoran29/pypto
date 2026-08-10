@@ -29,14 +29,13 @@ a pipeline pass at all.
 | 09 | [OutlineClusterScopes](09-outline_cluster_scopes.md) | Outlines Cluster scopes into Group functions and standalone Spmd scopes into Spmd functions |
 | 10 | [ConvertTensorToTileOps](10-convert_tensor_to_tile_ops.md) | Converts tensor ops to tile ops in InCore functions, updating orchestration call sites |
 | 11 | [OptimizeOrchTensors](11-optimize_orch_tensors.md) | Eliminates redundant orchestration allocations and improves data flow |
-| 12 | [ExpandMxPackedQuant](12-expand_mx_packed_quant.md) | Expands packed MX quantization into flat hardware quantization over 16×64 boxes |
+| 12 | [ExpandMxPackedQuant](12-expand_mx_packed_quant.md) | K-splits large packed quant/`matmul_mx`, then expands packed MX quant over 16×64 boxes |
 | 13 | [LowerCompositeOps](13-lower_composite_ops.md) | Decomposes composite tile / distributed ops into primitives |
 | 14 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | Flattens 3D+ tile operations to 2D by merging all but the last dimension |
 | 15 | [LegalizeTileCast](15-legalize_tile_cast.md) | Expands `tile.cast` pairs the ISA cannot emit as one instruction into the shortest native chain |
 | 16 | [AutoTileMatmulL0](16-auto_tile_matmul_l0.md) | Picks an L0 tile shape `(m, n, k)` from the backend's L0 capacities and tiles matmuls to it |
 | 17 | [CanonicalizeTileSlice](17-canonicalize_tile_slice.md) | Lowers `tile.slice` into the canonical `tile.extract` form |
 | 18 | [InferTileMemorySpace](18-infer_tile_memory_space.md) | Infers the on-chip `MemorySpace` of every tile and inserts `tile.move` to legalize mismatches |
-| 19 | [SplitLargeKMxMatmul](19-split_large_k_mx_matmul.md) | Splits static K>64 MX matmul into a K=64 `matmul_mx` / `matmul_mx_acc` chain |
 | 20 | [InsertMxScaleAddr](20-insert_mx_scale_addr.md) | Inserts `tile.tget_scale_addr` before MX matmul consumers after memory spaces are resolved |
 | 20 | [ResolveBackendOpLayouts](20-resolve_backend_op_layouts.md) | Repairs backend-required tile layouts for elementwise ops |
 | 21 | [LowerAutoVectorSplit](21-lower_auto_vector_split.md) | Converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form |

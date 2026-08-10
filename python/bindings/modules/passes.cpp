@@ -495,12 +495,6 @@ void BindPass(nb::module_& m) {
              "The dead tile.slice is then dropped, unifying Mat->Left/Right on pto.textract.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
-  passes.def("split_large_k_mx_matmul", &pass::SplitLargeKMxMatmul,
-             "Create a pass that splits large-K MX matmul into K=64 chunks\n\n"
-             "When tile.matmul_mx / _acc / _bias has static K>64 and K%64==0, rewrites\n"
-             "it into K=64 slices: first chunk matmul_mx (or matmul_mx_bias), remaining\n"
-             "chunks matmul_mx_acc. Scale tiles are sliced by ceil(64/32)=2 groups.\n"
-             "Run after InferTileMemorySpace and before InsertMxScaleAddr.");
   passes.def("insert_mx_scale_addr", &pass::InsertMxScaleAddr,
              "Create a pass that inserts tile.tget_scale_addr before MX matmul consumers\n\n"
              "Requires InferTileMemorySpace first so Left/LeftScale and Right/RightScale\n"
@@ -538,10 +532,12 @@ void BindPass(nb::module_& m) {
       "simplify", &pass::Simplify,
       "Create a pass that simplifies expressions and statements using algebraic rules and bound analysis");
   passes.def("expand_mx_packed_quant", &pass::ExpandMxPackedQuant,
-             "Expand tile.tquant_mx(layout=MX_A_ZZ|MX_B_NN) into per-box flat quant + ZZ/NN scales.\n\n"
-             "Must run before LowerCompositeOps. B (MX_B_NN) also inserts an INT8 [N,K]->[K,N]\n"
-             "transpose. Public pl.quant_mx(layout=...) emits the packed form; this pass\n"
-             "materializes its per-box implementation.");
+             "K-split large-K MX quant/matmul, then expand packed tquant_mx(layout).\n\n"
+             "Phase 1: static K>64 matmul_mx (+ co-split of feeding packed quant) into\n"
+             "K=64 chunks (chunk scale layout). Phase 2: reshape flat [1,G] matmul\n"
+             "scales. Phase 3: expand MX_A_ZZ/MX_B_NN into per-box flat quant +\n"
+             "full-pack ZZ/NN scales (mb|nb outer, kb inner; B also INT8\n"
+             "[N,K]->[K,N] transpose). Must run before LowerCompositeOps.");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
              "Decompose composite tile/distributed ops into primitives via the "
              "composite-lowering registry. Today lowers tile.sin/tile.cos, flat "

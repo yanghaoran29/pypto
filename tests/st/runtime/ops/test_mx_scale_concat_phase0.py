@@ -273,17 +273,7 @@ class TestPhase0ConcatVsFullZz:
     @pytest.mark.parametrize(
         "case_cls",
         [
-            pytest.param(
-                TestPhase0A,
-                id="A-full-zz",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason=(
-                        "full-K quant_mx(layout=MX_A_ZZ) needs Expand multi-K-box; "
-                        "Expand now requires kb==1 (K=64). Use phase0 C chunk path."
-                    ),
-                ),
-            ),
+            pytest.param(TestPhase0A, id="A-full-zz"),
             pytest.param(
                 TestPhase0B,
                 id="B-concat-full-view",

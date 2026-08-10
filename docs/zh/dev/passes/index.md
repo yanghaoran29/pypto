@@ -26,14 +26,13 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 09 | [OutlineClusterScopes](09-outline_cluster_scopes.md) | 把 Cluster 作用域外提为 Group 函数，独立 Spmd 作用域外提为 Spmd 函数 |
 | 10 | [ConvertTensorToTileOps](10-convert_tensor_to_tile_ops.md) | 在 InCore 函数中把 tensor 算子转为 tile 算子，并更新编排层调用点 |
 | 11 | [OptimizeOrchTensors](11-optimize_orch_tensors.md) | 消除编排层冗余分配并改善数据流 |
-| 12 | [ExpandMxPackedQuant](12-expand_mx_packed_quant.md) | 把紧凑 MX 量化展开为基于 16×64 分块的平铺硬件量化 |
+| 12 | [ExpandMxPackedQuant](12-expand_mx_packed_quant.md) | 大 K 共切 packed quant/`matmul_mx`，再展开为基于 16×64 分块的平铺硬件量化 |
 | 13 | [LowerCompositeOps](13-lower_composite_ops.md) | 把复合 tile / 分布式算子分解为基础原语 |
 | 14 | [FlattenTileNdTo2D](14-flatten_tile_nd_to_2d.md) | 合并除最后一维外的所有维度，把 3D+ tile 操作拍平为 2D |
 | 15 | [LegalizeTileCast](15-legalize_tile_cast.md) | 把 ISA 无法单条指令完成的 `tile.cast` 展开为最短的原生 cast 链 |
 | 16 | [AutoTileMatmulL0](16-auto_tile_matmul_l0.md) | 依据后端 L0 容量选择 L0 tile 形状 `(m, n, k)` 并据此分块 matmul |
 | 17 | [CanonicalizeTileSlice](17-canonicalize_tile_slice.md) | 把 `tile.slice` 下降为规范的 `tile.extract` 形式 |
 | 18 | [InferTileMemorySpace](18-infer_tile_memory_space.md) | 推断每个 tile 的片上 `MemorySpace`，并插入 `tile.move` 消解残留不匹配 |
-| 19 | [SplitLargeKMxMatmul](19-split_large_k_mx_matmul.md) | 把静态 K>64 的 MX matmul 切成 K=64 的 `matmul_mx` / `matmul_mx_acc` 链 |
 | 20 | [InsertMxScaleAddr](20-insert_mx_scale_addr.md) | 在 memory space 解析完成后，于 MX matmul 消费者前插入 `tile.tget_scale_addr` |
 | 20 | [ResolveBackendOpLayouts](20-resolve_backend_op_layouts.md) | 修正逐元素算子所需的后端 tile layout |
 | 21 | [LowerAutoVectorSplit](21-lower_auto_vector_split.md) | 把 AUTO `pl.split` 的混合 InCore 函数转换为显式 `split_aiv` 形式 |

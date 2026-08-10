@@ -184,9 +184,6 @@ class PassManager:
             passes.auto_tile_matmul_l0,
             passes.canonicalize_tile_slice,
             passes.infer_tile_memory_space,
-            # Split K>64 MX matmul into K=64 chunks before scale-addr binding so
-            # InsertMxScaleAddr sees one consumer (and fresh binds) per chunk.
-            passes.split_large_k_mx_matmul,
             passes.insert_mx_scale_addr,
             passes.resolve_backend_op_layouts,
             # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit

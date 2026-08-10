@@ -1,12 +1,18 @@
 # ExpandMxPackedQuant Pass
 
-把紧凑形式的 `tile.tquant_mx` 展开为 PTOAS 支持的平铺 MX 量化算子。Pass 在 tile IR 中显式化 16×64 分块打包，同时保持公开的 `MX_A_ZZ` 和 `MX_B_NN` 结果布局。
+早期 MX 合法化：先按 K=64 切开大 K 的 packed quant / `matmul_mx`，再把紧凑 `tile.tquant_mx` 展开为 PTOAS 支持的平铺 MX 量化。Pass 在 tile IR 中显式化 16×64 分块打包，同时保持公开的 `MX_A_ZZ` 和 `MX_B_NN` 结果布局。
 
 ## 概述 (Overview)
 
-`ExpandMxPackedQuant` 是面向 InCore 函数的函数级 Pass。它只改写 `tile.tquant_mx(..., layout=MX_A_ZZ)` 和 `tile.tquant_mx(..., layout=MX_B_NN)`；不带 `layout` 的平铺调用留给 [`LowerCompositeOps`](13-lower_composite_ops.md)。不含紧凑 MX 量化的函数在结构上保持不变。
+`ExpandMxPackedQuant` 是面向 InCore 函数的函数级 Pass，内部多阶段：
 
-输入必须是静态二维 tile，第一维可被 16 整除，第二维可被 64 整除。每个 16×64 分块先 reshape 为 `[32, 32]`，再由平铺 `tile.tquant_mx` 量化，最后 reshape 回原形状。每个 scale group 对应 32 个输入值。
+1. **K-split**：静态 `K>64` 且 `K%64==0` 时
+   - **共切**：若 `matmul_mx*` 的 data/scale 均为同一次 `tquant_mx(layout)` 的直接 `TupleGetItem`（index 0/1），则改为每段 K=64 的 packed `tquant_mx` + `matmul_mx` / `matmul_mx_acc`，并删除原 large-K quant 链。此路径按 **chunk 布局**消费 scale（字节序可不同于 full pack）；前端不要在中间插入 scale reshape；
+   - **仅 matmul**：否则只对 data/scale 做 `tile.slice`（scale 须已是逻辑 2D，按每块 2 个 group）。
+2. **Flat→逻辑 2D reshape**：若剩余 `matmul_mx*` 的 scale 仍是 packed-flat `[1,G]`（lhs `[1,M*(K/32)]` / rhs `[1,N*(K/32)]`），在 matmul 前插入 `tile.reshape` 到 `[M,K/32]` / `[K/32,N]`。前端不应手写该 reshape。
+3. **Expand**：改写剩余的 `tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)`（含孤立 large-K）。逐盒 assemble 的盒序为 **(mb|nb 外层, kb 内层)**，与主机 `_pack_a_scale` / `_pack_b_scale` 的 full pack 字节序一致；`K%64==0`。不带 `layout` 的平铺调用留给 [`LowerCompositeOps`](13-lower_composite_ops.md)。
+
+每个 16×64 分块先 reshape 为 `[32, 32]`，再由平铺 `tile.tquant_mx` 量化，最后 reshape 回原形状。每个 scale group 对应 32 个输入值。
 
 两种布局的结果为：
 
@@ -25,25 +31,13 @@
 
 ## 运行时机 (When It Runs)
 
-该 Pass 是 `tile_pto_passes` 的第一项，也是 `Default` 流水线中编号第 12 的 Pass。它紧跟 `OptimizeOrchTensors`，并在 `LowerCompositeOps` 之前运行，后者不应看到带紧凑 `layout` 关键字参数的调用。
+该 Pass 是 `tile_pto_passes` 的第一项，也是 `Default` 流水线中编号第 12 的 Pass。它紧跟 `OptimizeOrchTensors`，并在 `LowerCompositeOps` 之前运行。大 K 切分也在此 early 完成；后续 [`InferTileMemorySpace`](18-infer_tile_memory_space.md) / [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) 只看到 K=64 的 MX matmul。
 
 ## 下降路径 (Lowering Paths)
 
-Pass 先通过一次线性 IR 遍历收集紧凑量化定义、元组投影和带常量偏移的 store，并沿简单变量别名解析源 `tile.load`。
+统一走 **Vec assemble** 路径：若源可解析为常量偏移 `tile.load`，则逐盒 `tile.load`；否则对聚合 tile 做 `tile.slice`。每个盒经 `QuantizeBox`（reshape → 平铺 `tquant_mx` → reshape）后，assemble 进 quant / scale 缓冲。`MX_B_NN` 在 assemble `[N,K]` 之后再做 INT8 转置得到 `[K,N]`。
 
-### Store 融合路径
-
-当 quant 和 scale 结果都只被可见 store 使用、store 目标是函数参数、两个 store 与量化处于同一直线语句序列、量化到对应 store 之间没有访问该目标，且输入可解析为常量偏移 `tile.load` 时，Pass 会独立加载并量化每个分块，再直接写入目标 tensor。此时才能安全删除仅供 store 使用的元组投影，以及仅供该量化使用的源 load。动态 load 偏移、跨控制流的 store、中间穿插的目标访问、稍后才定义的目标 SSA 值，以及其他结果消费者都会选择 assemble 回退路径。
-
-对于 `MX_B_NN`，Pass 先在编译器自有的 Vec 存储中 assemble 中间 `[N, K]` 量化数据，然后 reinterpret 为 `INT8`，转置为 `[K, N]`，再 reinterpret 回 `FP8E4M3FN`。它不会借用函数的 `Out` 或 `InOut` 参数作为临时缓冲区。
-
-### Assemble 回退路径
-
-当 store 不可见，或输入经过变换而不是可解析的 load 时，Pass 从输入切出每个分块，并在 Vec tile 中 assemble 量化与 scale 结果。元组投影别名会保留给原消费者。Scale 缓冲区会带规范 MX fractal 元数据 reinterpret，以保证元组赋值与 IR round-trip 类型检查一致。
-
-## 临时值生命期 (Temporary Lifetimes)
-
-每处理 16 个分块，以及最后一个不满 16 的分块组后，Pass 都使用 `system.bar_all` 排空临时 tile。这会限制大型紧凑输入的异步 Vec 生命期。B 转置输入也会保持存活，直到最后一次 store 之后的排空点。
+每处理 16 个分块（及末尾不满组）插入 `system.bar_all`，限制异步 Vec 生命期；B 转置后再排空一次。
 
 ## API 与实现
 
@@ -62,6 +56,5 @@ packed_quant = passes.expand_mx_packed_quant()
 
 - [`LowerCompositeOps`](13-lower_composite_ops.md) — 把余下的平铺 `tile.tquant_mx` 下降为原始 destination 形式。
 - [Tile 算子](../ir/05-operators.md) — 公开 MX 量化形状与 dtype 约定。
-- [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md) — 切分大 K 维 MX matmul。
 - [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) — 为后续 MX matmul 消费者物化 scale 地址。
 - [`ExpandMixedKernel`](23-expand_mixed_kernel.md) — 拒绝 `FP8E8M0` V2C；mixed kernel 须经 GM 暂存 MX A-scale。

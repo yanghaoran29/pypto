@@ -207,22 +207,13 @@ inline const PassProperties kInferTileMemorySpaceProperties{
                  IRProperty::AivSplitValid},
     .invalidated = {IRProperty::AivSplitValid}};
 
+// Early MX legalization: K-split large packed quant + matmul_mx, then expand
+// kb==1 packed quant. Empty contract (same pipeline slot as before).
 inline const PassProperties kExpandMxPackedQuantProperties{};
-
-// -- Split large-K MX matmul pass --------------------------------------------
-//
-// Runs immediately before InsertMxScaleAddr (after InferTileMemorySpace).
-// Property-preserving rewrite of matmul_mx family ops with static K>64.
-
-inline const PassProperties kSplitLargeKMxMatmulProperties{
-    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred},
-    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred}};
 
 // -- Insert MX scale-address binding pass ------------------------------------
 //
-// Runs immediately after SplitLargeKMxMatmul (itself after InferTileMemorySpace).
+// Runs immediately after InferTileMemorySpace.
 // Requires concrete Left/LeftScale and Right/RightScale spaces so
 // tile.tget_scale_addr can be inserted before each MX matmul consumer.
 // Property-preserving (no new IRProperty).

@@ -1,12 +1,18 @@
 # ExpandMxPackedQuant Pass
 
-Expands packed `tile.tquant_mx` forms into the flat MX quantization operation supported by PTOAS. It preserves the public `MX_A_ZZ` and `MX_B_NN` result layouts while making the required 16×64 box packing explicit in tile IR.
+Early MX legalization: K-split large-K packed quant / `matmul_mx`, then expand packed `tile.tquant_mx` into the flat MX quantization operation supported by PTOAS. It preserves the public `MX_A_ZZ` and `MX_B_NN` result layouts while making the required 16×64 box packing explicit in tile IR.
 
 ## Overview
 
-`ExpandMxPackedQuant` is a function-level pass over InCore functions. It rewrites only `tile.tquant_mx(..., layout=MX_A_ZZ)` and `tile.tquant_mx(..., layout=MX_B_NN)` calls; flat calls without `layout` are left for [`LowerCompositeOps`](13-lower_composite_ops.md). Functions without packed MX quantization are structural no-ops.
+`ExpandMxPackedQuant` is a function-level pass over InCore functions with several phases:
 
-The input must be a static two-dimensional tile whose first dimension is divisible by 16 and whose second dimension is divisible by 64. Each 16×64 box is reshaped to `[32, 32]`, quantized by a flat `tile.tquant_mx`, and reshaped back. Scale groups contain 32 source values.
+1. **K-split** for static `K>64` with `K%64==0`:
+   - **Co-split**: when `matmul_mx*` data/scale are both direct `TupleGetItem` (index 0/1) of the same `tquant_mx(layout)`, rewrite into per-chunk K=64 packed `tquant_mx` + `matmul_mx` / `matmul_mx_acc` and drop the original large-K quant chain. This path consumes scales in **chunk layout** (byte order may differ from full pack). Frontends must not insert a scale reshape in between;
+   - **Matmul-only**: otherwise slice data/scale tiles (scales must already be logical 2D; 2 groups per chunk).
+2. **Flat→logical 2D reshape**: when a remaining `matmul_mx*` scale is still packed-flat `[1,G]` (lhs `[1,M*(K/32)]` / rhs `[1,N*(K/32)]`), insert `tile.reshape` to `[M,K/32]` / `[K/32,N]` before the matmul. Frontends must not write that reshape.
+3. **Expand**: rewrite remaining `tile.tquant_mx(..., layout=MX_A_ZZ|MX_B_NN)` (including isolated large-K). Per-box assemble uses **(mb|nb outer, kb inner)** order matching host `_pack_a_scale` / `_pack_b_scale` full-pack bytes; `K%64==0`. Flat calls without `layout` are left for [`LowerCompositeOps`](13-lower_composite_ops.md).
+
+Each 16×64 box is reshaped to `[32, 32]`, quantized by a flat `tile.tquant_mx`, and reshaped back. Scale groups contain 32 source values.
 
 The two layouts produce:
 
@@ -25,25 +31,13 @@ The empty property contract is declared as `kExpandMxPackedQuantProperties` in `
 
 ## When It Runs
 
-This is the first entry of `tile_pto_passes` and the 12th documented pass in the `Default` pipeline. It runs immediately after `OptimizeOrchTensors` and before `LowerCompositeOps`, which must not see a packed `layout` keyword.
+This is the first entry of `tile_pto_passes` and the 12th documented pass in the `Default` pipeline. It runs immediately after `OptimizeOrchTensors` and before `LowerCompositeOps`. Large-K splitting is done here early; later [`InferTileMemorySpace`](18-infer_tile_memory_space.md) / [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) only see K=64 MX matmuls.
 
 ## Lowering Paths
 
-The pass first collects packed-quant definitions, tuple projections, and constant-offset stores with one linear IR walk. It follows simple variable aliases to resolve a source `tile.load`.
+Only the **Vec assemble** path is used: if the source resolves to a constant-offset `tile.load`, each box is reloaded; otherwise each box is taken with `tile.slice` from the aggregate tile. Every box goes through `QuantizeBox` (reshape → flat `tquant_mx` → reshape) and is assembled into quant/scale buffers. For `MX_B_NN`, an INT8 bit-preserving transpose turns assembled `[N,K]` into `[K,N]`.
 
-### Store-fused path
-
-When both results are used exclusively by visible stores to function-parameter destinations, both stores remain in the same straight-line sequence as the quantization, neither destination is accessed between the quantization and its store, and the source resolves to a constant-offset `tile.load`, every box is loaded and quantized independently, then written directly into the destination tensors. The store-only tuple projections and a source load used only by this quantization can then be removed safely. Dynamic load offsets, control-flow-separated stores, intervening destination accesses, later destination SSA values, and additional result consumers all select the assemble fallback.
-
-For `MX_B_NN`, the pass assembles the intermediate `[N, K]` quant data in compiler-owned Vec storage, reinterprets it as `INT8`, transposes it to `[K, N]`, and reinterprets it back to `FP8E4M3FN`. It never borrows an `Out` or `InOut` function parameter as scratch storage.
-
-### Assemble fallback
-
-If the stores are not visible or the source is transformed rather than a resolvable load, the pass slices each box from the input and assembles the packed quant and scale results in Vec tiles. Projection aliases remain live for the original consumers. The scale buffer is reinterpreted with the canonical MX fractal metadata so tuple assignment and IR round-trip type checks remain coherent.
-
-## Temporary Lifetimes
-
-Per-box tiles are drained with `system.bar_all` after every 16 boxes, and after the final partial chunk. This bounds asynchronous Vec lifetimes for large packed inputs. The B transpose input is also kept alive through a drain after the final store.
+`system.bar_all` drains temporary tiles after every 16 boxes (and after the final partial chunk), plus once after the B transpose.
 
 ## API and Implementation
 
@@ -56,12 +50,11 @@ packed_quant = passes.expand_mx_packed_quant()
 - Declaration: `include/pypto/ir/transforms/passes.h`
 - Implementation: `src/ir/transforms/expand_mx_packed_quant_pass.cpp`
 - Python binding: `python/bindings/modules/passes.cpp`
-- Default ordering: `python/pypto/ir/pass_manager.py`
+- Default order: `python/pypto/ir/pass_manager.py`
 
 ## See Also
 
-- [`LowerCompositeOps`](13-lower_composite_ops.md) — lowers the remaining flat `tile.tquant_mx` call to its raw destination form.
-- [Tile Operators](../ir/05-operators.md) — public MX quantization shapes and dtype contract.
-- [`SplitLargeKMxMatmul`](19-split_large_k_mx_matmul.md) — chunks large-K MX matmul.
-- [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) — materializes scale addresses for later MX matmul consumers.
+- [`LowerCompositeOps`](13-lower_composite_ops.md) — lowers remaining flat `tile.tquant_mx` to destination-passing form.
+- [Tile operators](../ir/05-operators.md) — public MX quantization shape and dtype contracts.
+- [`InsertMxScaleAddr`](20-insert_mx_scale_addr.md) — materializes scale addresses for MX matmul consumers.
 - [`ExpandMixedKernel`](23-expand_mixed_kernel.md) — rejects `FP8E8M0` V2C; mixed kernels must stage MX A-scale via GM.
