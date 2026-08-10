@@ -37,6 +37,12 @@ _AUTO_PIPE_SETUP_OPS = {
     ir.get_op("system.aiv_initialize_pipe").name,
 }
 
+_AIC_INITIALIZE_PIPE = ir.get_op("system.aic_initialize_pipe").name
+_AIV_INITIALIZE_PIPE = ir.get_op("system.aiv_initialize_pipe").name
+_TPUSH_TO_AIC = ir.get_op("tile.tpush_to_aic").name
+_TPOP_FROM_AIV = ir.get_op("tile.tpop_from_aiv").name
+_TFREE_TO_AIV = ir.get_op("system.tfree_to_aiv").name
+
 _AUTO_TFREE_OPS = {
     ir.get_op("system.tfree_to_aic").name,
     ir.get_op("system.tfree_to_aiv").name,
@@ -66,6 +72,40 @@ def _flatten_top_level_stmts(body):
     if isinstance(body, ir.SeqStmts):
         return list(body.stmts)
     return [body]
+
+
+def _collect_pipe_ids(func, op_name):
+    """Collect explicit pipe ids from top-level calls matching a validated op name."""
+    ids = []
+    for stmt in _flatten_top_level_stmts(func.body):
+        call = None
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+            call = stmt.value
+        elif isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+            call = stmt.expr
+        if call is None or not isinstance(call.op, ir.Op) or call.op.name != op_name:
+            continue
+        if "id" in call.kwargs:
+            ids.append(call.kwargs["id"])
+    return ids
+
+
+def _collect_calls(func, op_name):
+    """Collect matching calls recursively, including nested control flow."""
+
+    class Collector(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def visit_call(self, call):
+            if isinstance(call.op, ir.Op) and call.op.name == op_name:
+                self.calls.append(call)
+            super().visit_call(call)
+
+    collector = Collector()
+    collector.visit_stmt(func.body)
+    return collector.calls
 
 
 def _make_stmt_body(stmts, span):
@@ -2149,6 +2189,158 @@ class TestPropertyVerification:
 class TestAutoPipeSetup:
     """Test auto-generated reserve/import/initialize_pipe setup."""
 
+    def test_data_and_mx_scale_pair_get_distinct_pipe_ids(self):
+        """A data transfer followed by its MX scale uses two paired V2C pipes."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 64], pl.BF16],
+                y: pl.Tensor[[64, 32], pl.FP8E4M3FN],
+                y_scale: pl.Tensor[[2, 32], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                x_quant, x_scale = pl.quant_mx(
+                    pl.load(x, [0, 0], [16, 64]), layout=pl.MX_A_ZZ, dtype=pl.FP8E4M3FN
+                )
+
+                # V2C #1: ordinary data, [16,64] FP8E4M3FN = 1024 bytes → id=0
+                x_mat = pl.move(x_quant, target_memory=pl.MemorySpace.Mat)
+                x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+
+                # V2C #2: paired MX scale, [16,2] FP8E8M0 = 32 bytes → id=1
+                x_scale_mat = pl.move(
+                    x_scale,
+                    target_memory=pl.MemorySpace.Mat,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                x_left_scale = pl.move(x_scale_mat, target_memory=pl.MemorySpace.LeftScale)
+
+                y_mat = pl.load(y, [0, 0], [64, 32], target_memory=pl.MemorySpace.Mat)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                y_scale_mat = pl.load(y_scale, [0, 0], [2, 32], target_memory=pl.MemorySpace.Mat)
+                y_right_scale = pl.move(y_scale_mat, target_memory=pl.MemorySpace.RightScale)
+                z_tile = pl.matmul_mx(x_left, x_left_scale, y_right, y_right_scale)
+                z_vec = pl.move(
+                    z_tile,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                out = pl.store(z_vec, [0, 0], out)
+                return out
+
+        After = _expand_raw(Before)
+        aic = After.get_function("main_incore_0_aic")
+        aiv = After.get_function("main_incore_0_aiv")
+        assert aic is not None and aiv is not None
+
+        assert _collect_pipe_ids(aiv, _TPUSH_TO_AIC) == [0, 1]
+        assert _collect_pipe_ids(aic, _TPOP_FROM_AIV) == [0, 1]
+        assert [call.kwargs["id"] for call in _collect_calls(aic, _TFREE_TO_AIV)] == [0, 1]
+
+        v2c_inits = [
+            stmt.expr
+            for stmt in _flatten_top_level_stmts(aic.body)
+            if isinstance(stmt, ir.EvalStmt)
+            and isinstance(stmt.expr, ir.Call)
+            and isinstance(stmt.expr.op, ir.Op)
+            and stmt.expr.op.name == _AIC_INITIALIZE_PIPE
+            and stmt.expr.kwargs.get("dir_mask") == 2
+        ]
+        assert [(c.kwargs["id"], c.kwargs["slot_size"]) for c in v2c_inits] == [(0, 1024), (1, 32)]
+        assert _collect_pipe_ids(aic, _AIC_INITIALIZE_PIPE)[:2] == [0, 1]
+        assert _collect_pipe_ids(aiv, _AIV_INITIALIZE_PIPE)[:2] == [0, 1]
+
+    def test_v2c_matching_view_from_ddr_is_still_retargeted_to_vec(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(self):
+                source = pl.tile.create([16, 64], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec)
+                ddr_source = pl.move(
+                    source,
+                    target_memory=pl.MemorySpace.DDR,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                lhs = pl.move(ddr_source, target_memory=pl.MemorySpace.Left)
+                pl.tpush_to_aiv(lhs, split=0)
+                returned: pl.Tile[[16, 64], pl.FP16, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+                pl.tfree_to_aic(returned)
+
+        after = _expand_raw(Before)
+        aiv = after.get_function("main_incore_0_aiv")
+        assert aiv is not None
+        pushes = _collect_calls(aiv, _TPUSH_TO_AIC)
+        assert len(pushes) == 1
+        push_type = pushes[0].args[0].type
+        assert isinstance(push_type, ir.TileType)
+        assert push_type.memory_space == ir.MemorySpace.Vec
+
+    def test_same_size_explicit_pipe_id_initializes_matching_pipe(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(self):
+                vector_source = pl.tile.create([16, 16], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec)
+                pl.tpush_to_aic(vector_source, split=0, id=1)
+                received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
+                    split=0,
+                    id=1,
+                )
+                pl.tfree_to_aiv(received, id=1)
+
+        after = _expand_raw(Before)
+        aic = after.get_function("main_incore_0_aic")
+        aiv = after.get_function("main_incore_0_aiv")
+        assert aic is not None and aiv is not None
+
+        assert _collect_pipe_ids(aiv, _TPUSH_TO_AIC) == [1]
+        assert _collect_pipe_ids(aic, _TPOP_FROM_AIV) == [1]
+        assert _collect_pipe_ids(aic, _TFREE_TO_AIV) == [1]
+        assert _collect_pipe_ids(aic, _AIC_INITIALIZE_PIPE) == [1]
+        assert _collect_pipe_ids(aiv, _AIV_INITIALIZE_PIPE) == [1]
+
+    def test_heterogeneous_data_pairs_require_mx_scale_second(self):
+        """Two heterogeneous ordinary-data transfers are not auto-paired as separate pipes."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 64], pl.BF16],
+                y: pl.Tensor[[64, 32], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [16, 64])
+                x_mat = pl.move(x_tile, target_memory=pl.MemorySpace.Mat)
+                x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+
+                y_tile = pl.load(y, [0, 0], [64, 32])
+                y_mat = pl.move(y_tile, target_memory=pl.MemorySpace.Mat)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+
+                z_tile = pl.matmul(x_left, y_right)
+                z_vec = pl.move(
+                    z_tile,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                out = pl.store(z_vec, [0, 0], out)
+                return out
+
+        with pytest.raises(
+            ValueError,
+            match="ordinary data first and FP8E8M0 MX scale second",
+        ):
+            _expand_raw(Before)
+
     def test_bidirectional_different_slot_sizes_uses_max(self):
         """Bidirectional kernels with different per-direction tile sizes use max as slot_size."""
 
@@ -2417,20 +2609,25 @@ class TestAutoPipeSetup:
 
         _assert_function_equal(After, Expected, "main_incore_0_aiv")
 
-    def test_alias_tfree_preserves_explicit_pipe_id(self):
-        """Canonicalizing a tfree alias must keep its original pipe id kwarg."""
+    def test_nested_alias_tfree_preserves_matching_explicit_pipe_id(self):
+        """A nested tfree alias must resolve to the outer tpop and keep its pipe id."""
 
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(self):
+                vector_source = pl.tile.create([16, 16], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec)
+                pl.tpush_to_aic(vector_source, split=0, id=1)
                 received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
                     split=0,
                     id=1,
                 )
                 alias: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = received
-                pl.tfree_to_aiv(alias, id=0)
-                vector_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+                for _i in pl.range(1):
+                    pl.tfree_to_aiv(alias, id=1)
+                cube_source = pl.tile.create([16, 16], dtype=pl.FP16, target_memory=pl.MemorySpace.Mat)
+                pl.tpush_to_aiv(cube_source, split=0)
+                vector_tile: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
                 pl.tfree_to_aic(vector_tile)
 
         After = _expand_raw(Before)
@@ -2438,7 +2635,7 @@ class TestAutoPipeSetup:
         assert aic_func is not None
 
         tpop_var = None
-        tfree_call = None
+        tfree_calls = _collect_calls(aic_func, _TFREE_TO_AIV)
         for stmt in ir.flatten_to_stmts(aic_func.body):
             if isinstance(stmt, ir.AssignStmt):
                 call = stmt.value
@@ -2451,13 +2648,12 @@ class TestAutoPipeSetup:
             if call.op.name == ir.get_op("tile.tpop_from_aiv").name:
                 assert isinstance(stmt, ir.AssignStmt)
                 tpop_var = stmt.var
-            elif call.op.name == ir.get_op("system.tfree_to_aiv").name:
-                tfree_call = call
 
         assert tpop_var is not None
-        assert tfree_call is not None
+        assert len(tfree_calls) == 1
+        tfree_call = tfree_calls[0]
         assert tfree_call.args == [tpop_var]
-        assert tfree_call.kwargs["id"] == 0
+        assert tfree_call.kwargs["id"] == 1
 
     def test_auto_tfree_does_not_hoist_user_before_if_defined_tile(self):
         """A later tpop user must stay after an if-defined tile result."""

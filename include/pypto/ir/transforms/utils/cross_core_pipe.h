@@ -53,6 +53,10 @@ struct CrossCorePipeMetadata {
 struct AutomaticPipeSetup {
   std::vector<StmtPtr> aic_stmts;
   std::vector<StmtPtr> aiv_stmts;
+  // When multi-id pipes are emitted, these hold the body stmts with `id`
+  // stamped onto matching tpush/tpop/tfree. Empty means "use the original body".
+  std::vector<StmtPtr> aic_body;
+  std::vector<StmtPtr> aiv_body;
 };
 
 constexpr int kAutoBufferBase = -1;
@@ -67,7 +71,8 @@ CrossCorePipeMetadata MergeCrossCorePipeMetadata(const CrossCorePipeMetadata& lh
 int BuildDirMask(const CrossCorePipeMetadata& metadata);
 int GetSlotNumForDirMask(int dir_mask);
 std::optional<int64_t> GetCommonSlotSizeBytes(const CrossCorePipeMetadata& metadata);
-std::string BuildPipeBufferName(const std::string& func_name, core_affinity::PipeDirection direction);
+std::string BuildPipeBufferName(const std::string& func_name, core_affinity::PipeDirection direction,
+                                int pipe_id = 0);
 
 CallPtr CreateSystemOpCall(const std::string& op_name,
                            const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span);
@@ -77,10 +82,12 @@ CallPtr CreateReserveBuffer(const std::string& buffer_name, int64_t size_bytes, 
 CallPtr CreateImportPeerBuffer(const std::string& buffer_name, const std::string& peer_func,
                                const Span& span);
 // `slot_num` overrides the ring depth emitted on the initialize_pipe op when set
-// (otherwise PTOAS derives it from `dir_mask`).
+// (otherwise PTOAS derives it from `dir_mask`). `pipe_id` is omitted when nullopt
+// so PTOAS uses the default frontend pipe id 0.
 CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slot_size_bytes,
                              const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf,
-                             std::optional<int> slot_num, const Span& span);
+                             std::optional<int> slot_num, const Span& span,
+                             std::optional<int> pipe_id = std::nullopt);
 
 void CollectCrossCorePipeMetadata(const std::vector<StmtPtr>& stmts, CrossCorePipeMetadata& metadata);
 CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtPtr>& stmts);
@@ -88,6 +95,12 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
 // `slot_num_override` (from pl.split(mode, slot_num=N)) overrides the hardcoded
 // ring depth (`GetSlotNumForDirMask`) used to size the reserved buffer and the
 // emitted initialize_pipe `slot_num` attribute. nullopt keeps the default.
+//
+// Automatic setup pairs tpush/tpop endpoints in lexical order. When one
+// direction has heterogeneous paired sizes, the supported automatic form is
+// exactly two pairs: ordinary data first and FP8E8M0 MX scale second. It emits
+// one unidirectional pipe per pair and returns bodies with matching ids on
+// tpush/tpop/tfree. Other heterogeneous graphs require manual pipe setup.
 AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,
                                            const std::string& aiv_name, const std::vector<StmtPtr>& aic_stmts,
                                            const std::vector<StmtPtr>& aiv_stmts,

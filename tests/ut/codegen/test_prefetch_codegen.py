@@ -192,8 +192,10 @@ class MixedPrefetchProgram:
         evt = pl.prefetch.async_prefetch(a, ctx)
         session = pl.prefetch.session(ctx)
         pl.prefetch.wait(evt, session)
-        tile_a = pl.load(a, [0, 0], [1, 128])
-        tile_b = pl.load(b, [0, 0], [128, 128])
+        tile_a_mat = pl.load(a, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+        tile_a = pl.move(tile_a_mat, target_memory=pl.MemorySpace.Left)
+        tile_b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+        tile_b = pl.move(tile_b_mat, target_memory=pl.MemorySpace.Right)
         return pl.store(pl.tile.matmul(tile_a, tile_b), [0, 0], out)
 
 

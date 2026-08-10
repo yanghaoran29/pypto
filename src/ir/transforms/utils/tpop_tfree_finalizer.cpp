@@ -383,6 +383,68 @@ std::vector<StmtPtr> FinalizeTpopTfrees(const std::vector<StmtPtr>& stmts, core_
     return normalized_inputs;
   }
 
+  // A tfree nested below an outer tpop is not part of the nested block's local
+  // lifetime scan, so leaving it in place would also make the outer scan add a
+  // second tfree. Remove the nested spelling here; the ordinary deferred-tfree
+  // path below recreates one canonical free after the enclosing statement (or
+  // any later use), preserving both dominance and the tpop's explicit pipe id.
+  std::function<StmtPtr(const StmtPtr&, const TpopVarRemap&)> rewrite_nested_control;
+  std::function<std::vector<StmtPtr>(const std::vector<StmtPtr>&, const TpopVarRemap&)>
+      remove_outer_tfrees_from_body;
+
+  remove_outer_tfrees_from_body = [&](const std::vector<StmtPtr>& body, const TpopVarRemap& seed_remap) {
+    TpopVarRemap body_remap = seed_remap;
+    std::vector<StmtPtr> rewritten;
+    rewritten.reserve(body.size());
+    for (const auto& stmt : body) {
+      VarPtr tfree_var;
+      std::string tfree_op_name;
+      if (IsTfreeStmt(stmt, &tfree_var, &tfree_op_name) && tfree_op_name == expected_tfree) {
+        const Var* canonical_var = CanonicalizeTpopRef(tfree_var.get(), body_remap);
+        if (chains.find(canonical_var) != chains.end()) continue;
+      }
+
+      auto rewritten_stmt = rewrite_nested_control(stmt, body_remap);
+      rewritten.push_back(rewritten_stmt);
+      propagate_stmt_aliases_into(rewritten_stmt, body_remap);
+    }
+    return rewritten;
+  };
+
+  rewrite_nested_control = [&](const StmtPtr& stmt, const TpopVarRemap& seed_remap) -> StmtPtr {
+    if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
+      TpopVarRemap body_remap = seed_remap;
+      for (const auto& iter_arg : for_stmt->iter_args_) {
+        propagate_alias_into(iter_arg, iter_arg ? iter_arg->initValue_ : nullptr, body_remap);
+      }
+      auto new_body = remove_outer_tfrees_from_body(FlattenBody(for_stmt->body_), body_remap);
+      return loop_repair::RebuildForStmt(for_stmt, loop_repair::MakeBody(new_body, for_stmt->span_));
+    }
+    if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      auto new_then = remove_outer_tfrees_from_body(FlattenBody(if_stmt->then_body_), seed_remap);
+      std::optional<std::vector<StmtPtr>> new_else;
+      if (const auto& else_body = if_stmt->else_body_) {
+        new_else = remove_outer_tfrees_from_body(FlattenBody(*else_body), seed_remap);
+      }
+      return loop_repair::RebuildIfStmt(if_stmt, new_then, new_else);
+    }
+    if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
+      TpopVarRemap body_remap = seed_remap;
+      for (const auto& iter_arg : while_stmt->iter_args_) {
+        propagate_alias_into(iter_arg, iter_arg ? iter_arg->initValue_ : nullptr, body_remap);
+      }
+      auto new_body = remove_outer_tfrees_from_body(FlattenBody(while_stmt->body_), body_remap);
+      return loop_repair::RebuildWhileStmt(while_stmt, loop_repair::MakeBody(new_body, while_stmt->span_));
+    }
+    return stmt;
+  };
+
+  TpopVarRemap rewrite_remap = tpop_var_remap;
+  for (auto& stmt : normalized_inputs) {
+    stmt = rewrite_nested_control(stmt, rewrite_remap);
+    propagate_stmt_aliases_into(stmt, rewrite_remap);
+  }
+
   std::vector<bool> remove_existing_tfree(normalized_inputs.size(), false);
   std::unordered_map<size_t, std::vector<StmtPtr>> deferred_tfrees;
   for (const auto* var : tpop_order) {

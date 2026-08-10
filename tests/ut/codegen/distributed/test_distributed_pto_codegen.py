@@ -1783,8 +1783,10 @@ def test_split_aiv_region_keeps_notify_off_the_cube_lane():
             peer: pl.Scalar[pl.INT32],
         ):
             with pl.at(level=pl.Level.CORE_GROUP):
-                ta = pl.load(a, [0, 0], [16, 64])
-                tw = pl.load(w, [0, 0], [64, 256])
+                ta_mat = pl.load(a, [0, 0], [16, 64], target_memory=pl.MemorySpace.Mat)
+                ta = pl.move(ta_mat, target_memory=pl.MemorySpace.Left)
+                tw_mat = pl.load(w, [0, 0], [64, 256], target_memory=pl.MemorySpace.Mat)
+                tw = pl.move(tw_mat, target_memory=pl.MemorySpace.Right)
                 acc = pl.matmul(ta, tw, out_dtype=pl.FP32)
                 out = pl.store(acc, [0, 0], out)
                 for _aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):  # noqa: B007

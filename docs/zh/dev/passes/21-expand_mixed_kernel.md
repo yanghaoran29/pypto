@@ -110,14 +110,14 @@ Ascend910B（a2a3）——跨核传输经过 GM → Mat，Mat 仅支持 NZ 布�
 这些 setup 参数由拆分后的函数体自动推导：
 
 - `dir_mask`：`C2V=1`、`V2C=2`、双向=`3`
-- `id`：自动生成 setup 时省略，因此 PTOAS 使用默认 frontend pipe id `0`
-- `slot_size`：所有方向中 tile 字节大小的最大值（`shape * dtype bits / 8`）
-- `slot_num`：环形缓冲深度——默认单向为 `8`，双向时每个方向为 `4`；可按 scope 覆盖（见下文）
+- `id`：同一方向仅一种配对后的 slot 尺寸时省略（默认 0）；受支持的“数据 + MX scale”形式中，数据使用 `0`，scale 使用 `1`，并写入对应的 `initialize_pipe` / `tpush` / `tpop` / `tfree`
+- `slot_size`：该 pipe 上传输 tile 的字节大小（`shape * dtype bits / 8`）；单尺寸路径下双向 pipe 取两方向最大值
+- `slot_num`：环形缓冲深度——默认单向为 `8`，旧版共享双向 pipe 的每个方向为 `4`；多 id setup 会发射彼此独立的单向 pipe，每条默认均为 `8`；可按 scope 覆盖（见下文）
 - `buffer_size`：`slot_num * slot_size`
-- buffer 名称：`<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`
+- buffer 名称：`<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`；多 id 时非 0 的 pipe 追加 `_idN`
 - reserve-buffer 的 `base`：插入时统一使用 `AUTO`，随后由 `AllocateMemoryAddr` 解析成显式地址
 
-当跨核方向使用了不同大小的 tile 时，Pass 会取所有观察到的 tile 字节大小的最大值作为 `initialize_pipe` 的公共 `slot_size`。较小 tile 写入时不会填满整个槽位，但不影响硬件正确性。用户手写程序仍然可以通过给 `initialize_pipe` 以及匹配的 `tpush` / `tpop` / `tfree` 传入不同 `id` 来创建多条独立 pipe。
+自动 setup 会在每个方向内按词法顺序配对 `tpush` 与 `tpop`。每一对使用两端较大的尺寸作为 canonical `slot_size`，因此 producer/consumer 形状不同的 split 传输仍共用一条 pipe。当前自动异构 setup 仅支持恰好两对传输：第一对是普通数据（`id=0`），第二对是 FP8E8M0 MX scale（`id=1`，MX scale 布局且 `fractal=32`）。展开时会给同一对的 `tpush` / `tpop` / `tfree` 写入匹配的 id，并生成对应的 `reserve_buffer` / `import_peer_buffer` / `initialize_pipe`。多 id 路径中的每条 pipe 都是单向的，因此即使整个传输图同时包含两个方向，每条 pipe 的默认 `slot_num` 仍为 `8`；`4` 槽默认值只属于旧版共享双向 pipe。其他异构或未配对的传输图必须提供完整的手写 pipe setup。C2V 与 V2C 的 id 空间彼此独立（codegen 以 `(id, dir_mask)` 为键）。当每个方向各自只有一种 canonical 尺寸时，仍走旧路径：单条 pipe（双向则 `dir_mask=3`），用两方向尺寸的最大值作为公共 `slot_size`，传输算子省略 `id`（默认 0）。
 
 ### 覆盖槽位数（`slot_num`）
 
@@ -475,4 +475,4 @@ class After:
 | 两阶段拆分后循环状态修复 | 先保证 loop-carried state 合法，再在 DCE 移除死共享别名后重新裁剪 iter_arg，最后再跑一次 DCE 清理暴露出的 init-value 链 |
 | 自动生成 pipe setup | tensor 级 mixed kernel 无需手写 `reserve_buffer` / `import_peer_buffer` / `initialize_pipe`；Pass 会根据跨核 tile 操作自动推导 |
 | 自动生成 tfree 链 | 消费侧拆分内核会补齐缺失的 `tfree`、将其改写为释放 canonical 的 popped tile，并在需要时把明显过早的 free 延后到同一个 block 内更靠后的位置；但不会重排彼此独立的 `tpop` 链顺序 |
-| Max-slot-size 策略 | 取所有 tile 字节大小的最大值作为单一 `initialize_pipe.slot_size`，对齐后端自动生成 setup 的假设，并保留旧有双向 `dir_mask=3` 行为 |
+| 自动 slot-size 策略 | 按词法顺序配对端点并取两端较大尺寸；同方向异构 setup 仅支持“普通数据在前、MX scale 在后”，其他传输图必须提供完整的手写 setup |

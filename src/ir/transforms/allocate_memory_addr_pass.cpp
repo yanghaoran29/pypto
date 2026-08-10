@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -85,17 +86,31 @@ bool HasCrossCorePipeRing(const ReserveBufferResolution& resolution, const std::
     if (func_name.compare(func_name.size() - suffix.size(), suffix.size(), suffix) != 0) return "";
     return func_name.substr(0, func_name.size() - suffix.size());
   };
-  std::vector<std::string> expected;
+  std::vector<std::string> expected_prefixes;
   for (const auto& kernel : {strip_suffix("_aic"), strip_suffix("_aiv")}) {
     if (kernel.empty()) continue;
-    expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::C2V));
-    expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::V2C));
+    expected_prefixes.push_back(
+        cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::C2V));
+    expected_prefixes.push_back(
+        cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::V2C));
   }
-  if (expected.empty()) return false;
+  if (expected_prefixes.empty()) return false;
+  auto matches_pipe_ring = [&](const std::string& name) {
+    for (const auto& prefix : expected_prefixes) {
+      if (name == prefix) return true;
+      // Multi-id auto pipes append "_idN" (N > 0) to the base ring name.
+      const std::string id_prefix = prefix + "_id";
+      if (name.size() > id_prefix.size() && name.compare(0, id_prefix.size(), id_prefix) == 0) {
+        return std::all_of(name.begin() + static_cast<std::ptrdiff_t>(id_prefix.size()), name.end(),
+                           [](unsigned char ch) { return std::isdigit(ch) != 0; });
+      }
+    }
+    return false;
+  };
   for (const auto& [call, base] : resolution.resolved_bases) {
     if (!call) continue;
     const auto name = call->GetKwarg<std::string>("name", "");
-    if (std::find(expected.begin(), expected.end(), name) != expected.end()) return true;
+    if (matches_pipe_ring(name)) return true;
   }
   return false;
 }

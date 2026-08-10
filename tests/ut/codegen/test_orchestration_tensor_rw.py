@@ -292,14 +292,33 @@ class TestTensorReadWriteOffsetCodegen:
                     ob_chunk, ob_chunk + 4, init_values=(k_proj, v_proj)
                 ):
                     kv0: pl.Scalar[pl.INDEX] = ob * 64
-                    tile_a: pl.Tile[[16, 128], pl.BF16] = pl.tile.load(
-                        normed_tile, [0, 0], [16, 128], [16, 128]
+                    tile_a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        normed_tile,
+                        [0, 0],
+                        [16, 128],
+                        [16, 128],
+                        target_memory=pl.MemorySpace.Mat,
                     )
-                    tile_wk: pl.Tile[[128, 64], pl.BF16] = pl.tile.load(wk, [0, kv0], [128, 64], [128, 64])
+                    tile_a = pl.tile.move(tile_a_mat, target_memory=pl.MemorySpace.Left)
+                    tile_wk_mat: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        wk,
+                        [0, kv0],
+                        [128, 64],
+                        [128, 64],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    tile_wk = pl.tile.move(tile_wk_mat, target_memory=pl.MemorySpace.Right)
                     k_acc: pl.Tile[[16, 64], pl.FP32] = pl.tile.matmul(tile_a, tile_wk)
                     k_proj_next: pl.Tensor[[16, 512], pl.FP32] = pl.tile.store(k_acc, [0, kv0], k_proj_iter)
 
-                    tile_wv: pl.Tile[[128, 64], pl.BF16] = pl.tile.load(wv, [0, kv0], [128, 64], [128, 64])
+                    tile_wv_mat: pl.Tile[[128, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        wv,
+                        [0, kv0],
+                        [128, 64],
+                        [128, 64],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    tile_wv = pl.tile.move(tile_wv_mat, target_memory=pl.MemorySpace.Right)
                     v_acc: pl.Tile[[16, 64], pl.FP32] = pl.tile.matmul(tile_a, tile_wv)
                     v_proj_next: pl.Tensor[[16, 512], pl.FP32] = pl.tile.store(v_acc, [0, kv0], v_proj_iter)
                     k_proj_rv, v_proj_rv = pl.yield_(k_proj_next, v_proj_next)

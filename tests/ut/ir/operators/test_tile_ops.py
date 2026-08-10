@@ -3309,6 +3309,36 @@ class TestTileReinterpretViewIR:
         assert isinstance(call.type, ir.TileType)
         assert self._shape_values(call.type) == [32]
 
+    @pytest.mark.parametrize(
+        ("source_dtype", "target_dtype"),
+        [
+            (DataType.INT8, DataType.FP8E4M3FN),
+            (DataType.UINT8, DataType.FP8E8M0),
+        ],
+    )
+    def test_mx_byte_alias_preserves_shape(self, source_dtype, target_dtype):
+        call = tile.reinterpret_view(self._var([16, 64], source_dtype), target_dtype)
+
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == target_dtype
+        assert self._shape_values(call.type) == [16, 64]
+
+    @pytest.mark.parametrize("layout", [ir.TileLayout.row_major, ir.TileLayout.col_major])
+    def test_complete_mx_scale_byte_alias_preserves_layout(self, layout):
+        view = ir.TileView(blayout=layout, slayout=layout, fractal=32)
+        call = tile.reinterpret_view(self._var([16, 64], DataType.UINT8, view), DataType.FP8E8M0)
+
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == DataType.FP8E8M0
+        assert self._shape_values(call.type) == [16, 64]
+        assert call.type.get_effective_tile_view().blayout == layout
+        assert call.type.get_effective_tile_view().slayout == layout
+
+    @pytest.mark.parametrize("target_dtype", [DataType.FP8E8M0, DataType.FP8E5M2, DataType.HF8])
+    def test_unsupported_byte_sized_float_target_is_rejected(self, target_dtype):
+        with pytest.raises(ValueError, match="only supports FP8 reinterpretation"):
+            tile.reinterpret_view(self._var([16, 64], DataType.INT8), target_dtype)
+
     def test_auto_shape_uses_col_major_contiguous_axis(self):
         view = ir.TileView(blayout=ir.TileLayout.col_major, slayout=ir.TileLayout.none_box)
         call = tile.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)

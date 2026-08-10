@@ -738,17 +738,21 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
                   tile_view_semantics::GetEffectiveTileView(*push_dest_type));
             }
 
-            auto tmov_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
-                                                        fractal_view, MemorySpace::Vec);
-            std::string src_name = "tile";
-            if (auto sv = std::dynamic_pointer_cast<const Var>(bm.source_tile)) {
-              src_name = sv->name_hint_;
+            const TileView source_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+            if (src_type->memory_space_ != MemorySpace::Vec || source_view != fractal_view) {
+              auto tmov_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
+                                                          fractal_view, MemorySpace::Vec);
+              std::string src_name = "tile";
+              if (auto sv = std::dynamic_pointer_cast<const Var>(bm.source_tile)) {
+                src_name = sv->name_hint_;
+              }
+              bool is_nz = (fractal_view.blayout == TileLayout::col_major);
+              auto tmov_var =
+                  std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), tmov_type, stmt->span_);
+              auto tmov_call = CreateMove(bm.source_tile, MemorySpace::Vec, tmov_type, stmt->span_);
+              result.push_back(std::make_shared<AssignStmt>(tmov_var, tmov_call, stmt->span_));
+              push_source = tmov_var;
             }
-            bool is_nz = (fractal_view.blayout == TileLayout::col_major);
-            auto tmov_var = std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), tmov_type, stmt->span_);
-            auto tmov_call = CreateMove(bm.source_tile, MemorySpace::Vec, tmov_type, stmt->span_);
-            result.push_back(std::make_shared<AssignStmt>(tmov_var, tmov_call, stmt->span_));
-            push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
               CreateTpush(push_op, push_source, stmt->span_, op_split), stmt->span_));
@@ -1198,6 +1202,13 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
       func->HasAttr("slot_num") ? std::optional<int>(func->GetAttr<int>("slot_num", 0)) : std::nullopt;
   auto automatic_pipe_setup = BuildAutomaticPipeSetup(func->name_, aic_name, aiv_name, aic_final, aiv_final,
                                                       slot_num_override, func->span_);
+  // Multi-id auto pipes rewrite the bodies so tpush/tpop/tfree carry matching `id`.
+  if (!automatic_pipe_setup.aic_body.empty()) {
+    aic_final = std::move(automatic_pipe_setup.aic_body);
+  }
+  if (!automatic_pipe_setup.aiv_body.empty()) {
+    aiv_final = std::move(automatic_pipe_setup.aiv_body);
+  }
   aic_final = PrependPipeSetup(automatic_pipe_setup.aic_stmts, aic_final);
   // Keep a leading get_subblock_idx binding (injected by the auto pl.split
   // LowerAutoVectorSplit path) above the pipe setup, matching the standalone

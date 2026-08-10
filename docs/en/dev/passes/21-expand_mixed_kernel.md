@@ -138,14 +138,14 @@ after every consumer-side `tpop` chain.
 Setup is derived from the split bodies:
 
 - `dir_mask`: `C2V=1`, `V2C=2`, bidirectional=`3`
-- `id`: omitted for automatic setup, so PTOAS uses the default frontend pipe id `0`
-- `slot_size`: max tile byte size across all directions (`shape * dtype bits / 8`)
-- `slot_num`: ring depth — `8` for unidirectional, `4` per direction for bidirectional by default; overridable per scope (see below)
+- `id`: omitted when each direction has a single paired slot size (default 0); for the supported data-plus-MX-scale form, data uses `0` and scale uses `1`, stamped on the matching `initialize_pipe` / `tpush` / `tpop` / `tfree`
+- `slot_size`: tile byte size for that pipe (`shape * dtype bits / 8`); on the single-size path a bidirectional pipe uses the max of both directions
+- `slot_num`: ring depth — `8` for unidirectional, `4` per direction for the legacy bidirectional pipe by default; multi-id setup emits separate unidirectional pipes, each defaulting to `8`; overridable per scope (see below)
 - `buffer_size`: `slot_num * slot_size`
-- buffer names: `<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`
+- buffer names: `<func>_c2v_slot_buffer` / `<func>_v2c_slot_buffer`; multi-id pipes with `id > 0` append `_idN`
 - reserve-buffer base: `AUTO` on insertion, then resolved to an explicit address by `AllocateMemoryAddr`
 
-When cross-core directions use different tile sizes, the pass picks `max(all observed tile byte sizes)` as the common `slot_size` for `initialize_pipe`. Smaller tiles leave unused bytes in each slot but hardware correctness is preserved. Explicit user-authored programs can still create multiple independent pipes by supplying different `id` values to `initialize_pipe` and matching `tpush` / `tpop` / `tfree` ops.
+Automatic setup pairs `tpush` and `tpop` endpoints in lexical order within each direction. A pair uses the larger endpoint size as its canonical `slot_size`, so split transfers whose producer and consumer shapes differ still share one pipe. Heterogeneous automatic setup is intentionally limited to exactly two pairs: ordinary data first (`id=0`) and an FP8E8M0 MX scale tile second (`id=1`, matching MX scale layout with `fractal=32`). The pass stamps the pair's id on its `tpush` / `tpop` / `tfree` ops and emits matching `reserve_buffer` / `import_peer_buffer` / `initialize_pipe` calls. Each multi-id pipe is unidirectional and therefore defaults to `slot_num=8`, even when the overall graph transfers in both directions; the `4`-slot default applies only to the legacy shared bidirectional pipe. Other heterogeneous or unpaired graphs must provide a complete manual pipe setup. C2V and V2C id spaces are independent (codegen keys on `(id, dir_mask)`). When each direction has only one canonical size, the legacy path remains: a single pipe (bidirectional `dir_mask=3` when both directions are present) using the max of the per-direction sizes as `slot_size`, with transfer ops omitting `id` (default 0).
 
 ### Overriding the slot count (`slot_num`)
 
@@ -499,4 +499,4 @@ true last use of that tile.
 | Two-stage post-split loop-state repair | First makes loop-carried state valid, then re-strips iter_args after DCE removes dead shared aliases, with a final DCE to clean up exposed init-value chains |
 | Auto-generated pipe setup | Tensor-level mixed kernels do not need handwritten `reserve_buffer` / `import_peer_buffer` / `initialize_pipe`; the pass derives them from cross-core tile ops |
 | Auto-generated tfree chains | Consumer-side split kernels insert missing `tfree` calls, rewrite them to free the canonical popped tile value, and delay obviously early frees within the same block without reordering independent `tpop` chains |
-| Max-slot-size policy | Uses `max(all tile byte sizes)` as the single `initialize_pipe.slot_size`, matching the backend assumption of one automatic reserve/import buffer per direction while preserving legacy bidirectional `dir_mask=3` behavior |
+| Automatic slot-size policy | Pairs endpoints in lexical order and uses the larger endpoint size; same-direction heterogeneous setup is limited to data first plus MX scale second, while other graphs require a complete manual setup |
