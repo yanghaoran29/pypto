@@ -1714,6 +1714,11 @@ class ForbidAliasCollector : public IRVisitor {
           for (size_t i = 0; i < forbidden_arg_count; ++i) forbid_arg(i);
         } else {
           for (size_t i : entry.ForbidOutputAliasArgs()) forbid_arg(i);
+          // A2/A3 TSEL also reads lhs/rhs while writing dst; A5 may reuse them.
+          if (IsOp(call, "tile.sel") && !IsA5Target()) {
+            forbid_arg(1);
+            forbid_arg(2);
+          }
         }
         // A dtype-widening cast (output element wider than its input) cannot run
         // in place: element i is read at i*in_bytes but written at i*out_bytes,

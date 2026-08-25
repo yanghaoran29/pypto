@@ -698,8 +698,8 @@ void OpConversionRegistry::RegisterMemoryOps() {
     ExprPtr zero_s = mask_dt.IsFloat() ? ExprPtr(std::make_shared<ConstFloat>(0.0, mask_dt, span))
                                        : ExprPtr(std::make_shared<ConstInt>(0, mask_dt, span));
     auto pred = emit("tile.cmps", {mask, zero_s}, {{"cmp_type", 1}}, "su_pred");
-    auto tmp = emit("tile.create", {MakeShapeTuple({one, make_idx(32)}, span)},
-                    {{"dtype", DataType(DataType::UINT8)}, {"target_memory", MemorySpace::Vec}}, "su_tmp");
+    auto tmp = emit("tile.create", {MakeShapeTuple({one, make_idx(16)}, span)},
+                    {{"dtype", DataType(DataType::UINT32)}, {"target_memory", MemorySpace::Vec}}, "su_tmp");
     auto out = op_reg.Create("tile.sel", {pred, scattered, args[0], tmp}, span);
     return ConversionResult{std::move(prologue), out};
   };
@@ -2297,11 +2297,11 @@ void OpConversionRegistry::RegisterScatterOps() {
                                                 : ExprPtr(std::make_shared<ConstInt>(0, mask_dt, span));
         std::vector<std::pair<std::string, std::any>> cmp_kw = {{"cmp_type", 1}};
         auto pred = emit("tile.cmps", {mask, zero_scalar}, cmp_kw, "scatter_pred");
-        // tmp = TSEL scratch tile (UINT8 [1, 32]).
-        std::vector<std::pair<std::string, std::any>> tmp_kw = {{"dtype", DataType(DataType::UINT8)},
+        // tmp = TSEL scratch tile (UINT32 [1, 16] on A2/A3).
+        std::vector<std::pair<std::string, std::any>> tmp_kw = {{"dtype", DataType(DataType::UINT32)},
                                                                 {"target_memory", MemorySpace::Vec}};
         auto tmp =
-            emit("tile.create", {MakeShapeTuple({one, make_idx(32)}, span)}, tmp_kw, "scatter_sel_tmp");
+            emit("tile.create", {MakeShapeTuple({one, make_idx(16)}, span)}, tmp_kw, "scatter_sel_tmp");
         // out = sel(pred, scattered, input, tmp): scattered @written, input @unwritten.
         auto out_call = op_reg.Create("tile.sel", {pred, scattered, args[0], tmp}, span);
         return ConversionResult{std::move(prologue), out_call};
@@ -2385,9 +2385,9 @@ void OpConversionRegistry::RegisterScatterOps() {
         ExprPtr zero_scalar = mask_dt.IsFloat() ? ExprPtr(std::make_shared<ConstFloat>(0.0, mask_dt, span))
                                                 : ExprPtr(std::make_shared<ConstInt>(0, mask_dt, span));
         auto pred = emit("tile.cmps", {mask, zero_scalar}, {{"cmp_type", 1}}, "scatter_mask_pred");
-        // tmp = TSEL scratch tile (UINT8 [1, 32]).
-        auto tmp = emit("tile.create", {MakeShapeTuple({make_idx(1), make_idx(32)}, span)},
-                        {{"dtype", DataType(DataType::UINT8)}, {"target_memory", MemorySpace::Vec}},
+        // tmp = TSEL scratch tile (UINT32 [1, 16] on A2/A3).
+        auto tmp = emit("tile.create", {MakeShapeTuple({make_idx(1), make_idx(16)}, span)},
+                        {{"dtype", DataType(DataType::UINT32)}, {"target_memory", MemorySpace::Vec}},
                         "scatter_mask_sel_tmp");
         // out = sel(pred, scattered, dst, tmp): scattered @selected, dst @unselected.
         auto out_call = op_reg.Create("tile.sel", {pred, scattered, args[1], tmp}, span);
@@ -2461,9 +2461,9 @@ void OpConversionRegistry::RegisterCmpOps() {
     auto zero_var = make_full(0.0, "cmp_zero");
 
     std::vector<ExprPtr> tmp_shape_dims = {std::make_shared<ConstInt>(1, DataType::INDEX, span),
-                                           std::make_shared<ConstInt>(32, DataType::INDEX, span)};
+                                           std::make_shared<ConstInt>(16, DataType::INDEX, span)};
     auto tmp_shape_tuple = std::make_shared<MakeTuple>(tmp_shape_dims, span);
-    std::vector<std::pair<std::string, std::any>> tmp_kw = {{"dtype", DataType::UINT8},
+    std::vector<std::pair<std::string, std::any>> tmp_kw = {{"dtype", DataType::UINT32},
                                                             {"target_memory", MemorySpace::Vec}};
     auto tmp_call = op_reg.Create("tile.create", {tmp_shape_tuple}, tmp_kw, span);
     auto tmp_var = std::make_shared<Var>("cmp_tmp", tmp_call->GetType(), span);

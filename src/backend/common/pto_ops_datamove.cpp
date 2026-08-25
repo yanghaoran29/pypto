@@ -15,6 +15,7 @@
  */
 
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -56,6 +57,7 @@ using ir::Var;
 using pto_ops_detail::AsPto;
 using pto_ops_detail::CheckSubviewTileCompat;
 using pto_ops_detail::EmitPartitionViewPTO;
+using pto_ops_detail::EnsureStaticViewTileSsa;
 using pto_ops_detail::GetDimStrings;
 using pto_ops_detail::GetIndexOffsetCodes;
 using pto_ops_detail::GetSizeCodes;
@@ -524,27 +526,70 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
 }
 
 // Helper function for Sort32: emits pto.tsort32
-// PTOAS expects: ins(src, idx : src_type, idx_type) outs(dst : dst_type)
+// PTOAS expects: ins(src, idx[, tmp] : src_type, idx_type[, tmp_type]) outs(dst : dst_type)
 static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                         codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
-      << "Operation:[" << pto_op_name << "] requires 2 arguments (src, idx), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 or 3 arguments (src, idx[, tmp]), but got "
+      << op->args_.size();
 
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string idx = codegen.GetExprAsCode(op->args_[1]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
   std::string idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  std::string tmp;
+  std::string tmp_type;
+  bool use_static_views = false;
+  if (op->args_.size() == 3) {
+    // Explicit-tmp A2/A3 forms verify against static valid_shape; alloc_tile types
+    // keep v_row=?, v_col=?, so bridge to a static-valid view like tcvt/tprelu.
+    tmp = EnsureStaticViewTileSsa(op->args_[2], codegen, "sort32_tmp_view");
+    tmp_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[2]->GetType()));
+  } else {
+    // alloc_tile carries valid extents as operands, so its SSA type remains
+    // dynamic even when the IR valid_shape is fully static. PTOAS uses the
+    // source *type* to decide whether an aligned tsort32 can skip implicit
+    // scratch. Rebind static inputs to zero-copy views so a 32-aligned width
+    // is recognized instead of being rejected as a dynamic level3 form.
+    auto src_tile = As<ir::TileType>(op->args_[0]->GetType());
+    auto idx_tile = As<ir::TileType>(op->args_[1]->GetType());
+    INTERNAL_CHECK_SPAN(src_tile && idx_tile, op->span_)
+        << "Internal error: tile.sort32 inputs must be TileType";
+    const auto src_valid = ir::tile_view_semantics::GetEffectiveTileView(*src_tile).valid_shape;
+    const bool has_static_valid =
+        src_valid.size() == 2 && As<ir::ConstInt>(src_valid[0]) && As<ir::ConstInt>(src_valid[1]);
+    if (has_static_valid) {
+      use_static_views = true;
+      src = EnsureStaticViewTileSsa(op->args_[0], codegen, "sort32_src_view");
+      idx = EnsureStaticViewTileSsa(op->args_[1], codegen, "sort32_idx_view");
+      src_type = codegen.GetViewTileBufTypeStringFromTileType(src_tile);
+      idx_type = codegen.GetViewTileBufTypeStringFromTileType(idx_tile);
+    }
+  }
 
-  std::string dst = codegen.GetCurrentResultTarget();
-  std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  auto dst_var = codegen.GetCurrentResultVar();
+  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.sort32 requires an assignment target";
+  auto dst_tile = As<ir::TileType>(dst_var->GetType());
+  INTERNAL_CHECK_SPAN(dst_tile, op->span_) << "Internal error: tile.sort32 result must be a TileType";
+  const bool use_static_dst = op->args_.size() == 3 || use_static_views;
+  const std::string dst = use_static_dst ? EnsureStaticViewTileSsa(dst_var, codegen, "sort32_dst_view")
+                                         : codegen.GetCurrentResultTarget();
+  const std::string dst_type = use_static_dst ? codegen.GetViewTileBufTypeStringFromTileType(dst_tile)
+                                              : codegen.GetCurrentResultTileBufTypeString();
 
   std::ostringstream oss;
   oss << pto_op_name;
-  // ins clause: src, idx
+  // ins clause: src, idx[, tmp]
   oss << " ins(" << src << ", " << idx;
-  if (!src_type.empty() || !idx_type.empty()) {
+  if (!tmp.empty()) {
+    oss << ", " << tmp;
+  }
+  if (!src_type.empty() || !idx_type.empty() || !tmp_type.empty()) {
     oss << " : " << src_type << ", " << idx_type;
+    if (!tmp.empty()) {
+      oss << ", " << tmp_type;
+    }
   }
   // outs clause: dst only (idx is modified in-place by hardware)
   oss << ") outs(" << dst;
@@ -802,6 +847,76 @@ static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::Codegen
   codegen.Emit(oss.str());
   return "";
 }
+
+namespace {
+
+// Parse the static `cols=` field from a rendered `!pto.tile_buf<...>` string.
+std::optional<int64_t> ParseTileBufStaticCols(const std::string& tile_buf_type) {
+  const std::string key = "cols=";
+  const size_t pos = tile_buf_type.find(key);
+  if (pos == std::string::npos) {
+    return std::nullopt;
+  }
+  size_t i = pos + key.size();
+  if (i >= tile_buf_type.size() || !std::isdigit(static_cast<unsigned char>(tile_buf_type[i]))) {
+    return std::nullopt;
+  }
+  int64_t value = 0;
+  while (i < tile_buf_type.size() && std::isdigit(static_cast<unsigned char>(tile_buf_type[i]))) {
+    value = value * 10 + (tile_buf_type[i++] - '0');
+  }
+  return value;
+}
+
+std::string ReplaceTileBufStaticCols(const std::string& tile_buf_type, int64_t cols) {
+  const std::string key = "cols=";
+  const size_t pos = tile_buf_type.find(key);
+  if (pos == std::string::npos) {
+    return tile_buf_type;
+  }
+  size_t end = pos + key.size();
+  while (end < tile_buf_type.size() && std::isdigit(static_cast<unsigned char>(tile_buf_type[end]))) {
+    ++end;
+  }
+  return tile_buf_type.substr(0, pos + key.size()) + std::to_string(cols) + tile_buf_type.substr(end);
+}
+
+std::string ReplaceTileBufStaticValidShape(const std::string& tile_buf_type, int64_t v_row, int64_t v_col) {
+  std::string out = tile_buf_type;
+  if (const size_t pos = out.find("v_row=?"); pos != std::string::npos) {
+    out.replace(pos, 7, "v_row=" + std::to_string(v_row));
+  }
+  if (const size_t pos = out.find("v_col=?"); pos != std::string::npos) {
+    out.replace(pos, 7, "v_col=" + std::to_string(v_col));
+  }
+  return out;
+}
+
+std::string GetTileMemRefAddrSsa(codegen::PTOCodegen& codegen,
+                                 const std::shared_ptr<const ir::TileType>& tile_type) {
+  if (!tile_type) {
+    return "";
+  }
+  const auto memref = ir::GetDefinedMemRef(tile_type);
+  if (!memref || !memref->byte_offset_) {
+    return "";
+  }
+  if (const auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
+    return codegen.GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+  }
+  std::string ssa = codegen.GetExprAsCode(memref->byte_offset_);
+  const auto scalar_type = As<ir::ScalarType>(memref->byte_offset_->GetType());
+  if (!scalar_type || scalar_type->dtype_ == DataType::INT64) {
+    return ssa;
+  }
+  const std::string wide = codegen.NewNamedTemp("alloc_addr");
+  const std::string from =
+      scalar_type->dtype_ == DataType::INDEX ? "index" : codegen.GetTypeString(scalar_type->dtype_);
+  codegen.Emit(wide + " = arith.index_cast " + ssa + " : " + from + " to i64");
+  return wide;
+}
+
+}  // namespace
 
 // Helper function for MrgSort format2: emits pto.tmrgsort
 // Supports 2-4 way merge. tmp is the last ins operand and carries the

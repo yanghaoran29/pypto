@@ -5037,17 +5037,16 @@ class TestAscend910BLoadTpopHazard:
 
 
 class TestForbidOutputAlias:
-    """A tile.sel output must not alias its mask (arg 0) or tmp (arg 3) buffer.
+    """A tile.sel output must not alias live-read operand buffers.
 
-    The TSEL intrinsic reads the predicate mask and the tmp scratch while
-    writing dst, so an in-place write onto either would corrupt the op
-    mid-flight (wrong select results on Ascend a2a3). tile.sel declares these
-    via OpRegistryEntry::forbid_output_alias(); MemoryReuse honours the marker
-    even when shape/dtype would otherwise permit the reuse.
+    On A2/A3, TSEL reads the predicate mask, both value operands, and the tmp
+    scratch while writing dst row-by-row, so an in-place write onto any of them
+    would corrupt the op. Mask/tmp are always forbidden via registry markers;
+    lhs/rhs are A2/A3-gated in MemoryReuse so A5 may reuse a dead value operand.
     """
 
     def test_sel_output_does_not_alias_mask_or_tmp(self):
-        """dst skips the mask buffer (large enough to hold it) and reuses a value operand."""
+        """dst skips the mask buffer (large enough to hold it) and uses its own buffer."""
 
         @pl.program
         class Before:
@@ -5071,9 +5070,14 @@ class TestForbidOutputAlias:
                 res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
                 return res
 
-        After = _run_pipeline(Before)
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
         bases = _collect_tile_memref_bases(After)
-        for name in ("dst", "mask", "tmp"):
+        for name in ("dst", "mask", "tmp", "t2"):
             assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
 
         # The mask reuses the dead 1024B FP32 buffer — big enough to hold dst —
@@ -5084,6 +5088,80 @@ class TestForbidOutputAlias:
         assert bases["dst"] != bases["tmp"], (
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
+        assert bases["dst"] != bases["t2"], (
+            f"tile.sel output must not alias its lhs/rhs buffer, but both bind to {bases['dst']}"
+        )
+
+    def test_sel_output_does_not_alias_distinct_lhs_rhs(self):
+        """Scatter-style sel(pred, scattered, base) must keep dst off both value tiles."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[8, 16], pl.FP32],
+                rhs: pl.Tensor[[8, 16], pl.FP32],
+                tmp_in: pl.Tensor[[1, 16], pl.UINT32],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                scattered: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(lhs, [0, 0], [8, 16])
+                base: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(rhs, [0, 0], [8, 16])
+                dead: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(scattered, scattered)
+                mask: pl.Tile[[8, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=1)
+                tmp: pl.Tile[[1, 16], pl.UINT32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [1, 16])
+                dst: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sel(mask, scattered, base, tmp)
+                res: pl.Tensor[[8, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "scattered", "base"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] != bases["scattered"]
+        assert bases["dst"] != bases["base"]
+
+    def test_a5_sel_output_may_reuse_dead_lhs(self):
+        """A5 TSEL may reuse a dying lhs/rhs buffer; mask and tmp stay forbidden."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[8, 16], pl.FP32],
+                rhs: pl.Tensor[[8, 16], pl.FP32],
+                tmp_in: pl.Tensor[[1, 16], pl.UINT32],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                scattered: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(lhs, [0, 0], [8, 16])
+                base: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(rhs, [0, 0], [8, 16])
+                dead: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(scattered, scattered)
+                mask: pl.Tile[[8, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=1)
+                tmp: pl.Tile[[1, 16], pl.UINT32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [1, 16])
+                dst: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sel(mask, scattered, base, tmp)
+                keep_base_live: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(base, dst)
+                res: pl.Tensor[[8, 16], pl.FP32] = pl.store(keep_base_live, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "scattered", "base", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["scattered"]
+        assert bases["dst"] != bases["base"]
+        assert bases["dst"] != bases["mask"]
+        assert bases["dst"] != bases["tmp"]
 
     @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
     def test_sels_output_may_reuse_dead_tmp(self, backend_type):

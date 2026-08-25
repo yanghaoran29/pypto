@@ -1115,6 +1115,20 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/pypto-lib"
           git clone --depth 1 https://github.com/hw-native-sys/pypto-lib.git "$GITHUB_WORKSPACE/pypto-lib"
 
+          # pypto-lib's strict source-spec/artifact ABI validation exposed stale
+          # directions in the prefill cache fixtures. Keep the integration test
+          # runnable until the same correction reaches pypto-lib main. The
+          # reverse check makes this a no-op once upstream contains the patch.
+          compat_patch="$GITHUB_WORKSPACE/lib-checkout/.github/patches/pypto-lib-prefill-csa-abi.patch"
+          if git -C "$GITHUB_WORKSPACE/pypto-lib" apply --check "$compat_patch"; then
+            git -C "$GITHUB_WORKSPACE/pypto-lib" apply "$compat_patch"
+          elif git -C "$GITHUB_WORKSPACE/pypto-lib" apply --reverse --check "$compat_patch"; then
+            echo "pypto-lib prefill cache ABI correction is already present"
+          else
+            echo "pypto-lib prefill cache ABI compatibility patch no longer applies" >&2
+            exit 1
+          fi
+
       # Each model run borrows a card via task-submit for the whole `python ...`
       # invocation (compile + run). task-submit propagates the inner exit code,
       # so a model crash fails the step. $TASK_DEVICE is the lent card.

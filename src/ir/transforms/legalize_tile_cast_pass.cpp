@@ -17,8 +17,12 @@
  * single instruction into a shortest sequence of native casts. Path search is
  * BFS over the native-conversion table the active BackendHandler supplies via
  * GetTcvtAdjacency(), so this pass holds no per-architecture knowledge of its
- * own. Typical outcome for A5 INT32→FP16 is INT32→FP32→FP16 — same byte-width
- * to float, then resize — which adds no precision loss beyond the final narrow.
+ * own for the cast graph. Typical outcome for A5 INT32→FP16 is INT32→FP32→FP16
+ * — same byte-width to float, then resize — which adds no precision loss beyond
+ * the final narrow.
+ *
+ * Scratch required by the final native hops is materialized immediately before
+ * MemRef initialization, after this pass has finished constructing the chain.
  */
 
 #include <algorithm>
@@ -273,24 +277,34 @@ class LegalizeTileCastMutator : public IRMutator {
     stmts.reserve(chain.size());
 
     for (size_t i = 0; i + 1 < chain.size(); ++i) {
-      ExprPtr cast_expr = MakeCast(cur, chain[i], mode, op->span_);
-      const std::string name =
-          auto_name::BuildName(auto_name::GetBaseName(op->var_->name_hint_), "cast_" + chain[i].ToString(),
-                               "tmp", static_cast<int>(temp_counter_++));
-      auto mid_var = std::make_shared<Var>(name, cast_expr->GetType(), op->span_);
-      stmts.push_back(std::make_shared<AssignStmt>(mid_var, cast_expr, op->span_));
-      cur = mid_var;
+      AppendCastHop(stmts, cur, chain[i], mode, op, /*final_assign=*/nullptr);
     }
-
-    auto final_assign = MutableCopy(op);
-    final_assign->value_ = MakeCast(cur, chain.back(), mode, op->span_);
-    stmts.push_back(std::move(final_assign));
+    AppendCastHop(stmts, cur, chain.back(), mode, op, op);
 
     if (stmts.size() == 1) return stmts.front();
     return std::make_shared<SeqStmts>(std::move(stmts), op->span_);
   }
 
  private:
+  void AppendCastHop(std::vector<StmtPtr>& stmts, ExprPtr& cur, DataType hop_dst, int mode,
+                     const AssignStmtPtr& origin, const AssignStmtPtr& final_assign) {
+    auto src_tile = As<TileType>(cur->GetType());
+    INTERNAL_CHECK_SPAN(src_tile, origin->span_) << "tile.cast hop input must be TileType";
+    ExprPtr cast_expr = MakeCast(cur, hop_dst, mode, origin->span_);
+    if (final_assign) {
+      auto assign = MutableCopy(final_assign);
+      assign->value_ = cast_expr;
+      stmts.push_back(std::move(assign));
+      return;
+    }
+    const std::string name =
+        auto_name::BuildName(auto_name::GetBaseName(origin->var_->name_hint_), "cast_" + hop_dst.ToString(),
+                             "tmp", static_cast<int>(temp_counter_++));
+    auto mid_var = std::make_shared<Var>(name, cast_expr->GetType(), origin->span_);
+    stmts.push_back(std::make_shared<AssignStmt>(mid_var, cast_expr, origin->span_));
+    cur = mid_var;
+  }
+
   std::string arch_name_;
   AdjList adj_;
   std::size_t temp_counter_ = 0;
