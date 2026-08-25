@@ -201,6 +201,10 @@ inline std::vector<std::pair<std::string, std::any>> StripAttr(
 /// peek through such a scope as if it were AUTO (see ``transform_utils::UnwrapAutoScope``).
 inline constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
 
+/// Marks a compiler-synthesized tile.create whose PTO allocation type must
+/// carry static valid dimensions instead of mutable valid-row/valid-col operands.
+inline constexpr const char* kAttrCompilerStaticValidTileAlloc = "__compiler_static_valid_tile_alloc";
+
 // ---------------------------------------------------------------------------
 // ForStmt iter_arg carry classification (produced by ``ClassifyIterArgCarry``)
 // ---------------------------------------------------------------------------

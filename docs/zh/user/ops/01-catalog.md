@@ -115,6 +115,12 @@
 | [`dim`][pypto.language.tensor.dim] | `pl.` | 张量的运行期维度 |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | 元素访问 |
 
+## 量化
+
+| 算子 | 可达 | 作用 |
+| ---- | ---- | ---- |
+| `quant_mx` | `pl.` (t) | Ascend950 MX block-32 动态量化，生成 FP8E4M3FN 或 MXFP4 E2M1 数据及 FP8E8M0 scale；MXFP4 接受 FP16/BF16 输入，当前仅作为独立输出路径 |
+
 ## 线性代数
 
 | 算子 | 可达 | 作用 |
