@@ -203,6 +203,7 @@ def load(
     target_memory: MemorySpace | None = None,
     clamp: bool = False,
     span: Span | None = None,
+    cache: int | None = None,
 ) -> Call:
     """Copy data from tensor to specified memory level.
 
@@ -232,6 +233,13 @@ def load(
             and is rejected when that provably fails; with ``clamp=True`` the
             request is cut back to the source edge instead.
         span: Optional source span for debugging (auto-captured if not provided)
+        cache: ``CachePolicy`` underlying int — 0 (``kDefault``, ordinary cached
+            GM read) or 1 (``kBypass``, declared streaming read). ``None`` (the
+            default) means the caller stated no policy and omits the kwarg, so
+            ordinary loads are unchanged and a scope-level declaration may still
+            stamp one later. An explicit 0 is NOT the same as ``None``: it is
+            recorded, and it is what makes ``cache=CachePolicy.DEFAULT`` opt a
+            single read back into the cache inside a bypassing scope.
 
     Returns:
         Call expression that returns a TileType with the copied data
@@ -268,6 +276,11 @@ def load(
         kwargs["target_memory"] = target_memory
     if clamp:
         kwargs["clamp"] = True
+    # `is not None`, not truthiness: an explicit `cache=0` (DEFAULT) is a real
+    # per-access override that must out-rank a scope declaration, so it has to
+    # survive into the IR. Only an unstated policy omits the kwarg.
+    if cache is not None:
+        kwargs["cache"] = cache
 
     valid_shape_tuple = shapes_tuple
     if valid_shape is not None:
@@ -704,6 +717,8 @@ def ci(
     dtype: DataType = DataType.INT32,
     descending: bool = False,
     span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
 ) -> Call:
     """Generate a contiguous integer sequence into a tile (pto.tci).
 
@@ -722,6 +737,7 @@ def ci(
         dtype: Destination dtype. Must be one of {INT16, INT32}.
         descending: If True, generate a descending sequence.
         span: Optional source span for debugging (auto-captured if not provided).
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
         Call expression that returns a TileType with the generated sequence.
@@ -736,7 +752,10 @@ def ci(
         start_expr = ConstInt(start, dtype, actual_span)
     shape_tuple = _to_make_tuple(shape, actual_span)
     kwargs: dict[str, Any] = {"dtype": dtype, "descending": descending}
-    return _ir_core.create_op_call("tile.ci", [start_expr, shape_tuple], kwargs, actual_span)
+    args = [start_expr, shape_tuple]
+    if tmp is not None:
+        args.append(tmp)
+    return _ir_core.create_op_call("tile.ci", args, kwargs, actual_span)
 
 
 arange = ci
@@ -1448,7 +1467,7 @@ def sel(mask: Expr, lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -
         mask: Predicate mask tile (TileType); encoding is target-defined
         lhs: Source tile 0, selected where mask is true (TileType)
         rhs: Source tile 1, selected where mask is false (TileType)
-        tmp: Scratch tile required by TSEL (TileType UINT8 [1, 32] on A2/A3)
+        tmp: Scratch tile required by TSEL (TileType UINT32 [1, 16] on A2/A3)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1717,6 +1736,8 @@ def cast(
     target_type: int | DataType,
     mode: str | int = "round",
     span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
 ) -> Call:
     """Cast tile to target data type (element-wise).
 
@@ -1726,6 +1747,8 @@ def cast(
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
+        tmp: Optional A2/A3 PTOAS scratch tile for non-saturating narrowing
+             tcvt. Normally compiler-generated.
 
     Returns:
         Call expression for element-wise cast to target dtype
@@ -1738,7 +1761,8 @@ def cast(
 
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"target_type": target_type, "mode": mode_val}
-    return _ir_core.create_op_call("tile.cast", [tile], kwargs, actual_span)
+    args: list[Expr] = [tile] if tmp is None else [tile, tmp]
+    return _ir_core.create_op_call("tile.cast", args, kwargs, actual_span)
 
 
 def log(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
@@ -3148,22 +3172,27 @@ def tpop_from_aiv(
 # ============================================================================
 
 
-def sort32(src: Expr, idx: Expr, span: Span | None = None) -> Call:
+def sort32(src: Expr, idx: Expr, span: Span | None = None, *, tmp: Expr | None = None) -> Call:
     """Sort fixed 32-element blocks with explicit index tile.
 
     Sorts 32-element blocks in src and permutes idx accordingly.
-    Output tile stores sorted value-index pairs with doubled last dimension.
+    Output tile stores 8-byte value-index pairs. Its last dimension is 2x the
+    input width for FP32 and 4x the input width for FP16.
 
     Args:
         src: Input value tile (TileType, FP16 or FP32, Vec memory)
         idx: Input index tile (TileType, Vec memory) with sequential offsets
         span: Optional source span for debugging
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
-        Call expression returning sorted tile with doubled last dimension
+        Call expression returning the dtype-dependent expanded sort output
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.sort32", [src, idx], {}, actual_span)
+    args = [src, idx]
+    if tmp is not None:
+        args.append(tmp)
+    return _ir_core.create_op_call("tile.sort32", args, {}, actual_span)
 
 
 # ============================================================================

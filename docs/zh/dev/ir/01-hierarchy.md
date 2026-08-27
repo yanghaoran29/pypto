@@ -340,7 +340,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     的，因此每个区域独立减半。持有至少一个区域的函数进入**手动模式**：区域对
     向量计算的放置具有决定权，`AivSplitValid` 验证器会拒绝所有区域之外的向量
     计算（每个全宽阶段请写一个 `mode=None` 区域，参见
-    [LowerAutoVectorSplit](../passes/20-lower_auto_vector_split.md)）。顶层
+    [LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md)）。顶层
     `for aiv_id in pl.split_aiv(...)` 会被 parser 包裹在外层
     `InCoreScopeStmt` 中（以便 `OutlineIncoreScopes` 提取），即
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`。
@@ -469,8 +469,8 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `param_directions_` | list[ParamDirection] | 参数方向，与 params_ 长度相同 |
 | `return_types_` | list[TypePtr] | 返回类型 |
 | `body_` | StmtPtr | 函数体 |
-| `level_` | optional[Level] | 层次级别（对 InCore/AIC/AIV/Group/Orchestration 自动派生，详见下文） |
-| `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration 自动派生，详见下文） |
+| `level_` | optional[Level] | 层次级别（对 InCore/AIC/AIV/Group/Orchestration/Graph 自动派生，详见下文） |
+| `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration/Graph 自动派生，详见下文） |
 | `attrs_` | list[(str, Any)] | 有序的自由形式元数据，以 `UsualField` 暴露（参与结构遍历） |
 
 ### 保留的 `attrs_` 键
@@ -495,12 +495,13 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 
 ### `level_` / `role_` 自动派生
 
-当 `func_type_` 属于 {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`} 时，
+当 `func_type_` 属于 {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`, `Graph`} 时，
 `Function` 构造函数会在未显式提供 `level_` / `role_` 时自动派生：
 
 | `func_type_` | 派生的 `level_` | 派生的 `role_` |
 | ------------ | --------------- | -------------- |
 | `Orchestration` | `CHIP` | `Orchestrator` |
+| `Graph` | `CHIP` | `Orchestrator` |
 | `InCore` | `CHIP_DIE` | `Worker` |
 | `AIC` | `AIC` | `Worker` |
 | `AIV` | `AIV` | `Worker` |

@@ -263,6 +263,17 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     tile_view.valid_shape = valid_shape_tuple->elements_;
   }
 
+  // Optional GM cache-access policy. Absent = the caller stated none; an
+  // explicit kDefault is distinct from absence and out-ranks a scope-level
+  // declaration downstream. Range-checked here, at the op boundary, for the
+  // same reason `atomic` is: the DSL types it as CachePolicy, but the text
+  // parser and hand-built or deserialized IR can hand over any int, and an
+  // unknown one would otherwise surface at codegen with no context.
+  const int cache = GetKwarg<int>(kwargs, "cache", static_cast<int>(CachePolicy::kDefault));
+  CHECK(cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass))
+      << "The operator " << op_name
+      << " cache kwarg must be CachePolicy.DEFAULT or CachePolicy.BYPASS, but got int " << cache;
+
   // Return TileType with same dtype as tensor and TileView containing valid_shape.
   // When target_memory is specified, write it into memory_space_ so the constructed
   // type is internally coherent (tile_view layout and memory_space agree). This
@@ -698,9 +709,12 @@ TypePtr DeduceTileFullType(const std::vector<ExprPtr>& args,
 TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
                          const std::vector<std::pair<std::string, std::any>>& kwargs,
                          const std::string& op_name) {
-  // tile.ci signature: (start, shape) with attrs {dtype, descending}
-  CHECK(args.size() == 2) << "The operator " << op_name
-                          << " requires exactly 2 arguments (start, shape), but got " << args.size();
+  // tile.ci signature: (start, shape[, tmp]) with attrs {dtype, descending}.
+  // A2/A3 requires the optional scratch operand when PTOAS PlanMemory is
+  // skipped; InitMemRef materializes the canonical workspace when absent.
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name << " requires 2 or 3 arguments (start, shape[, tmp]), but got "
+      << args.size();
 
   // Extract dtype and validate it is one of the supported integer types.
   DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
@@ -756,6 +770,17 @@ TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
 
   // descending kwarg is optional and defaults to false.
   (void)GetKwarg<bool>(kwargs, "descending", false);
+
+  if (args.size() == 3) {
+    auto tmp_type = As<TileType>(args[2]->GetType());
+    CHECK(tmp_type) << "The operator " << op_name
+                    << " requires optional third argument 'tmp' to be a TileType, but got "
+                    << args[2]->GetType()->TypeName();
+    CHECK(tmp_type->dtype_ == DataType::FP32 || tmp_type->dtype_ == DataType::INT32 ||
+          tmp_type->dtype_ == DataType::UINT32)
+        << "The operator " << op_name << " requires tmp dtype to be FP32, INT32, or UINT32, but got "
+        << tmp_type->dtype_.ToString();
+  }
 
   TileView tile_view;
   tile_view.valid_shape = tile_shape;
@@ -1099,6 +1124,9 @@ REGISTER_OP("tile.load")
         "Valid shape of tile in each dimension, in source tensor coordinates (TupleType of ScalarType). ")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<bool>("clamp")
+    // Declared GM cache-access policy, carried as an int (``ir::CachePolicy``)
+    // so serialization / structural comparison need no new enum arm.
+    .set_attr<int>("cache")
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
     .set_output_memory_from_kwarg("target_memory")
@@ -1509,8 +1537,15 @@ REGISTER_OP("tile.ci")
     .set_description("Generate a contiguous integer sequence into a destination tile (pto.tci)")
     .add_argument("start", "Starting integer scalar (must match dst dtype)")
     .add_argument("shape", "Destination shape (TupleType of ConstInt)")
+    .add_argument("tmp", "Optional A2/A3 scratch tile (FP32 Vec)")
     .set_attr<DataType>("dtype")
     .set_attr<bool>("descending")
+    .set_input_memory(2, MemorySpace::Vec)
+    // The A2/A3 PTOAS level3 TCI form takes tmp as an explicit scratch input
+    // and may still read it while producing dst, so MemoryReuse cannot recycle
+    // tmp's allocation for the output. A5 normally uses the tmp-free form, and
+    // InitMemRef never synthesizes this operand for A5.
+    .forbid_output_alias(2)
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

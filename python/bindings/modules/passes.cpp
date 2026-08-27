@@ -137,7 +137,11 @@ void BindPass(nb::module_& m) {
       .value("AccCompactValid", IRProperty::AccCompactValid,
              "Every tile.matmul_acc / tile.matmul_mx_acc accumulates into a CompactMode.normal "
              "buffer when mad's pitch (ceil(lhs validRow/16)*16) differs from the accumulator's "
-             "physical row count, and no tile outside Left/Right/Acc carries a compact mode");
+             "physical row count, and no tile outside Left/Right/Acc carries a compact mode")
+      .value("GraphBoundaryLegalized", IRProperty::GraphBoundaryLegalized,
+             "Every FunctionType::Graph function satisfies the host_build_graph boundary contract: "
+             "derived boundary scalars hoisted to the call sites, a signature within the runtime's "
+             "tensor/direction/return limits, and no call site the runtime could not cache");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -220,7 +224,10 @@ void BindPass(nb::module_& m) {
       .value("OutParamWriteDropped", DiagnosticCheck::OutParamWriteDropped,
              "Rebinding an Out/InOut parameter drops the caller's write")
       .value("ScalarWriteLineShared", DiagnosticCheck::ScalarWriteLineShared,
-             "pl.write from concurrent task instances may share a 64-byte cache line");
+             "pl.write from concurrent task instances may share a 64-byte cache line")
+      .value("InParamWritten", DiagnosticCheck::InParamWritten,
+             "A parameter declared In that its own function body writes. The write is invisible to "
+             "dependency analysis, so nothing is ordered against it");
 
   // Bind DiagnosticCheckSet
   auto diagnostic_check_set =
@@ -502,6 +509,14 @@ void BindPass(nb::module_& m) {
              "Applies three patterns: iter-arg reuse (merge Out->InOut), assemble parent\n"
              "strides (attach TensorView to Out params), and assemble-loop rewrite\n"
              "(convert tile.assemble loops to tile.store loops).");
+  passes.def("block_nz_tensor_views", &pass::BlockNzTensorViews,
+             "Create a pass that rewrites logical pl.NZ tensors into pto-isa's blocked NZ form\n\n"
+             "An NZ TensorType shape [..., R, C] becomes [..., C/c0, R/16, 16, c0], where\n"
+             "c0 is the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
+             "consuming tile.load has its offsets / shapes / valid_shape rewritten into\n"
+             "blocked coordinates while its logical 2-D destination TileType is preserved.\n"
+             "Must run after ConvertTensorToTileOps and after FlattenTileNdTo2D (it\n"
+             "requires TileOps2D: the destination tile must already be 2-D).");
   passes.def("flatten_tile_nd_to_2d", &pass::FlattenTileNdTo2D,
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"
@@ -601,6 +616,9 @@ void BindPass(nb::module_& m) {
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
   passes.def("materialize_dist_tensor_ctx", &pass::MaterializeDistTensorCtx,
              "Materialize CommCtx parameters and arguments for DistributedTensor function parameters.");
+  passes.def("legalize_graph_boundary", &pass::LegalizeGraphBoundary,
+             "Hoist derived boundary scalars out of Graph functions and reject graphs the "
+             "host_build_graph runtime could not record");
   passes.def("materialize_valid_shape_symbols", &pass::MaterializeValidShapeSymbols,
              "Materialize a Scalar[INDEX] parameter per unbindable device-kernel valid_shape symbol.\n\n"
              "A pl.dynamic() symbol named only in a parameter's pl.TensorView(valid_shape=...) is\n"

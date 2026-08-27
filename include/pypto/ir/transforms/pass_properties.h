@@ -63,6 +63,15 @@ inline const PassProperties kMaterializeDistTensorCtxProperties{
 //    Signature-and-call rewrite only; touches no structural property.
 inline const PassProperties kMaterializeValidShapeSymbolsProperties{};
 
+// -- LegalizeGraphBoundary pass (runs after the final Simplify) ---------------
+//    Hoists every boundary scalar a Graph body derives out to its call sites and
+//    rejects the graphs the host_build_graph runtime could not record. Rewrites
+//    call arguments and their directions, so it re-declares CallDirectionsResolved
+//    — MaterializeRuntimeScopes, which runs next, requires it.
+inline const PassProperties kLegalizeGraphBoundaryProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
+    .produced = {IRProperty::GraphBoundaryLegalized, IRProperty::CallDirectionsResolved}};
+
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
 //    body and for/if bodies so codegen emits SIMPLER_SCOPE 1:1 from the IR.
@@ -160,6 +169,26 @@ inline const PassProperties kConvertTensorToTileOpsProperties{
 inline const PassProperties kOptimizeOrchTensorsProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps},
     .produced = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps}};
+
+// -- Blocked NZ tensor views ---------------------------------------------------
+//
+// Rewrites a logical ``pl.NZ`` tensor into pto-isa's blocked rank-(r+2) form
+// and retargets its ``tile.load`` coordinates. It changes shapes and load
+// coordinates inside the existing tile-op vocabulary without establishing or
+// destroying an IRProperty of its own.
+//
+// It does, however, *require* TileOps2D: the destination tile must already be
+// the logical 2D operand when the load's GM window is blocked. Blocking an
+// ND-rank tile leaves a ``tile.load`` whose type annotation and argument ranks
+// cannot both be printed, which the printer round-trip rejects. Declaring the
+// requirement is what makes a hand-assembled pipeline in the wrong order fail
+// the property check instead of failing obscurely later.
+
+inline const PassProperties kBlockNzTensorViewsProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::TileOps2D,
+                 IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::TileOps2D,
+                 IRProperty::NormalizedStmtStructure}};
 
 // -- Tile ND-to-2D flattening pass --------------------------------------------
 
