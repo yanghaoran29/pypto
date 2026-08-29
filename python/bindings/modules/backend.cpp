@@ -138,8 +138,12 @@ void BindBackend(nb::module_& m) {
            "Whether ExpandMixedKernel must inject the GM-backed pipe slot buffer")
       .def("requires_split_load_tpop_workaround", &BackendHandler::RequiresSplitLoadTpopWorkaround,
            "Whether MemoryReuse must apply the load + tpop_from_aic in-place hazard guard")
+      .def("uses_a2a3_level3_tmp_abi", &BackendHandler::UsesA2A3Level3TmpAbi,
+           "Whether the backend uses the A2/A3 PTOAS level-3 explicit-tmp ABI")
       .def("requires_level3_tmp_scratch", &BackendHandler::RequiresLevel3TmpScratch,
-           "Whether InitMemRef/codegen must materialize PTOAS level-3 explicit tmp scratch")
+           "Deprecated alias for uses_a2a3_level3_tmp_abi")
+      .def("uses_raw_soft_syncall_pointer_abi", &BackendHandler::UsesRawSoftSyncallPointerAbi,
+           "Whether soft SYNCALL uses the PTOAS v0.60 raw-GM-pointer operand ABI")
       .def("requires_vto_c_fractal_adapt", &BackendHandler::RequiresVtoCFractalAdapt,
            "Whether AIV-side V-to-C tpush must materialise a fractal-layout adapter move")
       .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,

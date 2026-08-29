@@ -57,7 +57,9 @@ to global state.
 | `GetExtraPtoasFlags()` | extra ptoas flags | `[]` | `["--pto-arch", "a5"]` |
 | `RequiresGMPipeBuffer()` | inject GM-backed pipe slot in `ExpandMixedKernel` | `true` | `false` |
 | `RequiresSplitLoadTpopWorkaround()` | MemoryReuse load + tpop_from_aic in-place hazard guard | `true` | `false` |
-| `RequiresLevel3TmpScratch()` | InitMemRef materialize level-3 explicit tmp; codegen static-view bridges | `true` | `false` |
+| `UsesA2A3Level3TmpAbi()` | Architecture uses A2/A3 explicit-tmp operands and static-view bridges | `true` | `false` |
+| `RequiresLevel3TmpScratch()` | Deprecated alias of `UsesA2A3Level3TmpAbi()` | `true` | `false` |
+| `UsesRawSoftSyncallPointerAbi()` | Soft `SYNCALL` takes a raw GM pointer instead of A5 partition/local workspaces | `true` | `false` |
 | `RequiresVtoCFractalAdapt()` | AIV-side V-to-C fractal adapter `tile.move` | `false` | `true` |
 | `RequiresRuntimeSubblockBridge()` | split AIV wrappers source subblock id from runtime | `true` | `false` |
 | `RequiresNoSplitDualAivDispatch()` | `no_split` mixed kernels still dispatch on both AIV lanes | `true` | `false` |
@@ -93,6 +95,7 @@ handler = _backend_core.get_handler()
 handler = _backend_core.get_backend_instance(BackendType.Ascend950).get_handler()
 
 handler.get_pto_target_arch()             # "a2a3" or "a5"
+handler.uses_a2a3_level3_tmp_abi()        # architecture ABI, not PTO build level
 handler.requires_runtime_subblock_bridge()  # bool
 handler.get_extra_ptoas_flags()           # list[str]
 ```

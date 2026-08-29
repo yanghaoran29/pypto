@@ -283,9 +283,9 @@ REGISTER_OP("tile.scatter_mask")
     .set_op_category("TileOp")
     .set_description(
         "Scatter src rows into dst columns selected by a mask pattern (DPS: dst "
-        "is in/out). PyPTO codegen-level form lowered to a pto.tscatter mask "
-        "emission — not a distinct pto-isa instruction (unlike tile.gather_mask); "
-        "emitted for A2/A3 / CPU-sim style lowering paths.")
+        "is in/out). This is not a distinct pto-isa instruction (unlike "
+        "tile.gather_mask): A2/A3 emits the legacy pto.tscatter mask form, "
+        "while A5 synthesizes flattened indices for index-form pto.tscatter.")
     .add_argument("dst", "Destination tile (DPS; columns are rewritten on mask-marked positions)")
     .add_argument("src", "Source tile (compact rows; same dtype as dst)")
     .set_attr<int>("mask_pattern")

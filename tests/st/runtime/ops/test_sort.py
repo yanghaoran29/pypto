@@ -83,6 +83,39 @@ class Sort32FP32Program:
 
 
 @pl.program
+class Sort32GatherFP16Program:
+    """Sort FP16 blocks and gather the value lane from each 8-byte pair."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        src: pl.Tensor[[8, 32], pl.FP16],
+        idx: pl.Tensor[[8, 32], pl.UINT32],
+        value_indices: pl.Tensor[[8, 32], pl.INT32],
+        gather_tmp: pl.Tensor[[8, 32], pl.INT32],
+        out: pl.Out[pl.Tensor[[8, 32], pl.FP16]],
+    ) -> pl.Tensor[[8, 32], pl.FP16]:
+        src_tile = pl.load(src, [0, 0], [8, 32])
+        idx_tile = pl.load(idx, [0, 0], [8, 32])
+        sorted_tile: pl.Tile[[8, 128], pl.FP16] = pl.tile.sort32(src_tile, idx_tile)
+        value_idx_tile = pl.load(value_indices, [0, 0], [8, 32])
+        gather_tmp_tile = pl.load(gather_tmp, [0, 0], [8, 32])
+        values: pl.Tile[[8, 32], pl.FP16] = pl.tile.gather(sorted_tile, value_idx_tile, gather_tmp_tile)
+        return pl.store(values, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        src: pl.Tensor[[8, 32], pl.FP16],
+        idx: pl.Tensor[[8, 32], pl.UINT32],
+        value_indices: pl.Tensor[[8, 32], pl.INT32],
+        gather_tmp: pl.Tensor[[8, 32], pl.INT32],
+        out: pl.Out[pl.Tensor[[8, 32], pl.FP16]],
+    ) -> pl.Tensor[[8, 32], pl.FP16]:
+        return self.kernel(src, idx, value_indices, gather_tmp, out)
+
+
+@pl.program
 class Sort32GatherFP32Program:
     """Sort 32-element blocks, then gather to separate values and indices."""
 
@@ -462,6 +495,12 @@ def _make_idx_gather_idx():
     return ((torch.arange(0, 32, dtype=torch.int32) * 2 + 1).unsqueeze(0) + row_offsets).contiguous()
 
 
+def _make_fp16_value_gather_idx():
+    """Flat first-lane indices into each four-FP16 sort32 output tuple."""
+    row_offsets = (torch.arange(0, 8, dtype=torch.int32) * 128).unsqueeze(1)
+    return ((torch.arange(0, 32, dtype=torch.int32) * 4).unsqueeze(0) + row_offsets).contiguous()
+
+
 def _make_idx_1x128():
     """Global indices [0..127] for mrgsort format1 test."""
     return torch.arange(0, 128, dtype=torch.int32).unsqueeze(0).contiguous()
@@ -740,6 +779,31 @@ class Sort32FP32TestCase(PTOTestCase):
         tensors["output"][:] = expected
 
 
+class Sort32GatherFP16TestCase(PTOTestCase):
+    """FP16 TSORT32 stores four FP16 lanes per value-index pair."""
+
+    def get_name(self) -> str:
+        return "sort32_gather_fp16"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("src", [8, 32], DataType.FP16, init_value=lambda: _make_src_8x32().to(torch.float16)),
+            TensorSpec("idx", [8, 32], DataType.UINT32, init_value=_make_idx_8x32),
+            TensorSpec("value_indices", [8, 32], DataType.INT32, init_value=_make_fp16_value_gather_idx),
+            TensorSpec("gather_tmp", [8, 32], DataType.INT32, init_value=0),
+            TensorSpec("out", [8, 32], DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return Sort32GatherFP16Program
+
+    def compute_expected(self, tensors, params=None):
+        tensors["out"][:] = torch.sort(tensors["src"], dim=1, descending=True).values
+
+
 class Sort32GatherFP32TestCase(PTOTestCase):
     """Test sort32 + gather: separate values and indices from interleaved output.
 
@@ -818,33 +882,39 @@ class Sort32GatherMaskFP32TestCase(PTOTestCase):
 # --- Tests ---
 
 
-# sort32/mrgsort intrinsics are A2A3-only (Ascend 910B). Additionally, the
-# a2a3sim simulator value-converts TSORT32 index lanes while the expected
-# outputs in this file reinterpret raw uint32 bits, so the index-checking
-# cases would compare incompatible representations on the simulator. Until
-# ``compute_expected()`` is taught the simulator's lane convention, restrict
-# the whole class to onboard a2a3 only.
-@pytest.mark.platforms("a2a3")
 class TestSort:
-    """Test suite for sort32 and mrgsort operations."""
+    """TSORT32 coverage on both architectures."""
 
+    @pytest.mark.platforms("a2a3", "a5")
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_sort32_fp32(self, test_runner, platform):
         """Test sort32 with FP32 data: verify descending sort with index tracking."""
         result = test_runner.run(Sort32FP32TestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3", "a5")
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_sort32_gather_fp32(self, test_runner, platform):
         """Test sort32 + gather: separate values and indices into distinct tensors."""
         result = test_runner.run(Sort32GatherFP32TestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.platforms("a2a3")
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_sort32_gather_mask_fp32(self, test_runner, platform):
         """Test sort32 + gather_mask: extract sorted values with P0101 mask."""
         result = test_runner.run(Sort32GatherMaskFP32TestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_sort32_gather_fp16(self, test_runner, platform):
+        result = test_runner.run(Sort32GatherFP16TestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+
+@pytest.mark.platforms("a2a3")
+class TestMrgSort:
+    """TMRGSORT coverage remains restricted to Ascend910B."""
 
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_mrgsort1_fp32(self, test_runner, platform):

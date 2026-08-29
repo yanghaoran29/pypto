@@ -193,7 +193,8 @@ or call `set_validshape` on the source tile before taking the view.
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | Reserve buffer (`auto = true`, `base` omitted under `memory_planner=PTOAS`) |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | Cross-core all-participant barrier (hard/FFTS form) |
-| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Current PTO-ISA soft/GM-polling barrier (partial occupancy; at least 64-byte GM workspace; explicit `N=0` derives the count from device launch registers and omits `%used`) |
+| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` on A2/A3 | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Raw-pointer soft barrier; all participant sets; at least 64-byte GM workspace |
+| Same op on A5 (`C=AIV` or `MIX`) | `pto.syncall(%gm_view, %ub[, %l1][, %used] : ...) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Partition-view ABI with compiler-owned UB workspace and MIX-only L1 workspace; GM requires eight `INT32` slots per explicit participant (minimum 16 total); AIC-only soft is unsupported |
 
 **Notes:**
 

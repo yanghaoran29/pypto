@@ -227,8 +227,8 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
 //   tile.col_expand -> pto.tcolexpand: emits the column vector (args_[1]); args_[0]
 //                      (target) is kept only for shape/type inference.
 //   tile.row_expand -> pto.trowexpand: emits the row vector (args_[1]); ditto.
-//   tile.fillpad_expand -> pto.tfillpad: emits the source tile (args_[0]); PTOAS 0.58
-//                      infers expand lowering when dst tile_buf is larger than src.
+//   tile.fillpad_expand -> pto.tfillpad_expand: emits the source tile (args_[0]);
+//                      unlike pto.tfillpad, this form permits a larger dst tile_buf.
 //                      args_[1] (shape tuple) is type-deduction only. The pad value
 //                      and dst extents ride on the result tile-buf type.
 struct SingleOperandOp {
@@ -294,7 +294,7 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
       << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
-  if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
+  if (op->args_.size() == 2 && codegen.GetBackendHandler()->UsesA2A3Level3TmpAbi()) {
     auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
     auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
     auto dst_var = codegen.GetCurrentResultVar();
@@ -349,13 +349,13 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
       << "Operation:[" << pto_op_name << "] requires 2 or 3 arguments (start, shape[, tmp]), but got "
       << op->args_.size();
-  const bool level3 = codegen.GetBackendHandler()->RequiresLevel3TmpScratch();
+  const bool uses_a2a3_tmp_abi = codegen.GetBackendHandler()->UsesA2A3Level3TmpAbi();
   bool descending = op->GetKwarg<bool>("descending");
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
   std::string tmp;
   std::string tmp_type;
-  if (op->args_.size() == 3 && level3) {
+  if (op->args_.size() == 3 && uses_a2a3_tmp_abi) {
     // A2/A3 level3 TCI verifies tmp/dst static valid_shape; bridge alloc_tile views.
     tmp = EnsureStaticViewTileSsa(op->args_[2], codegen, "ci_tmp_view");
     tmp_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[2]->GetType()));
@@ -368,10 +368,10 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.ci requires an assignment target";
   auto dst_type = As<ir::TileType>(dst_var->GetType());
   INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.ci result must be a TileType";
-  const std::string dst = (op->args_.size() == 3 && level3)
+  const std::string dst = (op->args_.size() == 3 && uses_a2a3_tmp_abi)
                               ? EnsureStaticViewTileSsa(dst_var, codegen, "ci_dst_view")
                               : codegen.GetCurrentResultTarget();
-  const std::string dst_type_str = (op->args_.size() == 3 && level3)
+  const std::string dst_type_str = (op->args_.size() == 3 && uses_a2a3_tmp_abi)
                                        ? codegen.GetViewTileBufTypeStringFromTileType(dst_type)
                                        : codegen.GetCurrentResultTileBufTypeString();
   std::ostringstream oss;
@@ -921,7 +921,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     return MakeSingleOperandCodegenPTO({"tile.row_expand", "pto.trowexpand", 1, ""}, op, codegen);
   });
   reg("tile.fillpad_expand", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeSingleOperandCodegenPTO({"tile.fillpad_expand", "pto.tfillpad", 0, " (src, shape)"}, op,
+    return MakeSingleOperandCodegenPTO({"tile.fillpad_expand", "pto.tfillpad_expand", 0, " (src, shape)"}, op,
                                        codegen);
   });
 
@@ -967,7 +967,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
               << "tile.col_sum requires 1 or 2 arguments, but got " << op->args_.size();
           std::string config_attr = op->args_.size() == 2 ? " {isBinary = true}" : "";
           const bool needs_static_view =
-              op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch();
+              op->args_.size() == 2 && codegen.GetBackendHandler()->UsesA2A3Level3TmpAbi();
           if (needs_static_view) {
             auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
             auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());

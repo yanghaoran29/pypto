@@ -242,8 +242,9 @@ REGISTER_OP("tensor.scatter_mask")
         "Scatter rows of input into mask-marked columns of dst (tensor-level, "
         "maps 1:1 to tile.scatter_mask). Each row of the 2D input is expanded "
         "into a dst row by writing values onto the columns selected by "
-        "mask_pattern. PyPTO codegen-level form (not a distinct pto-isa "
-        "instruction); emitted for A2/A3 / CPU-sim style lowering paths.")
+        "mask_pattern. This is not a distinct pto-isa instruction: A2/A3 "
+        "emits the legacy pto.tscatter mask form, while A5 synthesizes "
+        "flattened indices for index-form pto.tscatter.")
     .add_argument("input", "Source tensor with compact rows (TensorType, 2D)")
     .add_argument("dst", "Destination tensor (rewritten on positions selected by mask_pattern)")
     .set_attr<int>("mask_pattern")

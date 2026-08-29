@@ -24,6 +24,7 @@ simpler_setup (issue #1064), this file can be deleted and callers can
 """
 
 import importlib.util
+from pathlib import Path
 
 from simpler_setup import KernelCompiler as _SimplerKernelCompiler  # pyright: ignore[reportMissingImports]
 
@@ -98,13 +99,24 @@ class KernelCompiler(_SimplerKernelCompiler):
         Returns:
             Binary contents of the compiled .o file.
         """
+        source = Path(source_path)
         all_include_dirs: list[str] = []
         if runtime_name is not None:
             all_include_dirs.extend(self.get_kernel_include_dirs(runtime_name))
+        if self.platform in ("a5", "a5sim") and "SYNCALL<SyncAllMode::Soft" in source.read_text(
+            encoding="utf-8"
+        ):
+            compat_dir = Path(__file__).with_name("incore")
+            wrapper = source.with_name(f".{source.stem}_a5_syncall_compat.cpp")
+            wrapper.write_text(
+                f'#include "a5_syncall_compat.hpp"\n#include "{source.name}"\n', encoding="utf-8"
+            )
+            source = wrapper
+            all_include_dirs.append(str(compat_dir))
         if extra_include_dirs:
             all_include_dirs.extend(extra_include_dirs)
         return super().compile_incore(
-            source_path,
+            str(source),
             core_type=core_type,
             pto_isa_root=pto_isa_root,
             extra_include_dirs=all_include_dirs or None,

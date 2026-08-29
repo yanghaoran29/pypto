@@ -54,7 +54,9 @@ if (backend::GetBackendType() != backend::BackendType::Ascend910B) { ... }
 | `GetExtraPtoasFlags()` | ptoas 额外参数 | `[]` | `["--pto-arch", "a5"]` |
 | `RequiresGMPipeBuffer()` | `ExpandMixedKernel` 是否注入 GM 槽位缓冲 | `true` | `false` |
 | `RequiresSplitLoadTpopWorkaround()` | MemoryReuse 是否做 load + tpop_from_aic 原地复用危害规避 | `true` | `false` |
-| `RequiresLevel3TmpScratch()` | InitMemRef 是否物化 level-3 显式 tmp；codegen static-view 桥接 | `true` | `false` |
+| `UsesA2A3Level3TmpAbi()` | 架构是否使用 A2/A3 显式 tmp operand 与 static-view 桥接 | `true` | `false` |
+| `RequiresLevel3TmpScratch()` | `UsesA2A3Level3TmpAbi()` 的弃用兼容别名 | `true` | `false` |
+| `UsesRawSoftSyncallPointerAbi()` | soft `SYNCALL` 是否接收裸 GM 指针，而非 A5 partition/local workspace | `true` | `false` |
 | `RequiresVtoCFractalAdapt()` | AIV 端 V→C tpush 是否需要 fractal 适配 `tile.move` | `false` | `true` |
 | `RequiresRuntimeSubblockBridge()` | 拆分 AIV 包装器是否从 runtime 上下文取 subblock id | `true` | `false` |
 | `RequiresNoSplitDualAivDispatch()` | `no_split` 混合 kernel 是否仍需在两个 AIV lane 上同时下发 | `true` | `false` |
@@ -90,6 +92,7 @@ handler = _backend_core.get_handler()
 handler = _backend_core.get_backend_instance(BackendType.Ascend950).get_handler()
 
 handler.get_pto_target_arch()              # "a2a3" 或 "a5"
+handler.uses_a2a3_level3_tmp_abi()         # 架构 ABI，而不是 PTO build level
 handler.requires_runtime_subblock_bridge()  # bool
 handler.get_extra_ptoas_flags()            # list[str]
 ```

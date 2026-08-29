@@ -32,7 +32,9 @@ class TestBackendHandlerValues:
 
         assert handler.requires_gm_pipe_buffer() is True
         assert handler.requires_split_load_tpop_workaround() is True
+        assert handler.uses_a2a3_level3_tmp_abi() is True
         assert handler.requires_level3_tmp_scratch() is True
+        assert handler.uses_raw_soft_syncall_pointer_abi() is True
         assert handler.requires_vto_c_fractal_adapt() is False
         assert handler.requires_runtime_subblock_bridge() is True
         assert handler.requires_no_split_dual_aiv_dispatch() is True
@@ -47,7 +49,9 @@ class TestBackendHandlerValues:
 
         assert handler.requires_gm_pipe_buffer() is False
         assert handler.requires_split_load_tpop_workaround() is False
+        assert handler.uses_a2a3_level3_tmp_abi() is False
         assert handler.requires_level3_tmp_scratch() is False
+        assert handler.uses_raw_soft_syncall_pointer_abi() is False
         assert handler.requires_vto_c_fractal_adapt() is True
         assert handler.requires_runtime_subblock_bridge() is False
         assert handler.requires_no_split_dual_aiv_dispatch() is False

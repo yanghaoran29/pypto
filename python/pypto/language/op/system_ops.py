@@ -153,6 +153,8 @@ def syncall(
     mode: SyncAllMode = SyncAllMode.HARD,
     gm_workspace: Tensor | None = None,
     used_cores: IntLike | None = None,
+    _ub_workspace: Tile | None = None,
+    _l1_workspace: Tile | None = None,
     span: Span | None = None,
 ) -> Call:
     """Cross-core all-participant barrier (``pto::SYNCALL``).
@@ -166,9 +168,9 @@ def syncall(
       (``HardSyncallOccupancy`` verifier, issue #1935). See
       ``pypto.ir.op.system_ops.syncall``.
     - ``mode=pl.SyncAllMode.SOFT``: GM-polling barrier that works at partial
-      occupancy. Each participant updates a shared counter in an exclusive
-      64-byte GM cache line and polls until all participants arrive. Supported
-      for every participant set.
+      occupancy. A2/A3 supports every participant set through a raw GM pointer.
+      A5 supports AIV and MIX through a partition view plus compiler-owned
+      local workspace; A5 AIC-only soft barriers are unsupported.
 
     Both modes synchronize arrival only. They do not wait for preceding data
     instructions or publish/invalidate business-data cache lines. For a
@@ -186,16 +188,20 @@ def syncall(
             *total* AIC + AIV participant count.
         mode: A [`SyncAllMode`][pypto.language.system.SyncAllMode] member.
         gm_workspace: Soft mode only. A shared, zero-initialized GM ``INT32``
-            tensor with at least 16 elements (64 bytes), visible to every
-            participating block. Pass it as a kernel parameter so all SPMD
-            blocks share one buffer. The buffer must occupy an exclusive cache
-            line and be zero-initialized before its first use.
+            tensor visible to every participating block. A2/A3 requires at
+            least 16 elements. With an explicit A5 participant count ``N``, it
+            requires at least ``max(16, 8*N)`` elements for cache-line-isolated
+            slots. Pass it as a kernel parameter and zero it before first use.
         used_cores: Soft mode only. Required participant count as a Python int
             in the INT32 range or an ``INT32`` scalar. Pass 0 explicitly to ask
             PTO-ISA to derive the count from the device launch configuration.
             That opt-in is unsafe when the runtime's logical grid differs from
             the device launch registers, including the currently pinned Simpler
             runtime.
+        _ub_workspace: Compiler-internal A5 UB workspace used only when parsing
+            a post-lowering IR dump.
+        _l1_workspace: Compiler-internal A5 MIX L1 workspace used only when
+            parsing a post-lowering IR dump.
         span: Optional source span for debugging (auto-captured if not provided).
 
     Returns:
@@ -207,7 +213,12 @@ def syncall(
         # Reject soft-only kwargs so a typo like syncall(gm_workspace=ws) does not
         # silently fall back to the full-occupancy hard barrier (the deadlock path
         # the soft form exists to avoid).
-        if gm_workspace is not None or used_cores is not None:
+        if (
+            gm_workspace is not None
+            or used_cores is not None
+            or _ub_workspace is not None
+            or _l1_workspace is not None
+        ):
             raise ValueError(
                 "syncall(mode=SyncAllMode.HARD) takes no gm_workspace/used_cores; "
                 "pass mode=SyncAllMode.SOFT to use the GM-polling barrier"
@@ -240,7 +251,18 @@ def syncall(
             "soft syncall used_cores must be a non-negative Python int or an INT32 scalar, "
             f"got {type(used_cores).__name__}"
         )
-    return _ir_ops.syncall_soft(core_type, gm_workspace.unwrap(), used_expr, span=actual_span)
+    if _ub_workspace is not None and not isinstance(_ub_workspace, Tile):
+        raise TypeError("soft syncall internal UB workspace must be a Tile")
+    if _l1_workspace is not None and not isinstance(_l1_workspace, Tile):
+        raise TypeError("soft syncall internal L1 workspace must be a Tile")
+    return _ir_ops.syncall_soft(
+        core_type,
+        gm_workspace.unwrap(),
+        used_expr,
+        ub_workspace=None if _ub_workspace is None else _ub_workspace.unwrap(),
+        l1_workspace=None if _l1_workspace is None else _l1_workspace.unwrap(),
+        span=actual_span,
+    )
 
 
 @overload

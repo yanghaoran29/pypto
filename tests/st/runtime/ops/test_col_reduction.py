@@ -26,6 +26,7 @@ import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 from pypto.ir.pass_manager import OptimizationStrategy
+from pypto.runtime import RunConfig
 
 # =============================================================================
 # Programs — col_sum (tmp_tile optional; provide it for binary-tree reduction)
@@ -492,6 +493,12 @@ class ColSum8x128FP32(PTOTestCase):
 
 
 class ColSum32x64FP16(PTOTestCase):
+    def __init__(self):
+        # A5 and A2/A3 use different valid FP16 binary-tree reduction orders.
+        # Both accumulate in FP16, so compare within the observed reduction-order
+        # rounding envelope rather than the harness's FP32-oriented 1e-5 default.
+        super().__init__(RunConfig(rtol=2e-3, atol=2e-2))
+
     def get_name(self) -> str:
         return "col_sum_32x64_fp16"
 

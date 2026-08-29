@@ -610,8 +610,11 @@ class TestConvertTensorToTileOps:
                 ret0__store = pl.tile.store(sliced__tile, [0], ret0__out)
                 return ret0__store
 
-        After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        try:
+            After = passes.convert_tensor_to_tile_ops()(Before)
+            ir.assert_structural_equal(After, Expected)
+        finally:
+            backend.reset_for_testing()
 
     def test_tensor_view_rejects_input_converted_to_tile(self):
         """A GM view cannot consume a producer that pass 12 lowers to Tile."""
@@ -4531,6 +4534,8 @@ class TestConvertScatterOp:
 
     def test_scatter_mask_conversion(self):
         """tensor.scatter_mask -> tile.load(input) + tile.load(dst) + tile.scatter_mask + tile.store."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
 
         @pl.program
         class Before:
@@ -4552,13 +4557,78 @@ class TestConvertScatterOp:
                 out: pl.Tensor[[4, 16], pl.FP32] = self.main_incore_0(inp, dst)
                 return out
 
-        After = passes.convert_tensor_to_tile_ops()(Before)
+        try:
+            After = passes.convert_tensor_to_tile_ops()(Before)
+        finally:
+            backend.reset_for_testing()
         after_src = After.as_python()
 
         assert "tensor.scatter_mask" not in after_src
         assert "pl.tile.scatter_mask(" in after_src
         assert "mask_pattern=1" in after_src
         assert "pl.Out[pl.Tensor[[4, 16]" in after_src
+
+    @pytest.mark.parametrize(
+        ("pattern", "stride"),
+        [(1, 2), (2, 2), (3, 4), (4, 4), (5, 4), (6, 4), (7, 1)],
+    )
+    def test_a5_scatter_mask_lowers_to_index_form(self, pattern, stride):
+        """A5 expands every mask pattern to flattened index-form scatter."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                inp: pl.Tensor[[4, 8], pl.FP32],
+                dst: pl.Tensor[[4, 8 * stride], pl.FP32],
+            ) -> pl.Tensor[[4, 8 * stride], pl.FP32]:
+                out = pl.tensor.scatter(inp, mask_pattern=pattern, dst=dst)
+                return out
+
+        try:
+            After = passes.convert_tensor_to_tile_ops()(Before)
+        finally:
+            backend.reset_for_testing()
+        after_src = After.as_python()
+
+        assert "tensor.scatter_mask" not in after_src
+        assert "pl.tile.scatter_mask(" not in after_src
+        assert after_src.count("pl.tile.scatter(") == 2
+        assert "scatter_mask_flat_idx" in after_src
+        assert "pl.tile.sel(" in after_src
+        assert "pl.tile.create([1, 32], dtype=pl.UINT8" in after_src
+
+    def test_a5_tile_scatter_mask_entry_uses_the_same_index_lowering(self):
+        """The public tile entry must not bypass the A5 compatibility lowering."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[4, 8], pl.FP32],
+                dst: pl.Tensor[[4, 16], pl.FP32],
+                out: pl.Tensor[[4, 16], pl.FP32],
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                inp_tile = pl.load(inp, [0, 0], [4, 8])
+                dst_tile = pl.load(dst, [0, 0], [4, 16])
+                scattered = pl.tile.scatter_mask(dst_tile, inp_tile, mask_pattern=pl.tile.MaskPattern.P0101)
+                return pl.store(scattered, [0, 0], out)
+
+        try:
+            After = passes.convert_tensor_to_tile_ops()(Before)
+        finally:
+            backend.reset_for_testing()
+        after_src = After.as_python()
+
+        assert "pl.tile.scatter_mask(" not in after_src
+        assert after_src.count("pl.tile.scatter(") == 2
+        assert "scatter_mask_flat_idx" in after_src
 
 
 class TestWrapperForwardPropagation:
@@ -5181,6 +5251,9 @@ class TestWindowSliceIncoreConversion:
     def test_soft_syncall_upgrades_workspace_to_inout(self):
         """The GM counter workspace is both read and written by soft syncall."""
 
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -5207,6 +5280,67 @@ class TestWindowSliceIncoreConversion:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_a5_soft_syncall_materializes_local_workspace(self):
+        """A5 injects the UB scratch required by its soft AIV barrier ABI."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, workspace: pl.Tensor[[32], pl.INT32]):
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=workspace,
+                    used_cores=4,
+                )
+                return  # noqa: PLR1711
+
+        try:
+            after = passes.convert_tensor_to_tile_ops()(Before)
+            kernel = after.get_function("kernel")
+            assert kernel is not None
+            syncall = _find_first_call_to(kernel, "system.syncall")
+            assert syncall is not None and len(syncall.args) == 3
+            ub_type = syncall.args[1].type
+            assert isinstance(ub_type, ir.TileType)
+            assert ub_type.memory_space == MemorySpace.Vec
+            static_shape = [dim.value for dim in ub_type.shape if isinstance(dim, ir.ConstInt)]
+            assert static_shape == [1, 512]
+
+            printed = str(after)
+            syncall_line = next(line for line in printed.splitlines() if "pl.system.syncall" in line)
+            assert "used_cores=4" in syncall_line
+            assert "_ub_workspace=syncall_ub_workspace" in syncall_line
+        finally:
+            backend.reset_for_testing()
+
+    def test_a5_soft_syncall_rejects_aic_only(self):
+        """A5 has no independent AIC GM write path for a soft barrier."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, workspace: pl.Tensor[[16], pl.INT32]):
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIC,
+                    gm_workspace=workspace,
+                    used_cores=2,
+                )
+                return  # noqa: PLR1711
+
+        try:
+            with pytest.raises(ValueError, match="unsupported on Ascend950"):
+                passes.convert_tensor_to_tile_ops()(Before)
+        finally:
+            backend.reset_for_testing()
 
     def test_barrier_upgrades_signal_to_inout(self):
         """``pld.tensor.barrier(signal)`` upgrades ``signal`` from In to InOut.

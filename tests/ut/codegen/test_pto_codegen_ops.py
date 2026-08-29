@@ -2831,10 +2831,10 @@ class TestMatmulAccCompactCodegen:
 class TestMrgSortCodegen:
     """Tests for mrgsort format1 code generation with constant and variable block_len."""
 
-    def _generate_mlir(self, program_cls) -> str:
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(backend_type)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -2906,11 +2906,9 @@ class TestMrgSortCodegen:
         assert tmrgsort_lines, "No pto.tmrgsort line found"
         assert "i32" in tmrgsort_lines[0], f"block_len type annotation should be i32: {tmrgsort_lines[0]}"
 
-    @pytest.mark.parametrize(
-        ("src_dtype", "output_cols"),
-        [(pl.FP32, 128), (pl.FP16, 256)],
-    )
-    def test_sort32_dynamic_valid_width_emits_level3_scratch(self, src_dtype, output_cols):
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize(("src_dtype", "output_cols"), [(pl.FP32, 128), (pl.FP16, 256)])
+    def test_sort32_dynamic_valid_width_emits_level3_scratch(self, backend_type, src_dtype, output_cols):
         """A runtime valid width keeps logical output bounds and uses static TSORT capacity."""
 
         @pl.program
@@ -2928,17 +2926,44 @@ class TestMrgSortCodegen:
                 sorted_tile = pl.tile.sort32(src_tile, idx_tile)
                 return pl.store(sorted_tile, [0, 0], out)
 
-        mlir = self._generate_mlir(Prog)
+        mlir = self._generate_mlir(Prog, backend_type)
         line = next(line for line in mlir.splitlines() if "pto.tsort32" in line)
         ins = line.split("ins(", 1)[1].split(":", 1)[0]
         assert ins.count(",") == 2, line
-        assert "%sort32_tmp_view" in line and "%sort32_dst_view" in line, line
+        if backend_type == BackendType.Ascend910B:
+            assert "%sort32_tmp_view" in line and "%sort32_dst_view" in line, line
+        else:
+            assert "%sort32_tmp_view" not in line and "%sort32_dst_view" not in line, line
+            assert "%sorted_tile__sort32_tmp" in line and "%sorted_tile" in line, line
         outs = line.split("outs(", 1)[1]
-        assert f"cols={output_cols}" in outs and f"v_col={output_cols}" in outs, line
-        assert "v_col=?" not in outs, line
+        assert f"cols={output_cols}" in outs, line
+        if backend_type == BackendType.Ascend910B:
+            assert f"v_col={output_cols}" in outs and "v_col=?" not in outs, line
         tstore_line = next(line for line in mlir.splitlines() if "pto.tstore" in line)
-        assert "%sorted_tile" in tstore_line and "%sort32_dst_view" not in tstore_line, tstore_line
+        assert "%sorted_tile" in tstore_line, tstore_line
         assert "arith.muli" in mlir, mlir
+
+    def test_a5_static_aligned_sort32_uses_static_views_without_tmp(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 32], pl.FP32],
+                idx: pl.Tensor[[1, 32], pl.UINT32],
+                out: pl.Tensor[[1, 64], pl.FP32],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                src_tile = pl.load(src, [0, 0], [1, 32])
+                idx_tile = pl.load(idx, [0, 0], [1, 32])
+                sorted_tile = pl.tile.sort32(src_tile, idx_tile)
+                return pl.store(sorted_tile, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        line = next(line for line in mlir.splitlines() if "pto.tsort32" in line)
+        assert "%sort32_src_view" in line and "%sort32_idx_view" in line, line
+        assert "%sort32_dst_view" in line, line
+        assert "sort32_tmp" not in line, line
+        assert "v_row=?" not in line and "v_col=?" not in line, line
 
 
 class TestConstDtypeCodegen:
@@ -3948,9 +3973,9 @@ class TestCrossCoreSyncCodegen:
 class TestSyncAllCodegen:
     """Tests that pl.system.syncall lowers to pto.syncall (hard/FFTS form)."""
 
-    def _generate_mlir(self, program_cls) -> str:
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(backend_type)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -3983,7 +4008,7 @@ class TestSyncAllCodegen:
         assert "core_type = #pto.sync_core_type<aiv_only>" in line, f"core_type missing:\n{line}"
 
     def test_syncall_soft_emits_gm_polling_barrier(self):
-        """soft syncall emits pto.syncall(%gm_pview, %used : ...) mode=<soft>."""
+        """A2/A3 soft syncall emits the PTOAS v0.60 raw-pointer form."""
 
         @pl.program
         class Prog:
@@ -4014,6 +4039,32 @@ class TestSyncAllCodegen:
         assert "tile_buf" not in line, f"legacy scratch operand still emitted:\n{line}"
         assert line.split(" : ", 1)[0].count(",") == 1, f"unexpected soft operand count:\n{line}"
         assert not any("partition_view" in ln and "syncgm" in ln for ln in mlir.splitlines()), mlir
+
+    def test_syncall_soft_a5_emits_partition_view(self):
+        """A5 soft syncall retains the ranked workspace operand required by PTOAS."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_syncall_soft(
+                self,
+                ws: pl.Tensor[[32], pl.INT32],
+            ) -> pl.Tensor[[32], pl.INT32]:
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=ws,
+                    used_cores=4,
+                )
+                return ws
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        line = next((ln for ln in mlir.splitlines() if "pto.syncall(" in ln), "")
+        assert "!pto.partition_tensor_view<32xi32>" in line, line
+        assert "loc=vec, dtype=i32, rows=1, cols=512" in line, line
+        assert "core_type = #pto.sync_core_type<aiv_only>" in line, line
+        assert "!pto.ptr<i32>" not in line, line
+        assert any("partition_view" in ln and "syncgm" in ln for ln in mlir.splitlines()), mlir
 
     def test_syncall_soft_omits_launch_derived_participant_count(self):
         """used_cores=0 emits the canonical single-operand soft form."""

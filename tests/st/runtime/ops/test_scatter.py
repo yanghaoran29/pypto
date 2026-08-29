@@ -54,13 +54,11 @@ A separate FP32 case feeds **repeated** indices with distinct values to pin the
 ascending-k last-wins ordering (the round-trip version hid this by writing equal
 values to repeated targets).
 
-**Mask form (A2/A3).** ``TestScatterMaskForm`` covers ``tensor.scatter_mask``
+**Mask form.** ``TestScatterMaskForm`` covers ``tensor.scatter_mask``
 (``mask_pattern=<int>`` + ``dst``), the column-wise inverse of the mask-form
 gather: each compact ``input`` row is written into the mask-selected columns of
-the wider ``dst`` (``dst.cols == input.cols * stride``). The form runs on the
-A2/A3 backend (``BackendType.Ascend910B``); A5 (``Ascend950``) rejects it, so
-``TestScatterMaskForm`` carries a ``platforms`` marker restricting it to the
-A2/A3 ids. Column selection mirrors gather: P0101
+the wider ``dst`` (``dst.cols == input.cols * stride``). A2/A3 emits the native
+mask form; A5 lowers it to index-form scatter. Column selection mirrors gather: P0101
 hits even columns (``0::2``), P1010 hits odd columns (``1::2``).
 
 The raw ``pto.tscatter`` mask instruction zero-fills the entire ``dst`` before
@@ -676,15 +674,8 @@ class TestScatterIndexForm:
         assert result.passed, f"Test failed: {result.error}"
 
 
-# The mask form is A2/A3 only. That restriction used to ride on a
-# ``get_backend_type`` pin on the case classes; it belongs on the tests, which
-# is what the platform matrix reads. Worth re-checking on silicon: under ptoas
-# 0.57 all four compile *and* pass on a5sim, so the rejection may no longer
-# hold — but a5sim has been wrong about 950 before (it does not model the
-# on-chip layout), so this stays restricted until a board run says otherwise.
-@pytest.mark.platforms("a2a3", "a2a3sim", reason="A5/Ascend950 rejects the pto.tscatter mask form")
 class TestScatterMaskForm:
-    """Mask-form row scatter — A2/A3 only (A5/Ascend950 rejects the mask form).
+    """Mask-form row scatter via native A2/A3 or index-form A5 lowering.
 
     Each compact ``inp`` row is written into the mask-selected columns of the
     wider ``dst`` (``dst.cols == inp.cols * stride``); column selection mirrors

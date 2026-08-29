@@ -200,15 +200,26 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresSplitLoadTpopWorkaround() const = 0;
 
   /**
-   * @brief Whether PyPTO/DSA-RP must materialize PTOAS level-3 explicit tmp
-   *        scratch and emit static-valid codegen views.
+   * @brief Whether this backend uses the A2/A3 PTOAS level-3 explicit-tmp ABI.
    *
-   * True on Ascend910B (a2a3): InitMemRef appends compiler-owned scratch for
-   * ops such as tile.ci / narrowing tile.cast / tile.sort32, and codegen
-   * bridges explicit-tmp forms with static valid_shape. False on Ascend950:
-   * PTOAS level-2 PlanMemory owns implicit tmp instead.
+   * This is an architecture capability, not the active PTO planning level.
+   * Ascend950 returns false even when PyPTO/DSA-RP selects PTO level3.
    */
-  [[nodiscard]] virtual bool RequiresLevel3TmpScratch() const = 0;
+  [[nodiscard]] virtual bool UsesA2A3Level3TmpAbi() const = 0;
+
+  /**
+   * @brief Deprecated compatibility alias for UsesA2A3Level3TmpAbi().
+   */
+  [[nodiscard]] bool RequiresLevel3TmpScratch() const { return UsesA2A3Level3TmpAbi(); }
+
+  /**
+   * @brief Whether PTOAS soft SYNCALL takes a raw GM pointer operand.
+   *
+   * PTOAS v0.60 uses the raw-pointer form on A2/A3. Ascend950 still verifies
+   * the workspace as a ranked partition tensor view, so its handler returns
+   * false and codegen retains that operand form.
+   */
+  [[nodiscard]] virtual bool UsesRawSoftSyncallPointerAbi() const = 0;
 
   /**
    * @brief Whether AIV-side V-to-C tpush must materialise a fractal-layout

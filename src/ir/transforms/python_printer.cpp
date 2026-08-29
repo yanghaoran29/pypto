@@ -1233,10 +1233,10 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     return;
   }
 
-  // The current PTO-ISA gives every system.syncall soft form the same operands:
-  // [gm_workspace] or [gm_workspace, used_cores]. Print them through the
-  // high-level keyword-only DSL surface so the program round-trips.
-  if (IsOp(op, "system.syncall") && (op->args_.size() == 1 || op->args_.size() == 2)) {
+  // A5 lowering inserts compiler-owned UB/L1 workspaces between gm_workspace
+  // and used_cores. Keep those internal operands out of the author-facing DSL
+  // so explicit pass dumps still round-trip through the public signature.
+  if (IsOp(op, "system.syncall") && !op->args_.empty()) {
     std::string core_type = "mix";
     std::string mode = "hard";
     for (const auto& [key, val] : op->kwargs_) {
@@ -1253,12 +1253,22 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       stream_ << "mode=" << prefix_ << ".SyncAllMode.SOFT, core_type=" << prefix_ << ".KernelType." << kernel
               << ", gm_workspace=";
       VisitExpr(op->args_[0]);
-      if (op->args_.size() == 2) {
+      const bool has_used_cores = op->args_.size() > 1 && As<ScalarType>(op->args_.back()->GetType());
+      const size_t workspace_end = op->args_.size() - (has_used_cores ? 1 : 0);
+      if (workspace_end > 1) {
+        stream_ << ", _ub_workspace=";
+        VisitExpr(op->args_[1]);
+      }
+      if (workspace_end > 2) {
+        stream_ << ", _l1_workspace=";
+        VisitExpr(op->args_[2]);
+      }
+      if (has_used_cores) {
         stream_ << ", used_cores=";
-        if (auto ci = As<ConstInt>(op->args_[1])) {
+        if (auto ci = As<ConstInt>(op->args_.back())) {
           stream_ << ci->value_;
         } else {
-          VisitExpr(op->args_[1]);
+          VisitExpr(op->args_.back());
         }
       } else {
         // The high-level API requires an explicit participant-count choice so

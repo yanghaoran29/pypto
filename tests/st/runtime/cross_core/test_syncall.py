@@ -38,7 +38,7 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
-from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
 from pypto import backend
 from pypto.ir.pass_manager import OptimizationStrategy
 from pypto.pypto_core import ir as _ir
@@ -78,11 +78,11 @@ A2A3_PLATFORMS = ("a2a3", "a2a3sim")
 
 # Soft-form SYNCALL polls a shared GM workspace, so it works at *partial*
 # occupancy. Use a small block count to exercise that (a hard barrier would
-# deadlock here). The GM workspace is one exclusive, zero-initialized 64-byte
-# cache line (16 int32 elements), shared across all blocks.
+# deadlock here). A5 assigns one cache-line-isolated 8-int32 slot per
+# participant; A2/A3's raw-pointer ABI also accepts these larger shapes.
 SOFT_CORE_NUM = 4
 SOFT_TOTAL_ROWS = SOFT_CORE_NUM * TILE_ROWS  # 512
-SOFT_WS_SLOTS = 16
+SOFT_WS_SLOTS = SOFT_CORE_NUM * 8
 
 # Mixed (AIC + AIV) soft-form SYNCALL. On 910B one cube block pairs with
 # AIV_RATIO vector subblocks (1 AIC + 2 AIV), so a launch of B cube blocks has
@@ -91,7 +91,7 @@ _BK910B = backend.Backend910B.instance()
 AIV_RATIO = _aiv_core_count(_BK910B) // _aic_core_count(_BK910B)  # 48 // 24 = 2
 MIX_CUBE_BLOCKS = 2  # partial occupancy (a hard mix barrier would deadlock here)
 MIX_USED_CORES = MIX_CUBE_BLOCKS * (1 + AIV_RATIO)  # 2 * 3 = 6 total AIC+AIV participants
-MIX_WS_SLOTS = 16
+MIX_WS_SLOTS = MIX_USED_CORES * 8
 MIX_M = 32
 MIX_K = 64
 MIX_N = 32
@@ -371,21 +371,22 @@ class TestSyncAll:
         result = test_runner.run(SPMDSyncAllTestCase(platform=platform))
         assert result.passed, f"SPMD aiv_only syncall failed: {result.error}"
 
-    @pytest.mark.parametrize("platform", A2A3_PLATFORMS)
+    @pytest.mark.parametrize("platform", PLATFORMS)
     def test_spmd_syncall_soft_aiv_only(self, test_runner, platform):
         """SPMD add with an aiv_only *soft* barrier at partial occupancy: verify out = a + b."""
         result = test_runner.run(SPMDSyncAllSoftTestCase(platform=platform))
         assert result.passed, f"SPMD aiv_only soft syncall failed: {result.error}"
 
-    @pytest.mark.parametrize("platform", A2A3_PLATFORMS)
+    @pytest.mark.parametrize("platform", PLATFORMS)
     def test_spmd_syncall_soft_mix(self, test_runner, platform):
         """Mixed (AIC+AIV) *soft* barrier at partial occupancy: verify out = (a + 1) @ b + 1."""
         result = test_runner.run(SPMDSyncAllMixSoftTestCase(platform=platform))
         assert result.passed, f"SPMD mix soft syncall failed: {result.error}"
 
-    @pytest.mark.parametrize("platform", A2A3_PLATFORMS)
+    @pytest.mark.platforms("a2a3", "a2a3sim")
+    @pytest.mark.parametrize("platform", PLATFORMS)
     def test_spmd_syncall_soft_aic_only(self, test_runner, platform):
-        """AIC-only *soft* barrier at partial occupancy: verify out = a @ b."""
+        """AIC-only soft barriers are supported by A2/A3, not A5 hardware."""
         result = test_runner.run(SPMDSyncAllAicSoftTestCase(platform=platform))
         assert result.passed, f"SPMD aic_only soft syncall failed: {result.error}"
 

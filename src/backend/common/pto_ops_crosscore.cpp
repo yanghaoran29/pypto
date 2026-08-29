@@ -18,6 +18,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
@@ -57,6 +59,10 @@ using ir::Var;
 using pto_ops_detail::AsPto;
 using pto_ops_detail::CheckSafeIdentifier;
 using pto_ops_detail::EmitIndexOperand;
+using pto_ops_detail::EmitPartitionViewPTO;
+using pto_ops_detail::GetDimStrings;
+using pto_ops_detail::GetSizeCodes;
+using pto_ops_detail::MakePartitionTensorViewType;
 
 static bool IsSameDimExpr(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (lhs == rhs) {
@@ -677,17 +683,26 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
     }
 
     CHECK(mode == "soft") << "system.syncall: mode must be hard|soft, got " << mode;
-    // The current PTO-ISA uses one soft operand ABI for every participant set:
-    // [gm_workspace] or [gm_workspace, used_cores]. Omitting used_cores asks
-    // PTO-ISA to derive the participant count from the launch configuration.
-    INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
-        << "system.syncall (soft " << core_type << ") requires gm_workspace and optional used_cores, got "
-        << op->args_.size() << " operands";
+    const bool raw_pointer_abi = codegen.GetBackendHandler()->UsesRawSoftSyncallPointerAbi();
+    if (raw_pointer_abi) {
+      INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+          << "system.syncall (soft " << core_type
+          << ") requires gm_workspace and optional used_cores on A2/A3, got " << op->args_.size()
+          << " operands";
+    } else {
+      CHECK_SPAN(core_type != "aic_only", op->span_)
+          << "soft syncall with core_type=aic_only is unsupported on Ascend950";
+      const size_t required = core_type == "mix" ? 3 : 2;
+      INTERNAL_CHECK_SPAN(op->args_.size() == required || op->args_.size() == required + 1, op->span_)
+          << "system.syncall (soft " << core_type << ") requires gm_workspace, "
+          << (core_type == "mix" ? "UB workspace, L1 workspace" : "UB workspace")
+          << ", and optional used_cores on A5, got " << op->args_.size() << " operands";
+    }
 
-    // gm_workspace: shared GM int32 tensor. PTOAS v0.60's tile-native soft
-    // SYNCALL ABI takes the raw GM pointer and constructs its fixed 16-element
-    // GlobalTensor internally. PTO-ISA uses one exclusive 64-byte cache line,
-    // so a statically shaped workspace must contain at least 16 int32 elements.
+    // gm_workspace: shared GM int32 tensor. PTOAS v0.60 takes a raw pointer on
+    // A2/A3, while A5 still verifies a ranked partition tensor view. A2/A3
+    // needs one 64-byte cache line; A5 needs one eight-int32 slot per explicit
+    // participant. Both ABIs require at least 16 int32 elements overall.
     auto gm_var = AsVarLike(op->args_[0]);
     CHECK_SPAN(gm_var, op->span_) << "system.syncall soft: gm_workspace must be a tensor variable";
     auto gm_tt = As<ir::TensorType>(gm_var->GetType());
@@ -698,6 +713,18 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
         << "system.syncall soft: gm_workspace must be an INT32 tensor, got " << dtype_str;
 
     constexpr int64_t kSyncAllSoftWorkspaceInt32 = 16;
+    constexpr int64_t kA5SyncAllSlotInt32 = 8;
+    const size_t used_cores_index = raw_pointer_abi ? 1 : (core_type == "mix" ? 3 : 2);
+    const ExprPtr used_cores_expr =
+        op->args_.size() > used_cores_index ? op->args_[used_cores_index] : nullptr;
+    int64_t required_capacity = kSyncAllSoftWorkspaceInt32;
+    if (!raw_pointer_abi) {
+      if (auto used = As<ir::ConstInt>(used_cores_expr); used && used->value_ > 0) {
+        CHECK_SPAN(used->value_ <= std::numeric_limits<int64_t>::max() / kA5SyncAllSlotInt32, op->span_)
+            << "system.syncall soft: used_cores is too large: " << used->value_;
+        required_capacity = used->value_ * kA5SyncAllSlotInt32;
+      }
+    }
     int64_t static_capacity = 1;
     bool has_dynamic_dim = false;
     for (const auto& dim_expr : gm_tt->shape_) {
@@ -708,22 +735,47 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
       }
       CHECK_SPAN(dim->value_ > 0, op->span_)
           << "system.syncall soft: gm_workspace dimensions must be positive, got " << dim->value_;
-      static_capacity = std::min(kSyncAllSoftWorkspaceInt32,
-                                 static_capacity * std::min(kSyncAllSoftWorkspaceInt32, dim->value_));
+      const int64_t clamped_dim = std::min(required_capacity, dim->value_);
+      const int64_t saturation_factor =
+          required_capacity / clamped_dim + (required_capacity % clamped_dim != 0 ? 1 : 0);
+      static_capacity =
+          static_capacity >= saturation_factor ? required_capacity : static_capacity * clamped_dim;
     }
     if (!has_dynamic_dim) {
-      CHECK_SPAN(static_capacity >= kSyncAllSoftWorkspaceInt32, op->span_)
-          << "system.syncall soft: gm_workspace must contain at least " << kSyncAllSoftWorkspaceInt32
-          << " INT32 elements (64 bytes), got " << static_capacity;
+      CHECK_SPAN(static_capacity >= required_capacity, op->span_)
+          << "system.syncall soft: gm_workspace must contain at least " << required_capacity
+          << " INT32 elements, got " << static_capacity;
     }
 
-    // Assemble the operand and type lists: gm_ptr[, used_cores].
-    std::vector<std::string> operands = {codegen.GetTensorBasePtr(gm_var)};
-    std::vector<std::string> types = {"!pto.ptr<i32>"};
-    if (op->args_.size() == 2) {
-      CHECK_SPAN(ExprIsI32Scalar(op->args_[1]), op->span_)
+    std::vector<std::string> operands;
+    std::vector<std::string> types;
+    if (raw_pointer_abi) {
+      operands.push_back(codegen.GetTensorBasePtr(gm_var));
+      types.emplace_back("!pto.ptr<i32>");
+    } else {
+      const std::string gm_view = codegen.GetOrCreateTensorView(gm_var);
+      const std::string gm_view_type = codegen.GetTensorViewTypeString(gm_tt.get());
+      const std::string partition_type = MakePartitionTensorViewType(GetDimStrings(gm_tt->shape_), dtype_str);
+      const std::vector<std::string> offset_codes(gm_tt->shape_.size(),
+                                                  codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX));
+      const std::vector<std::string> size_codes = GetSizeCodes(gm_tt->shape_, codegen);
+      operands.push_back(EmitPartitionViewPTO(gm_var->name_hint_ + "_syncgm", gm_view, gm_view_type,
+                                              partition_type, offset_codes, size_codes, codegen));
+      types.push_back(partition_type);
+
+      const size_t local_workspace_count = core_type == "mix" ? 2 : 1;
+      for (size_t i = 0; i < local_workspace_count; ++i) {
+        auto workspace_type = As<ir::TileType>(op->args_[i + 1]->GetType());
+        INTERNAL_CHECK_SPAN(workspace_type, op->span_)
+            << "Internal error: A5 soft syncall local workspace must be a tile";
+        operands.push_back(codegen.GetExprAsCode(op->args_[i + 1]));
+        types.push_back(codegen.GetExprTypeAnnotation(op->args_[i + 1]));
+      }
+    }
+    if (used_cores_expr) {
+      CHECK_SPAN(ExprIsI32Scalar(used_cores_expr), op->span_)
           << "system.syncall soft: used_cores must be an INT32 scalar";
-      operands.push_back(codegen.GetExprAsCode(op->args_[1]));
+      operands.push_back(codegen.GetExprAsCode(used_cores_expr));
       types.emplace_back("i32");
     }
 

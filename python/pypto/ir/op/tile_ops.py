@@ -3389,9 +3389,9 @@ def scatter_mask(
     mask-selected positions, and the call result aliases ``dst``.
 
     Unlike :func:`gather_mask` (a real ``pto.tgather`` ISA op on A2/A3 and A5),
-    mask-pattern scatter is not a distinct pto-isa instruction — PyPTO emits it
-    as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim style lowering
-    paths.
+    mask-pattern scatter is not a distinct pto-isa instruction. PyPTO emits the
+    legacy ``pto.tscatter`` mask form on A2/A3; on A5 it synthesizes flattened
+    indices and lowers to index-form ``pto.tscatter``.
 
     Args:
         dst: Destination tile (rewritten on positions selected by ``mask_pattern``)

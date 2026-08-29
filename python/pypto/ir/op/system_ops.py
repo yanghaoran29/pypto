@@ -462,14 +462,16 @@ def syncall_soft(
     gm_workspace: Expr,
     used_cores: Expr | None = None,
     *,
+    ub_workspace: Expr | None = None,
+    l1_workspace: Expr | None = None,
     span: Span | None = None,
 ) -> Call:
     """Soft (GM-polling) form of ``system.syncall``.
 
     Unlike the hard/FFTS form, the soft form polls a shared GM workspace and so
-    works at partial occupancy. All participant sets use the same operand ABI:
-    ``[gm_workspace]`` when the launch determines the participant count, or
-    ``[gm_workspace, used_cores]`` when it is explicit.
+    works at partial occupancy. The public pre-lowering operands are
+    ``[gm_workspace]`` or ``[gm_workspace, used_cores]``. A5 lowering inserts
+    compiler-owned UB/L1 workspace operands between them.
 
     This is an arrival barrier only: it neither waits for preceding data
     instructions nor publishes or invalidates business-data cache lines.
@@ -483,6 +485,8 @@ def syncall_soft(
         used_cores: Optional INT32 participant count. Omit to derive it from the
             device launch configuration. Runtimes with a synthetic logical grid
             should pass it explicitly.
+        ub_workspace: Compiler-internal A5 UB workspace.
+        l1_workspace: Compiler-internal A5 MIX L1 workspace.
         span: Optional source span for debugging (auto-captured if not provided).
 
     Returns:
@@ -503,6 +507,12 @@ def syncall_soft(
                 used_cores = None
     actual_span = _get_span_or_capture(span, frame_offset=1)
     args = [gm_workspace]
+    if ub_workspace is not None:
+        args.append(ub_workspace)
+    if l1_workspace is not None:
+        if ub_workspace is None:
+            raise ValueError("soft syncall internal L1 workspace requires a UB workspace")
+        args.append(l1_workspace)
     if used_cores is not None:
         args.append(used_cores)
     return _ir_core.create_op_call(

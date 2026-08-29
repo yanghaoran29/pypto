@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,9 +80,9 @@ bool IsA5TargetArch() {
   return handler != nullptr && handler->GetPtoTargetArch() == "a5";
 }
 
-bool RequiresLevel3TmpScratchForConversion() {
+bool UsesA2A3Level3TmpAbiForConversion() {
   const auto* handler = GetActiveBackendHandler();
-  return handler != nullptr && handler->RequiresLevel3TmpScratch();
+  return handler != nullptr && handler->UsesA2A3Level3TmpAbi();
 }
 
 struct TselScratchSpec {
@@ -90,7 +91,7 @@ struct TselScratchSpec {
 };
 
 TselScratchSpec GetTselScratchSpec() {
-  if (RequiresLevel3TmpScratchForConversion()) {
+  if (UsesA2A3Level3TmpAbiForConversion()) {
     return {DataType::UINT32, kTselScratchColsLevel3};
   }
   return {DataType::UINT8, kTselScratchColsDefault};
@@ -2342,87 +2343,157 @@ void OpConversionRegistry::RegisterScatterOps() {
       {0, {MemorySpace::Vec, std::nullopt}},
       {1, {MemorySpace::Vec, std::nullopt}},
   };
+  auto scatter_mask_conv = [](const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const Span& span) -> ConversionResult {
+    INTERNAL_CHECK_SPAN(args.size() == 2, span)
+        << "tensor.scatter_mask conversion expects 2 args (input, dst), got " << args.size();
+    auto& op_reg = OpRegistry::GetInstance();
+    auto input_tile = As<TileType>(args[0]->GetType());
+    auto dst_tile = As<TileType>(args[1]->GetType());
+    INTERNAL_CHECK_SPAN(input_tile && dst_tile, span)
+        << "tensor.scatter_mask conversion: input/dst must be Vec tiles after bridge";
+
+    // The A2/A3 mask form and the A5 index form both treat their destination
+    // as write-only. Reconstruct the public DPS preserve contract with a
+    // zeroed-scatter + mask + select blend:
+    //
+    //   scattered = scatter_mask(zeros,   input)  # input @selected, 0 @unselected
+    //   mask      = scatter_mask(zeros_m, ones)   # 1     @selected, 0 @unselected
+    //   pred      = (mask != 0)                    # packed predicate
+    //   out       = sel(pred, scattered, dst)      # selected→scattered, else→dst
+    auto in_rows = As<ConstInt>(input_tile->shape_[0]);
+    auto in_cols = As<ConstInt>(input_tile->shape_[1]);
+    auto dst_cols_c = As<ConstInt>(dst_tile->shape_[1]);
+    INTERNAL_CHECK_SPAN(in_rows && in_cols && dst_cols_c, span)
+        << "tensor.scatter_mask conversion requires static shapes for the preserve blend";
+    const int64_t b = in_rows->value_;
+    const int64_t c = in_cols->value_;
+    const int64_t dst_cols = dst_cols_c->value_;
+    const DataType dt = dst_tile->dtype_;
+
+    // Mask blend dtype: a compare-friendly type within dst's element size
+    // (bf16 → f16) so tile.cmps is well-defined for any supported dtype.
+    const int dt_bytes = static_cast<int>(dt.GetBit()) / 8;
+    const DataType mask_dt = (dt_bytes == 4)   ? DataType(DataType::FP32)
+                             : (dt_bytes == 2) ? DataType(DataType::FP16)
+                                               : DataType(DataType::INT8);
+
+    auto make_idx = [&](int64_t v) -> ExprPtr {
+      return std::make_shared<ConstInt>(v, DataType::INDEX, span);
+    };
+    auto make_typed_int = [&](int64_t v, DataType dtype) -> ExprPtr {
+      return std::make_shared<ConstInt>(v, dtype, span);
+    };
+    std::vector<StmtPtr> prologue;
+    auto emit = [&](const std::string& op_name, const std::vector<ExprPtr>& op_args,
+                    const std::vector<std::pair<std::string, std::any>>& op_kwargs,
+                    const std::string& name) -> VarPtr {
+      auto call = op_kwargs.empty() ? op_reg.Create(op_name, op_args, span)
+                                    : op_reg.Create(op_name, op_args, op_kwargs, span);
+      auto var = std::make_shared<Var>(name, call->GetType(), span);
+      prologue.push_back(std::make_shared<AssignStmt>(var, call, span));
+      return var;
+    };
+    auto make_full = [&](const DataType& fdt, int64_t rows, int64_t cols_, double v,
+                         const std::string& name) -> VarPtr {
+      ExprPtr val = fdt.IsFloat() ? ExprPtr(std::make_shared<ConstFloat>(v, fdt, span))
+                                  : ExprPtr(std::make_shared<ConstInt>(static_cast<int64_t>(v), fdt, span));
+      return emit("tile.full", {MakeShapeTuple({make_idx(rows), make_idx(cols_)}, span), val},
+                  {{"dtype", fdt}}, name);
+    };
+
+    // A5 has no mask-form TSCATTER. Because dst_cols == src_cols*stride,
+    // one flattened source sequence gives the desired destination index:
+    //   flat_idx[row,col] = (row*src_cols + col)*stride + offset.
+    ExprPtr flat_idx;
+    if (IsA5TargetArch()) {
+      const int pattern = GetKwargOr<int>(kwargs, "mask_pattern", -1);
+      INTERNAL_CHECK_SPAN(pattern >= 1 && pattern <= 7, span)
+          << "Internal error: scatter_mask conversion requires mask_pattern in [1, 7], got " << pattern;
+      const int64_t stride = pattern == 7 ? 1 : (pattern <= 2 ? 2 : 4);
+      const int64_t offset = pattern == 7 ? 0 : (pattern <= 2 ? pattern - 1 : pattern - 3);
+      const DataType idx_dtype = dt_bytes == 4 ? DataType(DataType::INT32) : DataType(DataType::INT16);
+      if (idx_dtype == DataType::INT16) {
+        constexpr int64_t kMaxFlatElements = 32768;
+        const int64_t max_rows = dst_cols == 0 ? kMaxFlatElements : kMaxFlatElements / dst_cols;
+        CHECK_SPAN(b <= max_rows, span)
+            << "scatter_mask with element dtype " << dt.ToString()
+            << " uses INT16 flattened indices, but rows(" << b << ") * dst_cols(" << dst_cols
+            << ") exceeds the INT16 index range (max flat index 32767, rows <= " << max_rows << ")";
+      }
+
+      CHECK_SPAN(c == 0 || b <= std::numeric_limits<int64_t>::max() / c, span)
+          << "scatter_mask source element count overflows int64: rows=" << b << ", cols=" << c;
+      const std::vector<std::pair<std::string, std::any>> ci_kw = {{"dtype", idx_dtype},
+                                                                   {"descending", false}};
+      const int64_t element_count = b * c;
+      ExprPtr linear_idx;
+      if (element_count == 1) {
+        linear_idx = make_full(idx_dtype, b, c, 0.0, "scatter_mask_linear_idx");
+      } else {
+        auto linear_flat =
+            emit("tile.ci",
+                 {make_typed_int(0, idx_dtype), MakeShapeTuple({make_idx(1), make_idx(element_count)}, span)},
+                 ci_kw, "scatter_mask_linear_idx");
+        linear_idx = b == 1 ? ExprPtr(linear_flat)
+                            : ExprPtr(emit("tile.reshape",
+                                           {linear_flat, MakeShapeTuple({make_idx(b), make_idx(c)}, span)},
+                                           {}, "scatter_mask_linear_idx_2d"));
+      }
+      flat_idx = linear_idx;
+      if (stride != 1) {
+        flat_idx =
+            emit("tile.muls", {flat_idx, make_typed_int(stride, idx_dtype)}, {}, "scatter_mask_strided_idx");
+        if (offset != 0) {
+          flat_idx =
+              emit("tile.adds", {flat_idx, make_typed_int(offset, idx_dtype)}, {}, "scatter_mask_flat_idx");
+        }
+      }
+      if (stride == 1 || offset == 0) {
+        auto flat_var = std::make_shared<Var>("scatter_mask_flat_idx", flat_idx->GetType(), span);
+        prologue.push_back(std::make_shared<AssignStmt>(flat_var, flat_idx, span));
+        flat_idx = flat_var;
+      }
+    }
+
+    auto scatter = [&](const ExprPtr& dst, const ExprPtr& src, const std::string& name) -> VarPtr {
+      if (flat_idx) return emit("tile.scatter", {dst, src, flat_idx}, {}, name);
+      return emit("tile.scatter_mask", {dst, src}, kwargs, name);
+    };
+
+    // scattered = input written into the selected columns of a zeroed dst.
+    auto values_zero = make_full(dt, b, dst_cols, 0.0, "scatter_mask_values_zero");
+    auto scattered = scatter(values_zero, args[0], "scatter_mask_values");
+    // mask = ones written into the same selected columns of a zeroed base.
+    auto mask_zero = make_full(mask_dt, b, dst_cols, 0.0, "scatter_mask_mask_zero");
+    auto ones_src = make_full(mask_dt, b, c, 1.0, "scatter_mask_ones");
+    auto mask = scatter(mask_zero, ones_src, "scatter_mask_mask");
+    // pred = (mask != 0)  → packed predicate (NE = cmp_type 1).
+    ExprPtr zero_scalar = mask_dt.IsFloat() ? ExprPtr(std::make_shared<ConstFloat>(0.0, mask_dt, span))
+                                            : ExprPtr(std::make_shared<ConstInt>(0, mask_dt, span));
+    auto pred = emit("tile.cmps", {mask, zero_scalar}, {{"cmp_type", 1}}, "scatter_mask_pred");
+    // tmp = TSEL scratch tile (UINT32 [1,16] on level3 backends).
+    const auto tsel_scratch = GetTselScratchSpec();
+    auto tmp =
+        emit("tile.create", {MakeShapeTuple({make_idx(1), make_idx(tsel_scratch.cols)}, span)},
+             {{"dtype", tsel_scratch.dtype}, {"target_memory", MemorySpace::Vec}}, "scatter_mask_sel_tmp");
+    // out = sel(pred, scattered, dst, tmp): scattered @selected, dst @unselected.
+    auto out_call = op_reg.Create("tile.sel", {pred, scattered, args[1], tmp}, span);
+    return ConversionResult{std::move(prologue), out_call};
+  };
+  RegisterCustom("tensor.scatter_mask", scatter_mask_conv, scatter_mask_input_reqs);
   RegisterCustom(
-      "tensor.scatter_mask",
-      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
-         const Span& span) -> ConversionResult {
+      "tile.scatter_mask",
+      [scatter_mask_conv](const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs,
+                          const Span& span) -> ConversionResult {
         INTERNAL_CHECK_SPAN(args.size() == 2, span)
-            << "tensor.scatter_mask conversion expects 2 args (input, dst), got " << args.size();
-        auto& op_reg = OpRegistry::GetInstance();
-        auto input_tile = As<TileType>(args[0]->GetType());
-        auto dst_tile = As<TileType>(args[1]->GetType());
-        INTERNAL_CHECK_SPAN(input_tile && dst_tile, span)
-            << "tensor.scatter_mask conversion: input/dst must be Vec tiles after bridge";
-
-        // The mask-form scatter emission zero-fills the entire dst tile before
-        // writing the mask-selected columns, so it does NOT preserve dst's
-        // unselected columns — they read back as 0. To
-        // honour the DPS preserve contract (and make chaining two patterns into
-        // one dst sound), reconstruct preserve on the PyPTO side with the same
-        // zeroed-scatter + mask + select blend as the index form:
-        //
-        //   scattered = scatter_mask(zeros,   input)  # input @selected, 0 @unselected
-        //   mask      = scatter_mask(zeros_m, ones)   # 1     @selected, 0 @unselected
-        //   pred      = (mask != 0)                    # packed predicate
-        //   out       = sel(pred, scattered, dst)      # selected→scattered, else→dst
-        auto in_rows = As<ConstInt>(input_tile->shape_[0]);
-        auto in_cols = As<ConstInt>(input_tile->shape_[1]);
-        auto dst_cols_c = As<ConstInt>(dst_tile->shape_[1]);
-        INTERNAL_CHECK_SPAN(in_rows && in_cols && dst_cols_c, span)
-            << "tensor.scatter_mask conversion requires static shapes for the preserve blend";
-        const int64_t b = in_rows->value_;
-        const int64_t c = in_cols->value_;
-        const int64_t dst_cols = dst_cols_c->value_;
-        const DataType dt = dst_tile->dtype_;
-
-        // Mask blend dtype: a compare-friendly type within dst's element size
-        // (bf16 → f16) so tile.cmps is well-defined for any supported dtype.
-        const int dt_bytes = static_cast<int>(dt.GetBit()) / 8;
-        const DataType mask_dt = (dt_bytes == 4)   ? DataType(DataType::FP32)
-                                 : (dt_bytes == 2) ? DataType(DataType::FP16)
-                                                   : DataType(DataType::INT8);
-
-        auto make_idx = [&](int64_t v) -> ExprPtr {
-          return std::make_shared<ConstInt>(v, DataType::INDEX, span);
-        };
-        std::vector<StmtPtr> prologue;
-        auto emit = [&](const std::string& op_name, const std::vector<ExprPtr>& op_args,
-                        const std::vector<std::pair<std::string, std::any>>& op_kwargs,
-                        const std::string& name) -> VarPtr {
-          auto call = op_kwargs.empty() ? op_reg.Create(op_name, op_args, span)
-                                        : op_reg.Create(op_name, op_args, op_kwargs, span);
-          auto var = std::make_shared<Var>(name, call->GetType(), span);
-          prologue.push_back(std::make_shared<AssignStmt>(var, call, span));
-          return var;
-        };
-        auto make_full = [&](const DataType& fdt, int64_t rows, int64_t cols_, double v,
-                             const std::string& name) -> VarPtr {
-          ExprPtr val = fdt.IsFloat()
-                            ? ExprPtr(std::make_shared<ConstFloat>(v, fdt, span))
-                            : ExprPtr(std::make_shared<ConstInt>(static_cast<int64_t>(v), fdt, span));
-          return emit("tile.full", {MakeShapeTuple({make_idx(rows), make_idx(cols_)}, span), val},
-                      {{"dtype", fdt}}, name);
-        };
-
-        // scattered = input written into the mask-selected columns of a zeroed dst.
-        auto values_zero = make_full(dt, b, dst_cols, 0.0, "scatter_mask_values_zero");
-        auto scattered = emit("tile.scatter_mask", {values_zero, args[0]}, kwargs, "scatter_mask_values");
-        // mask = ones written into the same selected columns of a zeroed base.
-        auto mask_zero = make_full(mask_dt, b, dst_cols, 0.0, "scatter_mask_mask_zero");
-        auto ones_src = make_full(mask_dt, b, c, 1.0, "scatter_mask_ones");
-        auto mask = emit("tile.scatter_mask", {mask_zero, ones_src}, kwargs, "scatter_mask_mask");
-        // pred = (mask != 0)  → packed predicate (NE = cmp_type 1).
-        ExprPtr zero_scalar = mask_dt.IsFloat() ? ExprPtr(std::make_shared<ConstFloat>(0.0, mask_dt, span))
-                                                : ExprPtr(std::make_shared<ConstInt>(0, mask_dt, span));
-        auto pred = emit("tile.cmps", {mask, zero_scalar}, {{"cmp_type", 1}}, "scatter_mask_pred");
-        // tmp = TSEL scratch tile (UINT32 [1,16] on level3 backends).
-        const auto tsel_scratch = GetTselScratchSpec();
-        auto tmp = emit("tile.create", {MakeShapeTuple({make_idx(1), make_idx(tsel_scratch.cols)}, span)},
-                        {{"dtype", tsel_scratch.dtype}, {"target_memory", MemorySpace::Vec}},
-                        "scatter_mask_sel_tmp");
-        // out = sel(pred, scattered, dst, tmp): scattered @selected, dst @unselected.
-        auto out_call = op_reg.Create("tile.sel", {pred, scattered, args[1], tmp}, span);
-        return ConversionResult{std::move(prologue), out_call};
+            << "tile.scatter_mask conversion expects 2 args (dst, src), got " << args.size();
+        if (!IsA5TargetArch()) {
+          return ConversionResult{OpRegistry::GetInstance().Create("tile.scatter_mask", args, kwargs, span)};
+        }
+        return scatter_mask_conv({args[1], args[0]}, kwargs, span);
       },
       std::move(scatter_mask_input_reqs));
 }
@@ -2773,6 +2844,57 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // diverging from the AUTO oracle's Mat-tile input. Distributed operands were
 // rejected upstream (parser + tensor deducer), so only a plain TileType arrives.
 void OpConversionRegistry::RegisterCrossCoreOps() {
+  RegisterCustom(
+      "system.syncall",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        auto& op_reg = OpRegistry::GetInstance();
+        const std::string mode = GetKwargOr<std::string>(kwargs, "mode", "hard");
+        if (mode != "soft" || !IsA5TargetArch()) {
+          return ConversionResult{op_reg.Create("system.syncall", args, kwargs, span)};
+        }
+
+        const std::string core_type = GetKwargOr<std::string>(kwargs, "core_type", "mix");
+        CHECK_SPAN(core_type != "aic_only", span)
+            << "soft syncall with core_type=aic_only is unsupported on Ascend950; "
+               "use AIV-only or MIX soft syncall, or the AIC-only hard form";
+        INTERNAL_CHECK_SPAN(args.size() == 1 || args.size() == 2, span)
+            << "Internal error: pre-lowering soft syncall expects gm_workspace and optional used_cores";
+
+        auto make_idx = [&](int64_t value) -> ExprPtr {
+          return std::make_shared<ConstInt>(value, DataType::INDEX, span);
+        };
+        auto make_workspace = [&](MemorySpace space, int64_t cols, const std::string& name,
+                                  std::vector<StmtPtr>& prologue) -> VarPtr {
+          auto shape = MakeShapeTuple({make_idx(1), make_idx(cols)}, span);
+          std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", DataType(DataType::INT32)},
+                                                                         {"target_memory", space}};
+          auto create = op_reg.Create("tile.create", {shape}, create_kwargs, span);
+          auto var = std::make_shared<Var>(name, create->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(var, create, span));
+          return var;
+        };
+
+        // A5 soft barriers use one 8-int32 cache-line slot per participant.
+        // Reserve enough UB polling space for every supported launch. Ascend950
+        // has at most 18 * (1 AIC + 2 AIV) = 54 MIX participants (or 36 AIV-only
+        // participants), so rounding the capacity to 64 covers the full SoC.
+        // MIX also needs one L1 slot for the AIC-to-AIV proxy write path.
+        constexpr int64_t kSyncallSlotInt32 = 8;
+        constexpr int64_t kMaxParticipants = 64;
+        std::vector<StmtPtr> prologue;
+        std::vector<ExprPtr> lowered_args = {args[0]};
+        lowered_args.push_back(make_workspace(MemorySpace::Vec, kMaxParticipants * kSyncallSlotInt32,
+                                              "syncall_ub_workspace", prologue));
+        if (core_type == "mix") {
+          lowered_args.push_back(
+              make_workspace(MemorySpace::Mat, kSyncallSlotInt32, "syncall_l1_workspace", prologue));
+        }
+        if (args.size() == 2) lowered_args.push_back(args[1]);
+        return ConversionResult{std::move(prologue),
+                                op_reg.Create("system.syncall", lowered_args, kwargs, span)};
+      });
+
   auto convert = [](const std::string& tile_op) -> ConversionFunc {
     return [tile_op](const std::vector<ExprPtr>& args,
                      const std::vector<std::pair<std::string, std::any>>& kwargs,

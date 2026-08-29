@@ -598,7 +598,7 @@ with ib.function("tensor_example") as f:
 | **聚集** | `tile.gatherb` | 按 32-byte 源块聚集。每个 UINT32 offset 选择一个块；每个 offset 列扩展为 `32 / sizeof(output_dtype)` 个输出元素，valid_shape 同比例扩展。`output_dtype` 默认等于源 dtype，也可选择另一种受支持的字节解释。offset 每行须包含正整数个 8-entry 组。切片源的字节地址必须能被证明为 32-byte 对齐；动态列偏移会被拒绝，而物理行跨度保持对齐时允许动态行偏移。映射为 `pto.tgatherb`。 |
 | - | `tile.mgather` | 从 GM tensor 聚集到新 Vec 或 Mat tile。Vec 输出使用 INT32 index tile（`[1,R]`，A5 也支持 `[R,1]`）；Mat 输出使用 ND-layout GM source 与 INT32 index tensor，并采用规范 NZ layout，物理行数按 16 对齐、列数按 `C0 = 32 / sizeof(dtype)` 对齐；可通过较小的二维 `valid_shape` 表达 padding tail。`coalesce="row"` 聚集整行；`"elem"` 按扁平元素索引聚集，且 Mat 输出要求同 dtype、连续 ND、元素数不少于物理输出的 GM `scratch` tensor。`gather_oob` 可选择 `undefined`、`clamp`、`wrap` 或 `zero`。payload dtype 支持 I8/U8/I16/U16/I32/U32/FP16/BF16/FP32，以及仅 A5 支持的 FP8E4M3FN/FP8E5M2/HF8。 |
 | **散布** | `tile.scatter` | 按行索引把 `src` 散布到 `dst`（`pto.tscatter` 索引形式；DPS：`dst` 为 in/out，结果别名为 `dst`）。`src` / `dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}；`indexes` dtype ∈ {I16, I32}；元素宽度匹配规则：4 字节 dst ↔ INT32，2 字节 dst ↔ INT16，1 字节 dst ↔ INT16。 |
-| - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO codegen 层形式，下降为 `pto.tscatter` 掩码发射 —— **并非**独立的 pto-isa 指令（与 `tile.gather_mask` 不同）。掩码语义见[掩码模式](#掩码模式)。 |
+| - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO 下降形式而非独立的 pto-isa 指令：A2/A3 使用旧的掩码发射，A5 合成扁平索引并使用 index-form `pto.tscatter`。掩码语义见[掩码模式](#掩码模式)。 |
 
 `tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语。
 
@@ -658,7 +658,7 @@ view 兜底，而被收窄、带 pad 或声明了 `compact` 的 Acc 盒永远不
 
 ### 掩码模式
 
-`*.gather_mask` / `*.scatter_mask` 使用编译期 `MaskPattern`（`pl.tile.MaskPattern`，整数取值 1–7，与硬件 `VREDUCEv2` 的 pattern mode 一致）按行标记列的一个子集（模式名**从右往左**读，最右位对应列 0）。同一标记集合驱动两个算子做**相反方向**的操作。**`gather_mask`** *选择并紧凑*：从宽输入中读取被标记的列，紧凑写入较窄输出的前若干列（`out_cols = cols / stride`）；这是真实的 pto-isa 指令（`pto.tgather` 掩码形式），A2/A3 **与 A5** 均支持。**`scatter_mask`** *放置并扩展*：把紧凑输入写入更宽 `dst` 的被标记列（`dst_cols = cols * stride`），未标记列保留 `dst` 原值（DPS）；这是 **PyPTO codegen 层形式，并非独立的 pto-isa 指令** —— 不存在 `pto.tscatter` 掩码指令（与 gather 不同）—— PyPTO 为 A2/A3 / CPU-sim 类下降路径发射它。例如对 `[a0 a1 a2 a3 a4 a5 a6 a7]`：gather `P0101 → [a0 a2 a4 a6]`；对 `[s0 s1 s2 s3]` 做 scatter `P0101 → [s0 · s1 · s2 · s3 ·]`（`·` 表示保留的 `dst`）。
+`*.gather_mask` / `*.scatter_mask` 使用编译期 `MaskPattern`（`pl.tile.MaskPattern`，整数取值 1–7，与硬件 `VREDUCEv2` 的 pattern mode 一致）按行标记列的一个子集（模式名**从右往左**读，最右位对应列 0）。同一标记集合驱动两个算子做**相反方向**的操作。**`gather_mask`** *选择并紧凑*：从宽输入中读取被标记的列，紧凑写入较窄输出的前若干列（`out_cols = cols / stride`）；这是真实的 pto-isa 指令（`pto.tgather` 掩码形式），A2/A3 **与 A5** 均支持。**`scatter_mask`** *放置并扩展*：把紧凑输入写入更宽 `dst` 的被标记列（`dst_cols = cols * stride`），未标记列保留 `dst` 原值（DPS）。它是 **PyPTO 下降形式，并非独立的 pto-isa 指令**。A2/A3 保留旧的掩码形式发射；A5 的 `TSCATTER` 没有掩码形式，因此构造扁平 `INT16`/`INT32` 索引，发射两次 index scatter 再 select，以保留未标记的 `dst` 值。例如对 `[a0 a1 a2 a3 a4 a5 a6 a7]`：gather `P0101 → [a0 a2 a4 a6]`；对 `[s0 s1 s2 s3]` 做 scatter `P0101 → [s0 · s1 · s2 · s3 ·]`（`·` 表示保留的 `dst`）。
 
 | 模式 | 整数 | 标记列 `c` 的条件 | 被标记的列 | 步长 |
 | ---- | ---- | ----------------- | ---------- | ---- |
@@ -719,9 +719,9 @@ with ib.function("tile_computation") as f:
 | `system.available_cluster_count` | 本次运行的 MIX cluster（= AIC）数，由设备读回。结果为 `Scalar[INT32]` | 无 |
 | `system.available_aiv_count` | 本次运行的独立 AIV 核数，由设备读回。结果为 `Scalar[INT32]` | 无 |
 
-`system.syncall` 有两种 mode，由其 `mode` **IR 属性**选择；Python 接口则用 `pl.SyncAllMode` 成员表达（见下文）。**hard** 形态（属性 `"hard"`，默认）下沉为 FFTS 屏障，等待所选 `core_type` 的**全部**物理核到达；kernel 必须以满占用方式启动（每个物理核一个 block）**且带 `sync_start=True`**（使所有 block 同时驻留——非 sync_start 启动可能分波次派发 block 而使屏障死锁），否则屏障死锁（AICore 错误 507018）。**soft** 形态（属性 `"soft"`）轮询一段共享 GM workspace，因此可在**部分**占用下工作。`gm_workspace` 是共享、清零的 GM `INT32` tensor，至少包含 16 个元素（64 字节）。请将它作为 kernel 参数传入，使所有 block 共享同一缓冲；该缓冲必须独占一条 cache line，并在首次使用前清零。
+`system.syncall` 有两种 mode，由其 `mode` **IR 属性**选择；Python 接口则用 `pl.SyncAllMode` 成员表达（见下文）。**hard** 形态（属性 `"hard"`，默认）下沉为 FFTS 屏障，等待所选 `core_type` 的**全部**物理核到达；kernel 必须以满占用方式启动（每个物理核一个 block）**且带 `sync_start=True`**（使所有 block 同时驻留——非 sync_start 启动可能分波次派发 block 而使屏障死锁），否则屏障死锁（AICore 错误 507018）。**soft** 形态（属性 `"soft"`）轮询一段共享且清零的 GM `INT32` workspace，因此可在**部分**占用下工作。请将该 tensor 作为 kernel 参数传入，让所有 block 共享，并在首次使用前清零。
 
-当前 PTO-ISA 对所有 `core_type` 使用相同的 soft operand ABI：`[gm_workspace]` 从设备启动配置推导参与核数，`[gm_workspace, used_cores]` 则以 INT32 范围内的 Python 整数或 `INT32` 标量显式指定。高层 DSL 要求必须传入 `used_cores` 以明确选择：正数生成双 operand 形式，显式传入 `0` 才生成单 operand 形式。对 `mix` 而言，显式计数是 AIC 与 AIV 参与者的总数。当 runtime 的逻辑 grid 与设备启动寄存器不一致时必须传入正数；当前 PyPTO 固定的 Simpler runtime 就属于这种情况。不再需要 UB/L1 scratch tile。
+soft operand ABI 因架构而异。A2/A3 传入裸 GM 指针，支持 `AIV`、`AIC` 和 `MIX`，GM 至少包含 16 个 `INT32` 元素（一条 64 字节 cache line）。A5 传入带 rank 的 GM partition view 与编译器负责的本地 workspace：`AIV` 使用一块 UB tile，`MIX` 使用 UB 加 L1 tile；A5 不支持 AIC-only soft barrier。显式 `used_cores=N>0` 时，A5 GM tensor 至少需要 `max(16, 8*N)` 个 `INT32` 元素，保证每个 participant 拥有 cache-line 隔离的槽位。高层 DSL 要求填写 `used_cores`：正数表示显式计数，显式传 `0` 则从设备启动寄存器推导。`MIX` 的计数是 AIC 与 AIV participant 总数。逻辑 grid 与设备启动寄存器不一致的 runtime（包括当前固定版本的 Simpler）必须传正数。
 
 两种 mode 都只保证 barrier 到达：不会等待 `TSTORE` 等前序数据指令，也不会发布或使业务数据的 cache line 失效。跨核通过 GM 交接可能跨多条 cache line 的数据时，应保守地在 barrier 前用全 GM `system.cacheinvalid()` 和 `system.fence` 显式发布 producer 的写，然后在 consumer 读之前用全 GM `system.cacheinvalid()` 使其 cache 失效。tensor-region 形式只使 view 基地址所在的那一条 cache line 失效。
 

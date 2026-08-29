@@ -207,7 +207,8 @@ std::optional<uint64_t> StaticSliceViewSpanBytes(const CallPtr& call, const Shap
 // Compiler-owned PTO level3 scratch
 // ============================================================================
 
-// Compiler-owned PTO level3 scratch (A2/A3 under PyPTO/DSA-RP planners only).
+// Compiler-owned PTO level3 scratch. TCI/TCVT scratch follows the A2/A3 ABI;
+// TSORT32 scratch follows the active level3 planner on every architecture.
 constexpr int64_t kA2A3CiScratchColsInt32 = 192;
 constexpr int64_t kA2A3CiScratchColsInt16 = 448;
 // PTOAS v0.60 makeTCvtTmpType head block: 4 bytes * 64 cols * min(cols/64, 255).
@@ -288,7 +289,7 @@ struct PtoScratchSpec {
   std::string name_component;
 };
 
-/// Materialize A2/A3 level3 scratch before MemRef collection.
+/// Materialize compiler-owned level3 scratch before MemRef collection.
 ///
 /// Optional compiler-owned scratch (`tile.ci`, narrowing `tile.cast`, required
 /// `tile.sort32`) is inserted only when absent. Caller-owned tmp operands on
@@ -297,6 +298,9 @@ struct PtoScratchSpec {
 /// for them. `tile.col_sum` / `tile.row_expand_add` likewise keep caller tmp.
 class MaterializePtoLevel3ScratchMutator : public IRMutator {
  public:
+  explicit MaterializePtoLevel3ScratchMutator(bool uses_a2a3_tmp_abi)
+      : uses_a2a3_tmp_abi_(uses_a2a3_tmp_abi) {}
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
     if (!call) return IRMutator::VisitStmt_(op);
@@ -325,8 +329,9 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
   }
 
  private:
-  static std::optional<PtoScratchSpec> GetScratchSpec(const CallPtr& call, const Span& span) {
+  std::optional<PtoScratchSpec> GetScratchSpec(const CallPtr& call, const Span& span) const {
     if (IsOp(call, "tile.ci") && call->args_.size() == 2) {
+      if (!uses_a2a3_tmp_abi_) return std::nullopt;
       auto result_type = As<TileType>(call->GetType());
       INTERNAL_CHECK_SPAN(result_type, span) << "tile.ci result must be TileType before InitMemRef";
       // PTOAS v0.60 level3 TCI tmp width: 192 FP32 cols for 32-bit dst, 448 for 16-bit dst.
@@ -336,6 +341,7 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     }
 
     if (IsOp(call, "tile.cast") && call->args_.size() == 1) {
+      if (!uses_a2a3_tmp_abi_) return std::nullopt;
       auto src_type = As<TileType>(call->args_[0]->GetType());
       INTERNAL_CHECK_SPAN(src_type, span) << "tile.cast source must be TileType before InitMemRef";
       const DataType dst = call->GetKwarg<DataType>("target_type");
@@ -358,6 +364,7 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     return std::nullopt;
   }
 
+  bool uses_a2a3_tmp_abi_ = false;
   std::size_t scratch_counter_ = 0;
 };
 
@@ -1043,12 +1050,12 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   }
 
   // PTOAS level2 owns implicit-tmp materialization as part of PlanMemory. PyPTO
-  // and DSA-RP instead emit fixed addresses and invoke level3, so backends that
-  // report RequiresLevel3TmpScratch() must materialize scratch here.
+  // and DSA-RP emit fixed addresses and invoke level3. TCI/TCVT scratch is
+  // restricted to the A2/A3 ABI, while TSORT32 scratch is level-driven and can
+  // therefore also be required on A5.
   const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
-  if (handler != nullptr && handler->RequiresLevel3TmpScratch() &&
-      (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
-    MaterializePtoLevel3ScratchMutator materializer;
+  if (handler != nullptr && (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
+    MaterializePtoLevel3ScratchMutator materializer(handler->UsesA2A3Level3TmpAbi());
     normalized_func = materializer.VisitFunction(normalized_func);
   }
 

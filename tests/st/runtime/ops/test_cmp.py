@@ -17,7 +17,10 @@ import torch
 from harness.core.harness import ONBOARD_PLATFORMS, DataType, PTOTestCase, TensorSpec
 
 M = 16
-N = 16
+# A5 TCMP requires the predicate destination to have the same physical shape
+# as its inputs. Its INT8 predicate carrier also requires a 32-byte row, so 32
+# columns is the smallest geometry that is valid on both A2/A3 and A5.
+N = 32
 
 _OUTPUT_NAMES = ("eq", "ne", "lt", "le", "gt", "ge")
 

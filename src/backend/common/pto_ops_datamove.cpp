@@ -534,7 +534,8 @@ static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const Ca
       << "Operation:[" << pto_op_name << "] requires 2 or 3 arguments (src, idx[, tmp]), but got "
       << op->args_.size();
 
-  const bool level3 = codegen.GetBackendHandler()->RequiresLevel3TmpScratch();
+  const bool pto_level3 = codegen.EmitTileAddr();
+  const bool uses_a2a3_tmp_abi = codegen.GetBackendHandler()->UsesA2A3Level3TmpAbi();
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string idx = codegen.GetExprAsCode(op->args_[1]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -542,11 +543,11 @@ static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const Ca
   std::string tmp;
   std::string tmp_type;
   bool use_static_views = false;
-  if (level3 && op->args_.size() == 3) {
+  if (uses_a2a3_tmp_abi && op->args_.size() == 3) {
     // A2/A3 level3 TSORT32 verifies explicit tmp against static valid_shape.
     tmp = EnsureStaticViewTileSsa(op->args_[2], codegen, "sort32_tmp_view");
     tmp_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[2]->GetType()));
-  } else if (level3) {
+  } else if (pto_level3 && op->args_.size() == 2) {
     // alloc_tile carries valid extents as operands, so its SSA type remains
     // dynamic even when the IR valid_shape is fully static. PTOAS uses the
     // source *type* to decide whether an aligned tsort32 can skip implicit
@@ -575,7 +576,8 @@ static std::string MakeSort32CodegenPTO(const std::string& pto_op_name, const Ca
   INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.sort32 requires an assignment target";
   auto dst_tile = As<ir::TileType>(dst_var->GetType());
   INTERNAL_CHECK_SPAN(dst_tile, op->span_) << "Internal error: tile.sort32 result must be a TileType";
-  const bool use_static_dst = level3 && (op->args_.size() == 3 || use_static_views);
+  const bool use_static_dst =
+      (uses_a2a3_tmp_abi && op->args_.size() == 3) || (pto_level3 && use_static_views);
   auto sort_dst_tile = dst_tile;
   if (use_static_dst && !pto_ops_detail::HasStaticValidShape(dst_tile)) {
     // Keep the result allocation's runtime logical valid_shape for downstream

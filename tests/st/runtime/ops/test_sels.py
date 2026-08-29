@@ -224,13 +224,14 @@ class TileSelsMaskCarrierTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         mask_cols = 32 // _INTEGER_BYTES[self._mask_dtype]
+        src_cols = max(16, 32 // _DTYPE_BYTES[self._src_dtype])
         mask_value = _ALTERNATING_MASK_VALUE[self._mask_dtype]
         return [
             TensorSpec(
                 "src",
-                [2, 16],
+                [2, src_cols],
                 self._src_dtype,
-                init_value=lambda: _source(2, 16, self._src_dtype),
+                init_value=lambda: _source(2, src_cols, self._src_dtype),
             ),
             TensorSpec(
                 "mask",
@@ -242,13 +243,14 @@ class TileSelsMaskCarrierTestCase(PTOTestCase):
                     dtype=_TORCH_DT[self._mask_dtype],
                 ),
             ),
-            TensorSpec("out", [2, 16], self._src_dtype, is_output=True, init_value=torch.zeros),
+            TensorSpec("out", [2, src_cols], self._src_dtype, is_output=True, init_value=torch.zeros),
         ]
 
     def get_program(self) -> Any:
         mask_dtype = _PL_DT[self._mask_dtype]
         mask_cols = 32 // _INTEGER_BYTES[self._mask_dtype]
         src_dtype = _PL_DT[self._src_dtype]
+        src_cols = max(16, 32 // _DTYPE_BYTES[self._src_dtype])
         scalar = self._scalar
         tmp_dtype = src_dtype if self._platform == "a2a3" else pl.UINT8
         tmp_cols = 16 if self._platform == "a2a3" else 32
@@ -258,27 +260,27 @@ class TileSelsMaskCarrierTestCase(PTOTestCase):
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                src: pl.Tensor[[2, 16], src_dtype],
+                src: pl.Tensor[[2, src_cols], src_dtype],
                 mask_in: pl.Tensor[[2, mask_cols], mask_dtype],
-                out: pl.InOut[pl.Tensor[[2, 16], src_dtype]],
-            ) -> pl.Tensor[[2, 16], src_dtype]:
-                src_tile: pl.Tile[[2, 16], src_dtype] = pl.load(src, [0, 0], [2, 16])
+                out: pl.InOut[pl.Tensor[[2, src_cols], src_dtype]],
+            ) -> pl.Tensor[[2, src_cols], src_dtype]:
+                src_tile: pl.Tile[[2, src_cols], src_dtype] = pl.load(src, [0, 0], [2, src_cols])
                 mask: pl.Tile[[2, mask_cols], mask_dtype] = pl.load(
                     mask_in,
                     [0, 0],
                     [2, mask_cols],
                 )
                 tmp: pl.Tile[[1, tmp_cols], tmp_dtype] = pl.tile.create([1, tmp_cols], dtype=tmp_dtype)
-                result: pl.Tile[[2, 16], src_dtype] = pl.tile.sels(mask, src_tile, tmp, scalar)
+                result: pl.Tile[[2, src_cols], src_dtype] = pl.tile.sels(mask, src_tile, tmp, scalar)
                 return pl.store(result, [0, 0], out)
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def orchestrator(
                 self,
-                src: pl.Tensor[[2, 16], src_dtype],
+                src: pl.Tensor[[2, src_cols], src_dtype],
                 mask_in: pl.Tensor[[2, mask_cols], mask_dtype],
-                out: pl.InOut[pl.Tensor[[2, 16], src_dtype]],
-            ) -> pl.Tensor[[2, 16], src_dtype]:
+                out: pl.InOut[pl.Tensor[[2, src_cols], src_dtype]],
+            ) -> pl.Tensor[[2, src_cols], src_dtype]:
                 return self.kernel(src, mask_in, out)
 
         return SelsMaskProgram
