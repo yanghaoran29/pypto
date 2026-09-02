@@ -40,6 +40,10 @@ struct AllocationConstraintAnalysis {
   std::set<const Var*> declared_allocation_bases;
   AllocationHazardInputs target_hazard_inputs;
   AllocationForbidAliasMap forbid_alias;
+  /// Tile vars (sharing-group representatives) that must not coalesce with any
+  /// other buffer — see OpRegistryEntry::{ForbidInputBufferReuseArgs,
+  /// RequiresExclusiveOutputBuffer}.
+  std::set<const Var*> exclusive_buffer_vars;
   bool needs_load_tpop_hazard_guard = false;
 };
 

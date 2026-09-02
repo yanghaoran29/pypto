@@ -101,7 +101,28 @@ AllocationPlan BuildDsaAllocationPlan(const FunctionPtr& func) {
     }
   }
 
-  // Preserve requested software-pipeline depth as hard separations first. The
+  std::vector<size_t> exclusive_intervals;
+  for (size_t index = 0; index < intervals.size(); ++index) {
+    const VarPtr& var = intervals[index].variable;
+    if (!var) continue;
+    bool exclusive = constraints.exclusive_buffer_vars.count(var.get()) > 0;
+    if (!exclusive) {
+      const auto group_it = analysis.var_sharing_groups.find(var);
+      if (group_it != analysis.var_sharing_groups.end() && !group_it->second.empty()) {
+        exclusive = constraints.exclusive_buffer_vars.count(group_it->second[0].get()) > 0;
+      }
+    }
+    if (exclusive) exclusive_intervals.push_back(index);
+  }
+  for (size_t exclusive : exclusive_intervals) {
+    for (size_t other = 0; other < intervals.size(); ++other) {
+      if (other != exclusive && intervals[other].memory_space == intervals[exclusive].memory_space) {
+        add_separation(exclusive, other, AllocationSeparationReason::ExclusiveBuffer);
+      }
+    }
+  }
+
+  // Preserve requested software-pipeline depth as hard separations first.
   // DSA-RP driver alone may later relax this typed policy under capacity pressure.
   using GroupKey = std::pair<MemorySpace, int32_t>;
   std::map<GroupKey, std::map<int32_t, std::vector<size_t>>> group_members;

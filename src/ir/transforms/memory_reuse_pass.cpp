@@ -1782,6 +1782,48 @@ class ForbidAliasCollector : public IRVisitor {
   std::map<const Var*, const Var*> member_to_rep_;  ///< sharing-group member -> representative
 };
 
+/// Collect tile vars whose buffers must stay on private slots (no MemoryReuse
+/// coalescing with any other tile). Populated from op-registry markers on
+/// `requires_exclusive_output_buffer()` and `forbid_input_buffer_reuse(i)`.
+class ExclusiveBufferCollector : public IRVisitor {
+ public:
+  explicit ExclusiveBufferCollector(const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups) {
+    for (const auto& [var, group] : sharing_groups) {
+      if (!group.empty()) member_to_rep_[var.get()] = group[0].get();
+    }
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (auto call = As<Call>(op->value_); call && call->op_) {
+      const auto& reg = OpRegistry::GetInstance();
+      if (reg.IsRegistered(call->op_->name_)) {
+        const auto& entry = reg.GetEntry(call->op_->name_);
+        if (entry.RequiresExclusiveOutputBuffer()) {
+          RecordExclusive(op->var_);
+        }
+        for (size_t i : entry.ForbidInputBufferReuseArgs()) {
+          if (i < call->args_.size()) {
+            if (auto v = AsVarLike(call->args_[i])) RecordExclusive(v);
+          }
+        }
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  std::set<const Var*> Take() { return std::move(exclusive_); }
+
+ private:
+  void RecordExclusive(const VarPtr& var) {
+    if (!var || !As<TileType>(var->GetType())) return;
+    const auto rep_it = member_to_rep_.find(var.get());
+    exclusive_.insert(rep_it != member_to_rep_.end() ? rep_it->second : var.get());
+  }
+
+  std::set<const Var*> exclusive_;
+  std::map<const Var*, const Var*> member_to_rep_;
+};
+
 /// True only for Ascend910B AIV split-mode functions, which need the load +
 /// tpop_from_aic in-place hazard guard.  All other backends / function kinds
 /// reuse buffers freely.  Defensive against unit-test contexts that run
@@ -2006,7 +2048,8 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
     const std::set<const Var*>& pipeline_load_tiles,
     const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const std::set<const Var*>& pinned_bases,
-    const FunctionPtr& func, std::vector<Diagnostic>* out_hints) {
+    const std::set<const Var*>& exclusive_buffer_vars, const FunctionPtr& func,
+    std::vector<Diagnostic>* out_hints) {
   std::map<VarPtr, VarPtr> reuse_map;
 
   // A declared allocation (`pl.Tile[..., pl.MemRef("name"), ...]`) has exactly the membership
@@ -2026,6 +2069,22 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
       if (!lifetimes[i].variable) continue;
       auto memref = GetTypeMemRef(lifetimes[i].variable->GetType());
       is_pinned[i] = memref.has_value() && (*memref)->base_ && pinned_bases.count((*memref)->base_.get()) > 0;
+    }
+  }
+
+  auto is_exclusive_var = [&](const VarPtr& var) -> bool {
+    if (!var || exclusive_buffer_vars.empty()) return false;
+    if (exclusive_buffer_vars.count(var.get()) > 0) return true;
+    const auto group_it = sharing_groups.find(var);
+    if (group_it != sharing_groups.end() && !group_it->second.empty()) {
+      return exclusive_buffer_vars.count(group_it->second[0].get()) > 0;
+    }
+    return false;
+  };
+  std::vector<bool> is_exclusive(lifetimes.size(), false);
+  if (!exclusive_buffer_vars.empty()) {
+    for (size_t i = 0; i < lifetimes.size(); ++i) {
+      is_exclusive[i] = is_exclusive_var(lifetimes[i].variable);
     }
   }
 
@@ -2330,7 +2389,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
       // loop, and skips the whole buffer scan for a pinned candidate.
       std::vector<char> buffer_pinned;
       for (size_t idx : indices) {
-        if (is_pinned[idx]) {
+        if (is_pinned[idx] || is_exclusive[idx]) {
           buffers.push_back({idx});
           buffer_pinned.push_back(1);
           continue;
@@ -3803,6 +3862,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
       AnalyzeAllocationConstraints(func, analysis_result, "MemoryReuse");
   const HazardInputs& hazard = constraint_analysis.target_hazard_inputs;
   const ForbidAliasMap& forbid_alias = constraint_analysis.forbid_alias;
+  const std::set<const Var*>& exclusive_buffer_vars = constraint_analysis.exclusive_buffer_vars;
 
   // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
   // with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
@@ -3828,7 +3888,8 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
-      analysis_result.pipeline_load_tiles, reserved_end_by_space, pinned_bases, func, &hints);
+      analysis_result.pipeline_load_tiles, reserved_end_by_space, pinned_bases, exclusive_buffer_vars, func,
+      &hints);
   // Surface capacity-forced pipeline-depth reductions (perf hints) and legacy-fallback overflows
   // (warnings) through the unified diagnostic channel → perf_hints.log / stderr.
   if (!hints.empty()) EmitDiagnostics(hints, "MemoryReuse");
@@ -3930,6 +3991,10 @@ AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& fun
   ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups);
   forbid_collector.VisitStmt(func->body_);
   result.forbid_alias = forbid_collector.Take();
+
+  ExclusiveBufferCollector exclusive_collector(lifetimes.var_sharing_groups);
+  exclusive_collector.VisitStmt(func->body_);
+  result.exclusive_buffer_vars = exclusive_collector.Take();
   return result;
 }
 

@@ -5137,6 +5137,47 @@ class TestForbidOutputAlias:
             f"tile.ci output must not alias its tmp buffer, but both bind to {tmp_base}"
         )
 
+    def test_ci_dst_and_tmp_do_not_reuse_dead_buffers(self):
+        """910B level3 tile.ci dst and tmp each get a private MemRef slot."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, src: pl.Tensor[[1, 192], pl.FP32]
+            ) -> pl.Tile[[1, 32], pl.INT32, pl.Mem.Vec]:
+                # Same shape as ci tmp; dies immediately before tmp is created.
+                dead: pl.Tile[[1, 192], pl.FP32, pl.Mem.Vec] = pl.load(src, [0, 0], [1, 192])
+                _sink: pl.Tile[[1, 192], pl.FP32, pl.Mem.Vec] = pl.add(dead, dead)
+                tmp: pl.Tile[[1, 192], pl.FP32, pl.Mem.Vec] = pl.tile.create(
+                    [1, 192], dtype=pl.FP32, target_memory=pl.Mem.Vec
+                )
+                seq: pl.Tile[[1, 32], pl.INT32, pl.Mem.Vec] = pl.tile.ci(
+                    0, [1, 32], dtype=pl.INT32, tmp=tmp
+                )
+                return seq
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("seq", "tmp", "dead"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        dead_base = bases["dead"]
+        assert bases["seq"] != dead_base, (
+            f"tile.ci dst must not reuse a dead buffer, but both bind to {dead_base}"
+        )
+        assert bases["tmp"] != dead_base, (
+            f"tile.ci tmp must not reuse a dead buffer, but both bind to {dead_base}"
+        )
+        assert bases["seq"] != bases["tmp"], (
+            f"tile.ci dst and tmp must not share a buffer, but both bind to {bases['seq']}"
+        )
+
     def test_sel_output_does_not_alias_mask_or_tmp(self):
         """dst skips the mask/tmp buffers while remaining free to reuse a value operand."""
 

@@ -30,6 +30,7 @@ enum class AllocationSeparationReason : uint8_t {
   TargetHazard,
   SemanticNoAlias,
   DeclaredAllocation,
+  ExclusiveBuffer,
 };
 
 struct AllocationSeparation {

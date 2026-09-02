@@ -1545,7 +1545,13 @@ REGISTER_OP("tile.ci")
     // and may still read it while producing dst, so MemoryReuse cannot recycle
     // tmp's allocation for the output. A5 normally uses the tmp-free form, and
     // InitMemRef never synthesizes this operand for A5.
+    //
+    // pypto#2558: the vector repeat path also corrupts neighbouring UB when dst
+    // or tmp share a MemRef with any other live tile, so keep both on private
+    // slots (no coalescing onto dead buffers either).
     .forbid_output_alias(2)
+    .forbid_input_buffer_reuse(2)
+    .requires_exclusive_output_buffer()
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

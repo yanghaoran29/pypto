@@ -629,6 +629,31 @@ class OpRegistryEntry {
   /// most ops (see forbid_output_alias()).
   [[nodiscard]] const std::set<size_t>& ForbidOutputAliasArgs() const { return forbid_output_alias_args_; }
 
+  /// Mark input argument `arg_index` as one whose buffer must not be obtained
+  /// via MemoryReuse coalescing onto any other tile's buffer (e.g. A2/A3
+  /// `tile.ci`'s level3 scratch tmp, which the vector TCI path writes across
+  /// a wide footprint). The operand still receives a normal MemRef allocation;
+  /// the packer simply keeps it on a private slot.
+  inline OpRegistryEntry& forbid_input_buffer_reuse(size_t arg_index) {
+    forbid_input_buffer_reuse_args_.insert(arg_index);
+    return *this;
+  }
+
+  /// Input argument indices whose buffer must not alias any other tile buffer.
+  [[nodiscard]] const std::set<size_t>& ForbidInputBufferReuseArgs() const {
+    return forbid_input_buffer_reuse_args_;
+  }
+
+  /// Mark this op's output as requiring a private buffer: MemoryReuse / DSA-RP
+  /// must not coalesce the result onto any other tile's allocation, even when
+  /// lifetimes are disjoint (e.g. A2/A3 `tile.ci` dst under the vector path).
+  inline OpRegistryEntry& requires_exclusive_output_buffer() {
+    requires_exclusive_output_buffer_ = true;
+    return *this;
+  }
+
+  [[nodiscard]] bool RequiresExclusiveOutputBuffer() const { return requires_exclusive_output_buffer_; }
+
   /// Declare which core executes this op. When unset, ClassifyCallAffinity
   /// derives the affinity from the op's memory spec (output memory space, or
   /// first tile input memory space for view/store ops). Use this for ops
@@ -854,6 +879,8 @@ class OpRegistryEntry {
   bool is_inplace_safe_{true};  ///< Whether the op supports in-place execution (src == dst buffer)
   ExecutionMemoryAccessEvidence execution_memory_access_evidence_{ExecutionMemoryAccessEvidence::Unknown};
   std::set<size_t> forbid_output_alias_args_;  ///< Input args whose buffer the output must not reuse
+  std::set<size_t> forbid_input_buffer_reuse_args_;  ///< Input args that must not coalesce onto other buffers
+  bool requires_exclusive_output_buffer_{false};     ///< Output must occupy a private buffer slot
   std::optional<core_affinity::CoreAffinity> core_affinity_;     ///< Explicit core-affinity override
   std::optional<core_affinity::CrossCoreRole> cross_core_role_;  ///< Cross-core role (for predicates)
   bool no_duplicate_{false};   ///< True when the op must not run on a second core (set_no_duplicate)
