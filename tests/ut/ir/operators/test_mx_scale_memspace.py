@@ -107,10 +107,34 @@ class TestMxScaleMemSpaces:
         assert view.slayout == ir.TileLayout.col_major
         assert view.fractal == 32
 
-    def test_mx_layout_load_requires_explicit_mat(self):
-        tensor = _mx_tensor_var("s", 16, 8)
-        with pytest.raises(ValueError, match="requires explicit target_memory=MemorySpace.Mat"):
-            tile.load(tensor, [0, 0], [16, 8])
+    @pytest.mark.parametrize(
+        ("layout", "shape", "expected_layout"),
+        [
+            (ir.TensorLayout.MX_A_ZZ, (16, 8), ir.TileLayout.row_major),
+            (ir.TensorLayout.MX_B_NN, (8, 16), ir.TileLayout.col_major),
+        ],
+    )
+    def test_mx_layout_load_defaults_to_mat(self, layout, shape, expected_layout):
+        tensor = _mx_tensor_var("scale", *shape, layout=layout)
+
+        call = tile.load(tensor, [0, 0], list(shape))
+
+        assert call.op.name == ir.get_op("tile.load").name
+        assert dict(call.kwargs) == {"target_memory": ir.MemorySpace.Mat}
+        out = call.type
+        assert isinstance(out, ir.TileType)
+        assert out.memory_space == ir.MemorySpace.Mat
+        view = out.get_effective_tile_view()
+        assert view.blayout == expected_layout
+        assert view.slayout == expected_layout
+        assert view.fractal == 32
+
+    def test_raw_mx_layout_load_still_requires_explicit_mat(self):
+        tensor = _mx_tensor_var("scale", 16, 8)
+        explicit = tile.load(tensor, [0, 0], [16, 8], target_memory=ir.MemorySpace.Mat)
+
+        with pytest.raises(ValueError, match="requires target_memory=MemorySpace.Mat"):
+            ir.create_op_call("tile.load", list(explicit.args), {}, ir.Span.unknown())
 
     def test_mx_b_layout_load_col_major(self):
         tensor = _mx_tensor_var("w_s", 8, 16, ir.TensorLayout.MX_B_NN)
@@ -123,10 +147,20 @@ class TestMxScaleMemSpaces:
         assert view.slayout == ir.TileLayout.col_major
         assert view.fractal == 32
 
-    def test_mx_layout_rejects_vec_target(self):
+    @pytest.mark.parametrize(
+        "target",
+        [
+            ir.MemorySpace.Vec,
+            ir.MemorySpace.Left,
+            ir.MemorySpace.Right,
+            ir.MemorySpace.LeftScale,
+            ir.MemorySpace.RightScale,
+        ],
+    )
+    def test_mx_layout_rejects_non_mat_target(self, target):
         tensor = _mx_tensor_var("s", 16, 8)
-        with pytest.raises(ValueError, match="Mat|Vec"):
-            tile.load(tensor, [0, 0], [16, 8], target_memory=ir.MemorySpace.Vec)
+        with pytest.raises(ValueError, match="only supports target_memory=MemorySpace.Mat"):
+            tile.load(tensor, [0, 0], [16, 8], target_memory=target)
 
     @pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
     def test_gather_row_rejects_mx_source_at_tensor_and_tile_layers(self, layout):
