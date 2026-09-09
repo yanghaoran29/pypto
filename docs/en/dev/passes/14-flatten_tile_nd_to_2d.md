@@ -44,20 +44,21 @@ For each InCore function (InCore, AIC, AIV):
 
 1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D, and no >2D `tile.assemble` whose written region fails to collapse contiguously
 2. **Transform statements**: Walk function body and convert >2D tile ops to 2D, preserving any dynamic `valid_shape` (see [Dynamic valid_shape](#dynamic-tile-dimensions-issue-1578))
-3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks, 2D `tile.assemble` offsets, and codegen-ready transpose forms
+3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks, 2D `tile.assemble` offsets, and codegen-ready transpose forms. `TileOps2D` is in `GetVerifiedProperties()`, so `PassPipeline` runs this verifier automatically right after the pass at any `VerificationLevel` above `None`
 
 Per-statement handling:
 
 | Tile op | Transformation |
 | ------- | -------------- |
 | `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shape to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
-| `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2 (e.g. a user-written `tile.reshape` to 3D feeding `pl.assemble` into an N-D tensor view), insert a `tile.reshape` to flatten the tile operand to 2D first — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
+| `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2, insert a `tile.reshape` to flatten the tile operand to 2D first — a safety net for hand-built IR, since the `tile.load` and `tile.reshape` branches now flatten every producer the DSL can write — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
 | `tile.store` (2D tensor) | Pass through unchanged |
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
 | `tile.assemble` (>2D target) | Fold the ND offset into the flattened `(row, col)` space with the same row-major collapse `tile.load` applies to its tensor-rank offsets (`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`, `col = o[k-1]`); the tile operands themselves are flattened by their defining ops. Requires source, target and offset to share one rank, and the written region to collapse to a contiguous row band (`IsRowMajorCollapseContiguous`) — both rejected in the precondition phase otherwise. Without the fold the offset would keep its ND rank on a 2D tile, and codegen (which reads `elements[0]`/`elements[1]` positionally and ignores the rest) would silently place the write at the wrong address |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
 | `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below). **When the result is itself a batched accumulator** (a downstream `tile.batch_matmul_acc` keeps writing it), the pages are written into ONE column-packed `Acc` tile with `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` instead — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns) |
 | `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, taking one window of the (already-flattened) accumulator per batch index: the **column** window `[0, b*N]` of an `[M, B*N]` tile when the chain is column-packed, the legacy **row** window `[b*M, 0]` of a `[B*M, N]` tile otherwise — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns). Memory-space decisions the pass does not already state (Vec/Acc round-trips on a row-packed accumulator, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 20) — flatten emits no inline `tile.move` |
+| `tile.reshape` / `tile.reinterpret_view` (>2D result) | Rewrite the literal target-shape operand to the merged 2D `[product(leading), last]` and re-deduce. These are the only tile ops whose result rank comes from a shape operand rather than from an operand's type, so the generic path below cannot lower them — it rebuilds the call with the *same* ND tuple and the rank>2 result survives the pass, to be typed from its first two dimensions by `ExtractTileTypeInfo` in PTO codegen. The collapse is exactly semantics-preserving here: a tile is one contiguous row-major run, so `[2, 8, 128]` and `[16, 128]` name the same elements in the same order. The 2D reshape that results is often the identity, which `FoldNoOpReshape` (pass 38) then removes. A safe batch-only reshape feeding `tile.batch_matmul` is peeled by the lowering instead (see above) and never reaches this branch |
 | Other tile ops (>2D) | Substitute vars, re-create with 2D types |
 | 1D/2D tile ops | Unchanged |
 
@@ -234,6 +235,53 @@ into its own 2-D tile (pl.matmul / pl.matmul_acc on 2-D operands); or keep the
 accumulator at most 16 columns wide, which fits a single L0C block column and
 needs no packing.
 ```
+
+## Logical accumulator row windows
+
+The same packing supports a local 2D accumulator updated through
+`acc[...] = pl.matmul_acc(acc[...], lhs, rhs, init_cond=...)`. The DSL keeps its
+logical row coordinates. For a `[T*R, N]` accumulator partitioned into `R`-row
+windows, the physical allocation becomes `[R, T*N]`:
+
+```python
+# Logical window
+win = pl.tile.slice(acc, [16, 32], [16, 0])
+part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+acc_updated = pl.tile.assemble(acc, part, [16, 0])
+
+# Packed window: acc's allocation changes from [32, 32] to [16, 64]
+win = pl.tile.slice(acc, [16, 32], [0, 32])
+part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+acc_updated = pl.tile.assemble(acc, part, [0, 32])
+```
+
+For runtime `t0`, the column offset is `(t0 // R) * N + n0`. The writeback
+retains the computation's def-use edge and needs no L0C-to-L0C copy. A final
+whole-accumulator store becomes one store per packed window at logical row
+offset `t * R`. This preserves the K-outer, row-inner loop order and its weight
+reuse, including runtime row-loop bounds.
+
+Only windows the MAD cannot already address are packed. A window at most 16
+columns wide that lies inside one 16-column block is a single L0C block column,
+so there is no second column for the compact write to mis-stride and pto-isa's
+`MadAccStrideCompatible` accepts it. The window's own column extent decides
+this, not the parent's: ptoas resolves a row window to the parent's physical
+`Rows` but the window's `Cols`, so a `[16, 16]` window of a `[48, 32]`
+accumulator is addressable. Those chains pass through untouched, and none of
+the requirements below apply to them — seeding a chain the hardware already
+accepts would subject a working kernel to the rejections listed here. The
+exemption deliberately matches `CanonicalizeTileSlice`'s
+`CheckAccWindowContiguous`, so a window left unpacked here is not refused two
+passes later.
+
+Packing requires one compiler-allocated buffer; equal, static row-window
+heights that divide the parent height; provably aligned row offsets; full valid
+shapes; FP32/INT32 elements; 16-aligned window height and parent width; and a
+packed allocation that fits L0C after the target's physical row alignment.
+Runtime alignment proofs currently cover power-of-two window heights. Each
+assemble must write a `matmul_acc` result back to the same window it read.
+Explicit MemRefs and consumers requiring the whole logical accumulator in a
+different layout are rejected with a diagnostic rather than silently repacked.
 
 ## Example
 

@@ -310,9 +310,20 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     // row_major -- an explicit claim contradicting InferImplicitTileLayoutFromShape,
     // which makes it col_major. Because the two disagreed the view could not
     // canonicalize away, and a downstream row_expand_add read the wrong layout.
-  } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
-             last_dim && last_dim->value_ == 1) {
-    tile_view.blayout = TileLayout::col_major;
+    //
+    // Derive the layout from the shared helper rather than re-deriving it here.
+    // A hand-rolled `shape.back() == 1` test agrees with the helper only on a
+    // rank-2 shape whose rows exceed one, and diverges on exactly the shapes
+    // the helper excludes: a `[1, 1]` tile (the helper needs rows > 1 for a
+    // column to mean anything) and any rank != 2 shape ending in 1. On those
+    // the stamp was an explicit col_major the helper contradicts, so it could
+    // not canonicalize away and rode into codegen, where `pto.alloc_tile`
+    // rejects a col-major none_box tile whose column byte size
+    // (rows * sizeof(dtype)) is not 32-byte aligned -- 4 bytes for a one-row
+    // FP32 carrier. Routing both through one helper is what keeps them from
+    // drifting again.
+  } else {
+    tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(shapes_tuple->elements_);
   }
 
   // Build tile shape from shapes tuple (always in source-tensor coordinates).
@@ -585,19 +596,22 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
   tile_view.slayout = requested_slayout;
 
   // TQUANT produces its exponent bytes as row/row/32 and the MX_B_NN path
-  // materializes col/col/32 with a Vec-to-Vec TMOV.  Vec's ordinary implicit
-  // fractal is 512, so retaining the source's MX-scale marker here keeps the
-  // moved result type consistent with the physical 32-byte scale boxes.  Keep
-  // this exception deliberately narrow: byte-valued scale payloads, complete
-  // row/row or col/col layouts, and a Vec destination.
+  // materializes col/col/32 with a Vec-to-Vec TMOV. Preserve that scale boxing
+  // while staging a public FP8E8M0 scale through Mat for a cross-core transfer.
   const bool source_is_complete_box =
       source_view.blayout == source_view.slayout && source_view.blayout != TileLayout::none_box;
   const bool destination_is_complete_box =
       requested_blayout == requested_slayout && requested_blayout != TileLayout::none_box;
   const bool is_mx_scale_payload =
       tile_type->dtype_ == DataType::UINT8 || tile_type->dtype_ == DataType::FP8E8M0;
-  if (space == MemorySpace::Vec && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
-      source_is_complete_box && destination_is_complete_box && is_mx_scale_payload) {
+  const bool is_vec_move = space == MemorySpace::Vec;
+  const bool is_vec_to_mat_staging =
+      space == MemorySpace::Mat &&
+      (!tile_type->memory_space_.has_value() || tile_type->memory_space_ == MemorySpace::Vec);
+  const bool preserves_mx_scale_boxes = (is_vec_move && is_mx_scale_payload) ||
+                                        (is_vec_to_mat_staging && tile_type->dtype_ == DataType::FP8E8M0);
+  if (preserves_mx_scale_boxes && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
+      source_is_complete_box && destination_is_complete_box) {
     tile_view.fractal = tile_view_semantics::kMXScaleFractal;
   }
 

@@ -1296,6 +1296,7 @@ def cast(
     mode: str | int = "round",
     *,
     tmp: Tile | None = None,
+    saturation_mode: str | int | None = None,
 ) -> Tile:
     """Cast tile to target data type (element-wise).
 
@@ -1304,7 +1305,22 @@ def cast(
         target_type: Target data type (DataType)
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
-        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated,
+             and only for a cast that opted out of saturation — the saturating
+             form is native and reads none.
+        saturation_mode: Destination saturation — ``"on"`` (1) clamps a
+             rounded value that falls outside the destination range to that
+             range; ``"off"`` (0) keeps the target's non-saturating
+             conversion, including its overflow and non-finite behavior.
+             **Defaults to** ``"on"`` **for an integer destination**:
+             nothing standard fixes what an overflowing conversion to an integer
+             produces, clamping is the safer of the two to get by accident, and
+             it is what the hardware converts natively. A float destination keeps
+             the target's own IEEE behavior (an out-of-range narrowing yields an
+             infinity) unless you ask otherwise. When the cast lowers to a chain
+             of native conversions, the mode applies to the final hop. On A2/A3 a
+             saturating narrowing cast needs no ``tmp``, so the compiler
+             generates none; a caller-supplied ``tmp`` is still honored.
 
     Returns:
         Tile wrapping the cast operation
@@ -1313,7 +1329,7 @@ def cast(
         >>> tile_fp32 = pl.tile.cast(tile_bf16, pl.FP32)
     """
     tmp_expr = None if tmp is None else tmp.unwrap()
-    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode, tmp=tmp_expr)
+    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode, tmp=tmp_expr, saturation_mode=saturation_mode)
     return Tile(expr=call_expr)
 
 
@@ -1352,10 +1368,9 @@ def quant_mx(
         Cube RHS layout; scale col/col NN.
 
     Note:
-        ``quant_mx`` and ``matmul_mx`` cannot currently share one InCore mixed
-        task. Stage the quantized data and scale through GM between separate
-        AIV and AIC kernels; automatic cross-core data+scale transport is a
-        follow-up.
+        On Ascend950, ``quant_mx`` and ``matmul_mx`` may share one InCore mixed
+        task. The compiler carries both generated results over V2C; the
+        FP8E8M0 scale keeps its logical MX scale layout.
     """
     if group_axis not in (0, 1):
         raise ValueError(f"pl.quant_mx group_axis must be 0 or 1, but got {group_axis!r}")

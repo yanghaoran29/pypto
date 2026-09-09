@@ -64,7 +64,6 @@ import inspect
 import json
 import os
 import re
-import struct
 import tempfile
 import textwrap
 from collections.abc import Callable, Mapping, Sequence
@@ -93,6 +92,7 @@ from .specializer import (
     _collect_annotation_dynamic_dims,
     _collect_dynvar_names,
     build_specialize_context,
+    free_name_source,
     func_name_lookup,
 )
 
@@ -760,7 +760,10 @@ def _scan_dep_io(
 
     Used by ``_extract_local_tensor_metas`` to propagate metas through
     ``v1, ..., vk = dep(args)`` assignments (each ``vi`` inherits the meta of
-    the caller arg bound to the i-th output-like parameter).
+    the caller arg bound to the i-th output-like parameter). A dep with no
+    output-like params is still recorded: ``_dep_return_metas`` needs
+    ``param_names`` to bind the call site's args when it descends into the
+    callee's body.
 
     ``output_param_names`` covers both ``pl.Out[...]`` and ``pl.InOut[...]``
     params — a caller can capture either from ``v = dep(...)`` — and is kept in
@@ -783,11 +786,54 @@ def _scan_dep_io(
     return out
 
 
+class _DepScan(NamedTuple):
+    """Everything the local-meta walk needs to know about one caller's deps.
+
+    ``io`` and ``funcs`` are both keyed by the name the caller's *source*
+    calls the dep by (see :class:`_DepBinding`). ``seen`` holds the ``id()`` of
+    every Python function already on the extraction stack, so the recursive
+    descent :func:`_dep_return_metas` performs cannot loop.
+    """
+
+    io: dict[str, tuple[list[str], list[str]]]
+    funcs: dict[str, JITFunction]
+    seen: frozenset[int]
+
+
+def _target_names(target: ast.expr) -> list[str]:
+    """Return the bound names of ``v = ...`` / ``v1, ..., vk = ...``.
+
+    Empty for any other target shape (a subscript, an attribute, a nested
+    unpack) — those are not local tensor rebindings this extractor models.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple) and all(isinstance(e, ast.Name) for e in target.elts):
+        return [e.id for e in target.elts if isinstance(e, ast.Name)]
+    return []
+
+
+def _return_element_names(func_def: ast.FunctionDef) -> list[str]:
+    """Return the names a function's first value-carrying ``return`` hands back.
+
+    ``return a, b`` → ``["a", "b"]``; ``return a`` → ``["a"]``. An element that
+    is not a bare ``Name`` (a call, a subscript, a literal) yields ``""`` so the
+    positional alignment with the caller's targets survives — the empty name
+    simply resolves to no meta.
+    """
+    for node in ast.walk(func_def):
+        if not (isinstance(node, ast.Return) and node.value is not None):
+            continue
+        elts = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
+        return [e.id if isinstance(e, ast.Name) else "" for e in elts]
+    return []
+
+
 def _dep_out_metas(
     call: ast.Call,
     dep_name: str,
     target: ast.expr,
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     local: dict[str, TensorMeta],
 ) -> dict[str, TensorMeta]:
     """For ``v1, ..., vk = dep(args)`` where ``dep`` has ``k`` ``Out`` params,
@@ -795,16 +841,12 @@ def _dep_out_metas(
     parameter.
 
     Mapping handles both positional and keyword args. No-op when the dep has
-    no ``Out`` params or when target/arity don't match.
+    no ``Out`` params or when target/arity don't match — ``_dep_return_metas``
+    then covers the callee-allocated case.
     """
-    dep_params, out_params = dep_io[dep_name]
-    if isinstance(target, ast.Name):
-        names = [target.id]
-    elif isinstance(target, ast.Tuple) and all(isinstance(e, ast.Name) for e in target.elts):
-        names = [e.id for e in target.elts if isinstance(e, ast.Name)]
-    else:
-        return {}
-    if not out_params or len(names) != len(out_params):
+    dep_params, out_params = deps.io[dep_name]
+    names = _target_names(target)
+    if not names or not out_params or len(names) != len(out_params):
         return {}
     mapping: dict[str, str | None] = {}
     for i, arg in enumerate(call.args):
@@ -819,6 +861,119 @@ def _dep_out_metas(
         if caller_arg is not None and caller_arg in local:
             result[vname] = local[caller_arg]
     return result
+
+
+class _DepReturn(NamedTuple):
+    """What descending into a callee's ``return`` statement established.
+
+    ``metas`` are the targets the descent typed. ``stale`` are the targets it
+    proved it *cannot* type: the callee returns a named local its own extractor
+    declined, so whatever the caller knew about that name before the call no
+    longer describes it. Both are empty when the descent did not happen at all,
+    which leaves the caller's pre-call fallback in charge.
+    """
+
+    metas: dict[str, TensorMeta]
+    stale: frozenset[str]
+
+
+_DEP_RETURN_DECLINED = _DepReturn({}, frozenset())
+
+
+def _dep_return_metas(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: dict[str, TensorMeta],
+    scalars: Mapping[str, int | float | bool],
+) -> _DepReturn:
+    """For ``v1, ..., vk = dep(args)`` where ``dep`` returns tensors it created
+    itself, resolve each ``vi`` from the callee's own ``return`` statement.
+
+    ``_dep_out_metas`` covers the in-place convention, where every returned
+    tensor is also an ``Out`` parameter the *caller* allocated, so its meta is
+    already in the caller's pool. A helper may instead ``pl.create_tensor`` its
+    results and hand them back — the classic ``a, b = make_pair(x)`` inline
+    preparation step — and then the shape and dtype exist only inside the
+    callee. Re-run the extractor over the callee's body, seeded with the params
+    this call site binds, and read the returned names' metas off that.
+
+    A returned element that is a *named* callee local the descent could not type
+    comes back in ``stale`` rather than silently absent. The caller would
+    otherwise keep the meta the target carried before the call — demonstrably
+    the wrong tensor, since the callee rebinds it — and hand that shape to the
+    next dep. An element that is not a bare ``Name`` (a call, a literal)
+    establishes nothing either way and is simply left out.
+
+    Returns :data:`_DEP_RETURN_DECLINED` when the callee's source is
+    unavailable, its return arity doesn't match the target, or it is already on
+    the extraction stack.
+    """
+    dep = deps.funcs.get(dep_name)
+    names = _target_names(target)
+    if dep is None or not names or id(dep._func) in deps.seen:
+        return _DEP_RETURN_DECLINED
+    try:
+        ret_names = _return_element_names(_get_func_def(dep._func))
+    except OSError:
+        return _DEP_RETURN_DECLINED
+    if len(ret_names) != len(names):
+        return _DEP_RETURN_DECLINED
+    dep_params, _ = deps.io[dep_name]
+    seed_meta: dict[str, TensorMeta] = {}
+    seed_scalars: dict[str, int | float | bool] = {}
+    for dep_param, caller_arg in _build_param_mapping(dep_params, _call_arg_refs(call)).items():
+        # A ``_SlicedArg`` (``chip_orch(x[r], ...)``) seeds nothing: that
+        # per-rank dispatch form returns through ``Out`` params, so the
+        # descent below never needs the sliced param's meta.
+        if not isinstance(caller_arg, str):
+            continue
+        if caller_arg in local:
+            seed_meta[dep_param] = local[caller_arg]
+        elif caller_arg in scalars:
+            seed_scalars[dep_param] = scalars[caller_arg]
+    callee_metas = _extract_local_tensor_metas(
+        dep._func,
+        seed_meta=seed_meta,
+        seed_scalars=seed_scalars,
+        caller_func_type=dep._func_type,
+        dep_seen=deps.seen,
+    )
+    resolved = {v: callee_metas[r] for v, r in zip(names, ret_names, strict=True) if r in callee_metas}
+    stale = {v for v, r in zip(names, ret_names, strict=True) if r and r not in callee_metas}
+    return _DepReturn(resolved, frozenset(stale))
+
+
+def _dep_out_metas_or_return(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: dict[str, TensorMeta],
+    scalars: Mapping[str, int | float | bool],
+) -> _DepReturn:
+    """Resolve one ``v1, ..., vk = dep(args)`` target, ``Out`` convention first.
+
+    The ``Out`` rule needs nothing but the caller's own pool, and where both
+    rules apply they agree — a returned ``Out`` param resolves to the same
+    caller buffer either way — so it wins and never marks a target stale.
+    """
+    out_metas = _dep_out_metas(call, dep_name, target, deps, local)
+    if out_metas:
+        return _DepReturn(out_metas, frozenset())
+    return _dep_return_metas(call, dep_name, target, deps, local, scalars)
+
+
+def _apply_dep_return(local: dict[str, TensorMeta], dep_return: _DepReturn) -> None:
+    """Fold one dep-call target's resolution into the source-ordered pool.
+
+    Resolved names land; names the descent proved stale are dropped, so the
+    caller's pre-call fallback cannot hand a replaced tensor's shape onward.
+    """
+    local.update(dep_return.metas)
+    for name in dep_return.stale:
+        local.pop(name, None)
 
 
 def _fold_int_arith(op: ast.operator, lhs: int, rhs: int) -> int | None:
@@ -946,9 +1101,10 @@ def _update_local_tensor_meta(
     stmt: ast.stmt,
     local: dict[str, TensorMeta],
     dim_aliases: dict[str, tuple[str, int]],
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    scalars: Mapping[str, int | float | bool],
 ) -> None:
     """Apply one assignment's metadata effects to the source-ordered state."""
     parts = _assignment_parts(stmt)
@@ -959,7 +1115,7 @@ def _update_local_tensor_meta(
     has_named_target = named_target is not None
     meta: TensorMeta | None = None
     preserve_existing = False
-    dep_target_metas: list[dict[str, TensorMeta]] = [{} for _ in targets]
+    dep_returns: list[_DepReturn] = [_DEP_RETURN_DECLINED for _ in targets]
 
     # Python evaluates the RHS once before assigning any target. Infer all RHS
     # effects from the same pre-assignment state so a self-referential chained
@@ -981,18 +1137,23 @@ def _update_local_tensor_meta(
                 # result metadata this extractor does not model (for example,
                 # same-shaped pl.assemble rebindings).
                 preserve_existing = True
-        elif isinstance(fn, ast.Name) and fn.id in dep_io:
-            dep_target_metas = [_dep_out_metas(value, fn.id, target, dep_io, local) for target in targets]
-            # Preserve the existing dependency-result behavior when the
-            # callee has no explicit Out/InOut metadata: an already-known
-            # target keeps its metadata until a later supported rebinding can
-            # refine it. This is how bare inline helpers propagate same-shaped
-            # results today.
+        elif isinstance(fn, ast.Name) and fn.id in deps.io:
+            # The in-place ``Out``-param convention first; a callee that
+            # allocates its own results falls through to its return statement.
+            dep_returns = [
+                _dep_out_metas_or_return(value, fn.id, target, deps, local, scalars) for target in targets
+            ]
+            # Preserve the existing dependency-result behavior when neither
+            # rule resolves the callee's results: an already-known target keeps
+            # its metadata until a later supported rebinding can refine it.
+            # This is how bare inline helpers propagate same-shaped results
+            # today. A target the return descent proved stale is exempt — see
+            # ``_dep_return_metas``.
             preserve_existing = True
 
     alias = _extract_dim_alias(value)
-    for target, target_metas in zip(targets, dep_target_metas, strict=True):
-        local.update(target_metas)
+    for target, dep_return in zip(targets, dep_returns, strict=True):
+        _apply_dep_return(local, dep_return)
         named = target if isinstance(target, ast.Name) else None
 
         if named is None:
@@ -1016,15 +1177,16 @@ def _walk_local_tensor_meta_stmts(
     stop_at_dep: str | None,
     local: dict[str, TensorMeta],
     dim_aliases: dict[str, tuple[str, int]],
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    scalars: Mapping[str, int | float | bool],
 ) -> bool:
     """Walk supported DSL scopes in source order until the selected call."""
     for stmt in stmts:
         if _stmt_calls_dep(stmt, stop_at_dep):
             return True
-        _update_local_tensor_meta(stmt, local, dim_aliases, dep_io, resolve_int, pl_attr_handlers)
+        _update_local_tensor_meta(stmt, local, dim_aliases, deps, resolve_int, pl_attr_handlers, scalars)
         for attr in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, attr, None)
             if isinstance(nested, list) and _walk_local_tensor_meta_stmts(
@@ -1032,9 +1194,10 @@ def _walk_local_tensor_meta_stmts(
                 stop_at_dep,
                 local,
                 dim_aliases,
-                dep_io,
+                deps,
                 resolve_int,
                 pl_attr_handlers,
+                scalars,
             ):
                 return True
     return False
@@ -1046,6 +1209,7 @@ def _extract_local_tensor_metas(
     seed_scalars: dict[str, int | float | bool] | None = None,
     caller_func_type: str = "orchestration",
     stop_at_dep: str | None = None,
+    dep_seen: frozenset[int] = frozenset(),
 ) -> dict[str, TensorMeta]:
     """Infer ``TensorMeta`` for the local tensor variables in ``func``'s body.
 
@@ -1077,6 +1241,12 @@ def _extract_local_tensor_metas(
        argument bound to the i-th ``Out`` parameter (the in-place-output
        convention every such kernel follows, and the same heuristic
        ``_infer_return_type`` uses on the callee side).
+    4. ``v1, ..., vk = jit_dep(args)`` where ``jit_dep`` instead allocates its
+       own results (``a = pl.create_tensor(...); ...; return a, b``) — the
+       extractor descends into the callee's body, seeded with the params this
+       call site binds, and each ``vi`` takes the meta of the i-th returned
+       name (see :func:`_dep_return_metas`). ``dep_seen`` carries the ``id()``
+       of every function already on that stack so the descent cannot loop.
 
     ``seed_meta`` pre-populates the table with the caller's parameter metas
     (including any ``DynDim`` entries those carry) so a ``pl.slice`` of a
@@ -1277,7 +1447,11 @@ def _extract_local_tensor_metas(
             dims.append(v if v is not None else parent_dim)
         return TensorMeta(shape=tuple(dims), dtype=src_meta.dtype, layout=src_meta.layout)
 
-    dep_io = _scan_dep_io(func, caller_func_type)
+    deps = _DepScan(
+        io=_scan_dep_io(func, caller_func_type),
+        funcs={b.call_name: b.dep for b in _discover_dep_bindings(func, caller_func_type)},
+        seen=dep_seen | {id(func)},
+    )
 
     # Dispatch table: pl.<attr>(...) → meta extraction function.
     # Replaces sequential if-chains, reducing branch and statement counts.
@@ -1293,9 +1467,10 @@ def _extract_local_tensor_metas(
         stop_at_dep,
         local,
         dim_aliases,
-        dep_io,
+        deps,
         _resolve_int,
         _pl_attr_handlers,
+        scalars,
     )
     return local
 
@@ -1369,13 +1544,19 @@ def _extract_call_args_for_dep(
     ]
     if not calls:
         return None
-    node = min(calls, key=lambda call: (call.lineno, call.col_offset))
+    return _call_arg_refs(min(calls, key=lambda call: (call.lineno, call.col_offset)))
+
+
+def _call_arg_refs(node: ast.Call) -> list[tuple[str | None, str | _SlicedArg | None]]:
+    """Unify one call node's positional and keyword args into ``(param, ref)`` pairs.
+
+    ``param`` is ``None`` for a positional argument (paired with the callee's
+    parameter list by index in :func:`_build_param_mapping`) and the keyword
+    name otherwise. ``**kwargs`` splats are skipped — they carry no name to
+    bind against.
+    """
     result: list[tuple[str | None, str | _SlicedArg | None]] = [(None, _arg_ref(arg)) for arg in node.args]
-    result.extend(
-        (kw.arg, _arg_ref(kw.value))
-        for kw in node.keywords
-        if kw.arg is not None  # skip **kwargs splats
-    )
+    result.extend((kw.arg, _arg_ref(kw.value)) for kw in node.keywords if kw.arg is not None)
     return result
 
 
@@ -1820,8 +2001,16 @@ class JITFunction:
         annotations are unchanged. Retain the bindings themselves and compare
         identity, avoiding overloaded equality and recycled object IDs.
 
+        Keyed by the *generated* name, not ``dep.__name__``: the triples are
+        sorted, so position is not carried, and two same-named deps swapping
+        layouts (``helper`` from two modules going ``NZ``/``ND`` -> ``ND``/``NZ``)
+        would otherwise produce the same sorted set and hand the second call the
+        first one's artifact. The generated name is the disambiguator the
+        emitted signatures already carry.
+
         Returns:
-            Sorted ``(dep name, parameter, layout)`` triples for the cache key.
+            Sorted ``(generated dep name, parameter, layout)`` triples for the
+            cache key.
         """
         state = self._get_dep_graph_state()
         bindings = tuple(
@@ -1830,10 +2019,15 @@ class JITFunction:
         cached = state.layouts
         if cached is not None and all(a is b for a, b in zip(bindings, cached.bindings, strict=True)):
             return cached.layouts
+        # Same list ``_build_contexts`` allocates from, so the names agree with
+        # the ones the generated program actually uses.
+        gen_names = _allocate_generated_names(self, state.graph.deps)
         layouts = tuple(
             sorted(
-                (dep.__name__, param, str(layout))
+                (gen_names[id(dep._func)], param, str(layout))
                 for dep in state.graph.deps
+                # ``dep.__name__`` here is the diagnostic name only — a layout
+                # error should name the user's own function.
                 for param, layout in _param_layouts(dep._func, dep.__name__).items()
             )
         )
@@ -1952,23 +2146,26 @@ class JITFunction:
 
     @capture_namespaces()
     def _get_source_hash(self) -> str:
-        """Hash source structure and the current values of referenced constants."""
+        """Hash source structure and the current values of referenced constants.
+
+        Each referenced name contributes the exact text the specializer will fold
+        it into, straight from ``free_name_source``. Reading the emitted form —
+        rather than re-deciding here which types count — is what keeps the key in
+        step with the folding rule: a constant that changes the generated source
+        changes this hash by construction, and one that does not fold (an opaque
+        object, a JIT dep, ``pl`` itself) contributes nothing because it leaves
+        the source unchanged.
+        """
         source_hash = self._get_static_source_hash()
         records = []
         for index, jit_func in enumerate([self, *self._get_deps()]):
             func = jit_func._func
             namespace = func_name_lookup(func)
             for name in _constant_dependency_names(func):
-                value = namespace.get(name)
-                if not isinstance(value, (int, float, bool)):
+                folded = free_name_source(name, namespace)
+                if folded is None:
                     continue
-                if isinstance(value, bool):
-                    kind, encoded = "bool", str(value)
-                elif isinstance(value, int):
-                    kind, encoded = "int", str(value)
-                else:
-                    kind, encoded = "float", struct.pack("!d", value).hex()
-                records.append((index, func.__module__, func.__qualname__, name, kind, encoded))
+                records.append((index, func.__module__, func.__qualname__, name, folded))
         return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
 
     @cache_in_snapshot
@@ -2741,17 +2938,25 @@ class JITFunction:
             ],
         ] = {id(self._func): (tensor_meta, scalar_values, scalar_dtypes)}
 
+        # One generated ``@pl.function`` name per JIT function, unique across
+        # the program. Two distinct deps may share a ``__name__`` (two modules
+        # each defining ``helper``, or two kernels from the same factory);
+        # emitting both as ``def helper`` made the parser reject the program
+        # with a bare ``Duplicate function name "helper"``.
+        gen_names = _allocate_generated_names(self, deps_topo)
+
         # Walk caller-first (reverse of leaf-first topo order) so each dep's
         # caller metadata is already resolved when we get to it; collect
         # contexts caller-first, then reverse to restore leaf-first emit
         # order.
         # Per caller, ``call name → generated function name``. They differ
-        # under an aliased import: the body calls ``kern(...)`` while the
-        # generated ``@pl.function`` is named after ``dep.__name__``.
+        # under an aliased import (the body calls ``kern(...)`` while the
+        # generated ``@pl.function`` is named after ``dep.__name__``) and
+        # under a uniquified name (``helper`` → ``helper__2``).
         dep_func_names_by_caller: dict[int, dict[str, str]] = {}
         for dep in deps_topo:
             for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
-                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = dep.__name__
+                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = gen_names[id(dep._func)]
 
         dep_contexts: list[SpecializeContext] = []
         for dep in reversed(deps_topo):
@@ -2776,7 +2981,7 @@ class JITFunction:
             dep_contexts.append(
                 build_specialize_context(
                     func=dep._func,
-                    func_name=dep.__name__,
+                    func_name=gen_names[id(dep._func)],
                     func_type=dep._func_type,
                     level=dep._level,
                     tensor_meta=dep_meta,
@@ -2796,7 +3001,7 @@ class JITFunction:
 
         entry_ctx = build_specialize_context(
             func=self._func,
-            func_name=self.__name__,
+            func_name=gen_names[id(self._func)],
             func_type=self._func_type,
             level=self._level,
             tensor_meta=tensor_meta,
@@ -2866,6 +3071,53 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
     caller's source must use the bindings instead — see ``_DepBinding``.
     """
     return [binding.dep for binding in _discover_dep_bindings(func, caller_func_type)]
+
+
+def _generated_names_for(jit_func: JITFunction, base: str) -> tuple[str, ...]:
+    """Every generated ``@pl.function`` name ``jit_func`` would occupy as ``base``.
+
+    A single method for everything except an ``@pl.jit.extern`` mixed kernel,
+    which the specializer renders as an AIC member, an AIV member, and a Group
+    wrapper — three names derived from the same base.
+    """
+    if jit_func._func_type == "extern" and jit_func._external_core_type == "mixed":
+        return (base, f"{base}_aic", f"{base}_aiv")
+    return (base,)
+
+
+def _allocate_generated_names(entry: JITFunction, deps: list[JITFunction]) -> dict[int, str]:
+    """Map ``id(jit_func._func)`` → the unique name its ``@pl.function`` gets.
+
+    A generated ``@pl.program`` holds one method per JIT function, so their
+    names must be distinct — but two distinct deps may legitimately share a
+    ``__name__`` (two modules each defining ``helper``, or two kernels built by
+    the same factory). A clash is resolved by suffixing the later claimant
+    ``__2``, ``__3``, … so both specializations survive instead of the parser
+    rejecting the program with ``Duplicate function name "helper"``.
+
+    The entry is named first, so a clash never moves the name the user called;
+    deps follow in ``deps`` order, which is derived from source order, so the
+    same call graph always yields the same names.
+    """
+    used: set[str] = set()
+    names: dict[int, str] = {}
+    # Highest suffix already handed out per base name, so N functions sharing a
+    # base cost O(N) probes overall rather than rescanning from 2 each time.
+    next_suffix: dict[str, int] = {}
+    for jit_func in [entry, *deps]:
+        key = id(jit_func._func)
+        if key in names:
+            continue
+        base = jit_func.__name__
+        candidate = base
+        suffix = next_suffix.get(base, 2)
+        while not used.isdisjoint(_generated_names_for(jit_func, candidate)):
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        next_suffix[base] = suffix
+        names[key] = candidate
+        used.update(_generated_names_for(jit_func, candidate))
+    return names
 
 
 # ---------------------------------------------------------------------------

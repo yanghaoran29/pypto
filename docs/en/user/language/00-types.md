@@ -209,8 +209,8 @@ the op must be `FP8E4M3FN`. The supported FP4-input form is a left FP4 operand m
 right FP8 operand: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
 legalization pass expands that request to FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
 reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
-`group_axis` matching PTOAS `grpAxis`) is available;
-it cannot yet share one InCore mixed task with `matmul_mx` — stage through GM between AIV/AIC.
+`group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
+task with `matmul_mx`; the generated data and scale cross directly over V2C.
 
 ### Dynamic shapes
 
@@ -294,6 +294,17 @@ differ from a directly rounded conversion by one ULP of the destination. This is
 behaviour, not a defect — see
 [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) for the per-architecture
 tables.
+
+`pl.cast` also takes a keyword-only `saturation_mode` (`"on"` / `"off"`, or `1` / `0`) for
+`Tensor` and `Tile` inputs. `"on"` clamps an out-of-range result to the destination range;
+`"off"` keeps the target's non-saturating conversion, whose overflow behaviour is
+architecture-defined. **`"on"` is the default when the destination is an integer type** —
+nothing standard fixes what an overflowing conversion to an integer produces, clamping is
+the safer thing to get by accident, and on A2/A3 it is also the conversion the hardware
+performs natively. A **float** destination is left alone: IEEE says an out-of-range
+narrowing yields an infinity, and PyPTO matches that unless you ask for `"on"`. A
+multi-hop cast applies the mode to its final hop, which is the one that reaches the dtype
+you named.
 
 ## See Also
 
