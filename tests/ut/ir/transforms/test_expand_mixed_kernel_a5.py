@@ -43,8 +43,9 @@ _AUTO_TFREE_OPS = {
 }
 
 _TILE_MOVE = ir.get_op("tile.move").name
-_TILE_TRANSPOSE_VIEW = ir.get_op("tile.transpose_view").name
+_TILE_RESHAPE = ir.get_op("tile.reshape").name
 _TILE_TPOP_FROM_AIV = ir.get_op("tile.tpop_from_aiv").name
+_TILE_TPUSH_TO_AIC = ir.get_op("tile.tpush_to_aic").name
 
 
 def _expand_raw(program):
@@ -1480,8 +1481,8 @@ class TestCrossCoreBoundaries:
 
         ir.assert_structural_equal(After, Expected)
 
-    def test_mx_a_scale_uses_matching_row_major_v2c_view(self):
-        """A matching MX_A scale crosses V2C without a producer adapter."""
+    def test_mx_a_scale_uses_byte_preserving_v2c_alias(self):
+        """A matching MX_A scale crosses V2C without reordering its bytes."""
 
         @pl.program
         class Before:
@@ -1532,11 +1533,23 @@ class TestCrossCoreBoundaries:
             for stmt in _flatten_top_level_stmts(aiv.body)
             if isinstance(stmt, ir.AssignStmt)
             and isinstance(stmt.value, ir.Call)
-            and stmt.value.op.name in {_TILE_MOVE, _TILE_TRANSPOSE_VIEW}
+            and stmt.value.op.name in {_TILE_MOVE, _TILE_RESHAPE}
             and isinstance(stmt.var.type, ir.TileType)
             and stmt.var.type.dtype == pl.FP8E8M0
         ]
-        assert producer_adapters == []
+        assert len(producer_adapters) == 1
+        adapter_call = producer_adapters[0].value
+        assert isinstance(adapter_call, ir.Call)
+        assert adapter_call.op.name == _TILE_RESHAPE
+        generated_pushes: list[ir.Call] = []
+        for stmt in _flatten_top_level_stmts(aiv.body):
+            if not isinstance(stmt, ir.EvalStmt):
+                continue
+            call = stmt.expr
+            if isinstance(call, ir.Call) and call.op.name == _TILE_TPUSH_TO_AIC:
+                generated_pushes.append(call)
+        assert len(generated_pushes) == 2
+        assert all("__mx_scale_v2c_push" not in push.attrs for push in generated_pushes)
 
         scale_tpops = [
             stmt
@@ -1567,8 +1580,8 @@ class TestCrossCoreBoundaries:
             for stmt in _flatten_top_level_stmts(aic.body)
         )
 
-    def test_mx_b_scale_uses_transpose_view_for_v2c_push(self):
-        """MX_B keeps its logical col/col tpop and pushes a row/row transpose view."""
+    def test_mx_b_scale_uses_byte_preserving_v2c_alias(self):
+        """MX_B keeps its logical col/col tpop through the physical carrier."""
 
         @pl.program
         class Before:
@@ -1619,24 +1632,17 @@ class TestCrossCoreBoundaries:
             for stmt in _flatten_top_level_stmts(aiv.body)
             if isinstance(stmt, ir.AssignStmt)
             and isinstance(stmt.value, ir.Call)
-            and stmt.value.op.name in {_TILE_MOVE, _TILE_TRANSPOSE_VIEW}
+            and stmt.value.op.name in {_TILE_MOVE, _TILE_RESHAPE}
             and isinstance(stmt.var.type, ir.TileType)
             and stmt.var.type.dtype == pl.FP8E8M0
         ]
         assert len(producer_adapters) == 1
         adapter = producer_adapters[0]
         assert isinstance(adapter.value, ir.Call)
-        assert adapter.value.op.name == _TILE_TRANSPOSE_VIEW
+        assert adapter.value.op.name == _TILE_RESHAPE
         push_type = adapter.var.type
         assert isinstance(push_type, ir.TileType)
         assert _const_tile_shape(push_type) == [32, 2]
-        push_view = push_type.get_effective_tile_view()
-        assert (push_view.blayout, push_view.slayout, push_view.fractal) == (
-            pl.TileLayout.row_major,
-            pl.TileLayout.row_major,
-            32,
-        )
-
         scale_tpops = [
             stmt
             for stmt in _flatten_top_level_stmts(aic.body)
@@ -1666,8 +1672,8 @@ class TestCrossCoreBoundaries:
             for stmt in _flatten_top_level_stmts(aic.body)
         )
 
-    def test_mx_scale_v2c_rejects_partial_valid_columns(self):
-        """The byte-exact ND push requires the physical final extent to be fully valid."""
+    def test_mx_scale_v2c_alias_preserves_partial_valid_columns(self):
+        """The byte-preserving alias retains the scale's partial valid shape."""
 
         @pl.program
         class Before:
@@ -1685,8 +1691,17 @@ class TestCrossCoreBoundaries:
                     slayout=pl.TileLayout.row_major,
                 )
 
-        with pytest.raises(pypto.InternalError, match="full-valid final dimension"):
-            _expand_raw(Before)
+        After = _expand_raw(Before)
+        aiv = After.get_function("main_incore_0_aiv")
+        assert aiv is not None
+        assert any(
+            isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == _TILE_RESHAPE
+            and isinstance(stmt.var.type, ir.TileType)
+            and stmt.var.type.dtype == pl.FP8E8M0
+            for stmt in _flatten_top_level_stmts(aiv.body)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4409,7 +4424,7 @@ class TestDCERegression:
 
 
 class TestManualPipeVtoCFractalAdapt:
-    """A non-MX hand-written pl.tpush_to_aic gets the V->C fractal adapter.
+    """A hand-written pl.tpush_to_aic gets the V->C fractal adapter.
 
     The push is staged into an NZ Vec tile exactly as the boundary-move path
     stages the pipes this pass builds itself, and the original call's kwargs
@@ -4422,8 +4437,8 @@ class TestManualPipeVtoCFractalAdapt:
     which fails as soon as the gate stops being consulted.
     """
 
-    def test_fp8e8m0_mx_scale_push_is_rejected(self):
-        """Manual MX-scale pipes fail instead of guessing the consumer layout."""
+    def test_fp8e8m0_mx_scale_push_is_adapted(self):
+        """Manual row/row and col/col MX-scale pushes use the NZ carrier."""
 
         @pl.program
         class RowMajorBefore:
@@ -4487,8 +4502,35 @@ class TestManualPipeVtoCFractalAdapt:
                 self.manual_aiv(scale_data)
 
         for program in (RowMajorBefore, ColMajorBefore):
-            with pytest.raises(ValueError, match="Hand-written tile.tpush_to_aic does not support.*MX-scale"):
-                _expand_raw(program)
+            After = _expand_raw(program)
+            aiv = After.get_function("manual_aiv")
+            assert aiv is not None
+            adapters = [
+                stmt
+                for stmt in _flatten_top_level_stmts(aiv.body)
+                if isinstance(stmt, ir.AssignStmt)
+                and isinstance(stmt.value, ir.Call)
+                and stmt.value.op.name == _TILE_MOVE
+                and isinstance(stmt.var.type, ir.TileType)
+                and stmt.var.type.dtype == pl.FP8E8M0
+            ]
+            assert len(adapters) == 1
+            adapter_type = adapters[0].var.type
+            assert isinstance(adapter_type, ir.TileType)
+            adapter_view = adapter_type.get_effective_tile_view()
+            assert (adapter_view.blayout, adapter_view.slayout) == (
+                pl.TileLayout.col_major,
+                pl.TileLayout.row_major,
+            )
+            pushes: list[ir.Call] = []
+            for stmt in _flatten_top_level_stmts(aiv.body):
+                if not isinstance(stmt, ir.EvalStmt):
+                    continue
+                call = stmt.expr
+                if isinstance(call, ir.Call) and call.op.name == _TILE_TPUSH_TO_AIC:
+                    pushes.append(call)
+            assert len(pushes) == 1
+            assert "__mx_scale_v2c_push" not in pushes[0].attrs
 
     def test_push_in_a_hand_written_aiv_function_is_adapted(self):
         """The author already typed the function AIV, so the pass only adapts."""
