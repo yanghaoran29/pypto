@@ -287,6 +287,15 @@ inline const PassProperties kInferTileMemorySpaceProperties{
                  IRProperty::AivSplitValid, IRProperty::AccToGmStoreValid, IRProperty::AccCompactValid},
     .invalidated = {IRProperty::AivSplitValid}};
 
+// Head-peel the canonical MX split-K initialization predicate before mixed
+// kernels are expanded. The rewrite preserves the already-inferred spaces and
+// all structural properties.
+inline const PassProperties kPeelMatmulMxInitCondProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+
 // -- Insert MX scale-address binding pass ------------------------------------
 //
 // Runs immediately after InferTileMemorySpace.

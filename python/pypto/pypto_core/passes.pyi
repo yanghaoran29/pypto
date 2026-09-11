@@ -544,6 +544,9 @@ def block_mx_scale_tensor_views() -> Pass:
     ``materialize_tensor_strides``.
     """
 
+def peel_matmul_mx_init_cond() -> Pass:
+    """Create a pass that head-peels static MX matmul initialization loops."""
+
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
@@ -1067,6 +1070,7 @@ __all__ = [
     "optimize_orch_tensors",
     "block_nz_tensor_views",
     "block_mx_scale_tensor_views",
+    "peel_matmul_mx_init_cond",
     "flatten_tile_nd_to_2d",
     "legalize_tile_cast",
     "auto_tile_matmul_l0",

@@ -470,6 +470,9 @@ void BindPass(nb::module_& m) {
              "Variable used before any definition in scope");
 
   passes.def("unroll_loops", &pass::UnrollLoops, "Create a loop unrolling pass");
+  passes.def("peel_matmul_mx_init_cond", &pass::PeelMatmulMxInitCond,
+             "Head-peel static split-K loops using tile.matmul_mx_acc(..., "
+             "init_cond=(loop_var == loop_start)) before mixed-kernel expansion.");
   passes.def("skew_cross_core_pipeline", &pass::SkewCrossCorePipeline,
              "Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately before\n"
              "lower_pipeline_loops. A single-round-trip producer-role loop runs the producer\n"

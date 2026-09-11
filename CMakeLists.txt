@@ -253,6 +253,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
     src/ir/transforms/lower_pipeline_to_slots_pass.cpp
+    src/ir/transforms/peel_matmul_mx_init_cond_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp

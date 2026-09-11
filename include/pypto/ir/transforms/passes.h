@@ -316,6 +316,17 @@ Pass LegalizeGraphBoundary();
 Pass UnrollLoops();
 
 /**
+ * @brief Head-peel a static split-K loop whose ``tile.matmul_mx_acc`` uses
+ *        ``init_cond=(loop_var == loop_start)``.
+ *
+ * The first body copy becomes ``tile.matmul_mx`` and the remainder keeps a
+ * predicate-free ``tile.matmul_mx_acc``. This runs before mixed-kernel
+ * expansion so AIV conversion and AIC consumption are peeled together, and
+ * PTOAS never has to schedule a runtime branch between the two MAD forms.
+ */
+Pass PeelMatmulMxInitCond();
+
+/**
  * @brief Skew cross-core (cube/vector) ``pl.pipeline`` loops; runs immediately
  *        before ``LowerPipelineLoops``.
  *

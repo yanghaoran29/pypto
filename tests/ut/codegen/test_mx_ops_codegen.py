@@ -115,6 +115,25 @@ class TestMxMatmulCodegen:
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
         )
 
+    def test_mx_scale_load_accepts_clamped_and_modulo_offsets(self):
+        """Clamp and positive-divisor modulo expressions prove non-negative."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+                offset: pl.Scalar[pl.INDEX],
+            ):
+                row_off = pl.min(pl.max(offset, 0), 7) * 16
+                col_off = (offset % 4) * 2
+                _ = pl.load(a_s, [row_off, col_off], [16, 2], target_memory=pl.Mem.Mat)
+
+        mlir = _emit_incore_mlir(Program)
+        assert "cf.assert" not in mlir
+        assert "pto.tload" in mlir
+
     def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
         """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""
 
@@ -376,6 +395,110 @@ class TestMxMatmulCodegen:
         ins_acc = acc_line.split("ins(", 1)[1].split(",", 1)[0].strip()
         outs_acc = acc_line.split("outs(", 1)[1].split(":", 1)[0].strip()
         assert ins_acc == outs_acc
+
+    @pytest.mark.parametrize(
+        ("init_cond", "expected_op"),
+        [(True, "pto.tmatmul.mx "), (False, "pto.tmatmul.mx.acc")],
+    )
+    def test_matmul_mx_acc_literal_init_cond_selects_form(self, init_cond, expected_op):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                a_s: pl.Tensor[[16, 2], pl.FP8E8M0, pl.MX_A_ZZ],
+                b: pl.Tensor[[64, 32], pl.FP8E4M3FN],
+                b_s: pl.Tensor[[2, 32], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ):
+                lhs = pl.load(a, [0, 0], [16, 64])
+                lhs_scale = pl.load(a_s, [0, 0], [16, 2])
+                rhs = pl.load(b, [0, 0], [64, 32])
+                rhs_scale = pl.load(b_s, [0, 0], [2, 32])
+                acc = pl.tile.create([16, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                result = pl.matmul_mx_acc(
+                    acc,
+                    lhs,
+                    lhs_scale,
+                    rhs,
+                    rhs_scale,
+                    init_cond=init_cond,
+                )
+                pl.store(result, [0, 0], out)
+
+        mlir = _emit_incore_mlir(Program)
+        assert expected_op in mlir
+        assert mlir.count("pto.tmatmul.mx") == 1
+        assert "scf.if" not in mlir
+
+    def test_matmul_mx_acc_runtime_init_cond_branches(self):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+                a_s: pl.Tensor[[16, 2], pl.FP8E8M0, pl.MX_A_ZZ],
+                b: pl.Tensor[[64, 32], pl.FP8E4M3FN],
+                b_s: pl.Tensor[[2, 32], pl.FP8E8M0, pl.MX_B_NN],
+                pred: pl.Tensor[[1, 1], pl.BOOL],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ):
+                lhs = pl.load(a, [0, 0], [16, 64])
+                lhs_scale = pl.load(a_s, [0, 0], [16, 2])
+                rhs = pl.load(b, [0, 0], [64, 32])
+                rhs_scale = pl.load(b_s, [0, 0], [2, 32])
+                acc = pl.tile.create([16, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                result = pl.matmul_mx_acc(
+                    acc,
+                    lhs,
+                    lhs_scale,
+                    rhs,
+                    rhs_scale,
+                    init_cond=pl.read(pred, [0, 0]),
+                )
+                pl.store(result, [0, 0], out)
+
+        mlir = _emit_incore_mlir(Program)
+        assert "scf.if" in mlir
+        assert "pto.tmatmul.mx " in mlir
+        assert "pto.tmatmul.mx.acc" in mlir
+        assert "= scf.if" not in mlir
+
+    def test_matmul_mx_acc_split_k_init_cond_is_head_peeled(self):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[16, 128], pl.FP8E4M3FN],
+                a_s: pl.Tensor[[16, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+                b: pl.Tensor[[128, 32], pl.FP8E4M3FN],
+                b_s: pl.Tensor[[4, 32], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ):
+                acc = pl.tile.create([16, 32], pl.FP32, target_memory=pl.Mem.Acc)
+                for k0 in pl.range(0, 128, 64):
+                    lhs = pl.load(a, [0, k0], [16, 64])
+                    lhs_scale = pl.load(a_s, [0, k0 // 32], [16, 2])
+                    rhs = pl.load(b, [k0, 0], [64, 32])
+                    rhs_scale = pl.load(b_s, [k0 // 32, 0], [2, 32])
+                    acc = pl.matmul_mx_acc(
+                        acc,
+                        lhs,
+                        lhs_scale,
+                        rhs,
+                        rhs_scale,
+                        init_cond=(k0 == 0),
+                    )
+                pl.store(acc, [0, 0], out)
+
+        mlir = _emit_incore_mlir(Program)
+        mx_lines = [line for line in mlir.splitlines() if "pto.tmatmul.mx" in line]
+        assert "scf.if" not in mlir
+        assert sum("pto.tmatmul.mx.acc" in line for line in mx_lines) == 1
+        assert sum("pto.tmatmul.mx " in line for line in mx_lines) == 1
 
     def test_mx_rank5_view_maps_aligned_logical_offsets(self):
         @pl.program
