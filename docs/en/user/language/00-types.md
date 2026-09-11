@@ -179,7 +179,8 @@ matmul weight load can skip the online ND→NZ conversion. It is an assertion ab
 bytes, not a request to convert: the shape and slicing you write stay logical, and the
 compiler derives the blocked physical descriptor. It currently requires a statically shaped,
 fractal-aligned tensor with a whole-byte dtype (`shape[-2] % 16 == 0`,
-`shape[-1] % (256 / dtype bits) == 0`) read
+`shape[-1] % (256 / dtype bits) == 0`) of **logical rank 2 or 3** — `[R, C]` or `[B, R, C]`,
+since the underlying NZ descriptor has exactly one batch slot — read
 into a matmul operand; anything else is rejected with a diagnostic.
 
 When a tensor's rows are not contiguous — a window into a larger buffer, a strided slice
@@ -199,9 +200,10 @@ scale tensor** of an MX (microscaling) operand on Ascend950 — `MX_A_ZZ` for th
 scale pack, `MX_B_NN` for the right/B one — so that a Mat-to-scale `pl.move` can check the
 source layout instead of byte-copying incompatible data into `LeftScale` / `RightScale`.
 They are the one case where a layout marker on a `pl.Tensor` annotation is required rather
-than discouraged. Current limitations: an MX `pl.load` must pass `target_memory=pl.Mem.Mat`
-explicitly; ordinary MX subviews (`slice`, `reshape`, `transpose`, `reinterpret_view`) and
-MX `remote_load` are rejected. Exception: FP8E8M0 `pl.tensor.view` may alias packed ND
+than discouraged. An MX `pl.load` may omit `target_memory`; the Python API selects
+`pl.Mem.Mat`, and `matmul_mx` operand placement inserts the required moves. Ordinary MX
+subviews (`slice`, `reshape`, `transpose`, `reinterpret_view`) and MX `remote_load` are
+rejected. Exception: FP8E8M0 `pl.tensor.view` may alias packed ND
 backing to `MX_A_ZZ` / `MX_B_NN` as a logical rank-2 view (`layout=mx_*`; PTOAS v0.60 packs
 physically). The matmul itself is `pl.matmul_mx` and its `_acc` /
 `_bias` variants, which take a data tile and a scale tile per operand. Both data tiles reaching
@@ -210,7 +212,14 @@ right FP8 operand: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. O
 legalization pass expands that request to FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
 reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
 `group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
-task with `matmul_mx`; the generated data and scale cross directly over V2C.
+task with `matmul_mx`; the generated data and scale cross directly over V2C, with a generated
+Vec-to-Mat-to-scale-memory path for the scale.
+`pl.quant_mx(tensor, group_axis=1)` returns GM A data `[M,K]` plus an
+`MX_A_ZZ[M,K/32]` scale tensor. `group_axis=0` accepts `[N,K]` and returns
+Cube-oriented data `[K,N]` plus `MX_B_NN[K/32,N]`. Those two tensor pairs are
+the required inputs to tensor `pl.matmul_mx`, which is 2-D-only and returns
+FP32; tensor MX accumulation, bias, transpose flags, batches, dynamic shapes,
+and FP4 are intentionally not part of this interface.
 
 ### Dynamic shapes
 

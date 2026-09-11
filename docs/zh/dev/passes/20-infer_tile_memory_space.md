@@ -105,8 +105,9 @@ yield 查表与 init 载体查表都使用 `AsVarLike` 而非 `As<Var>`。原样
 
 阶段 1 **从不**覆盖已有的 `target_memory` kwarg。如果用户写了 `pl.load(..., target_memory=Mat)`，而下游 `matmul` 需要 `Left`，则 load 仍保持 `Mat`，并由后续插入 `tile.move`。
 
-源类型为 `TensorLayout.MX_A_ZZ` / `MX_B_NN` 的 `tile.load` 必须显式携带
-`target_memory=Mat`；如果省略或传入其他目标，类型推导会在本 pass 运行前报错。
+公开 Python load builder 会把 `TensorLayout.MX_A_ZZ` / `MX_B_NN` 源上省略的
+target 规范化为 `target_memory=Mat`。原始 `tile.load` IR 仍必须携带该 target；
+如果缺失或传入其他目标，类型推导会在本 pass 运行前报错。
 
 ### 阶段 2 — Move 收集（`MoveCollector`）
 
@@ -252,7 +253,7 @@ class After:
 
 `TileMemoryInferred` 属性是本 pass 建立的契约。下游 pass（尤其 `ExpandMixedKernel` 与 `InitMemRef`）依赖该契约，配套的属性 verifier 守护回归。
 
-`AccToGmStoreValid` 只有在这里才可判定：`tile.store` 是否从 Acc 收窄写入 GM，取决于本 pass 解析出的 memory space。`AivSplitValid` 被失效并重新产生也是同一原因——这是最后一个能观察到 AIV split 边界内存的验证点（此前在 `ConvertTensorToTileOps` 处该操作数的 space 可能仍未解析），再往后 `LowerAutoVectorSplit` 就会擦除区域节点。
+`AccToGmStoreValid` 只有在这里才可判定：`tile.store` 是否从 Acc 收窄写入 GM，取决于本 pass 解析出的 memory space。`AivSplitValid` 被失效并重新产生也是同一原因——这是最后一个能观察到 AIV split 边界内存的验证点（此前在 `ConvertTensorToTileOps` 处该操作数的 space 可能仍未解析），再往后 `LowerAutoVectorSplit` 就会切换到 lowered 阶段的验证契约。
 
 ## 作用范围
 

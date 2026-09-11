@@ -44,7 +44,8 @@ second = slice_kernel.compile()  # A distinct specialization with 64 rows.
 被引用的闭包常量由源码依赖哈希覆盖，无需单独的闭包键组件。
 
 快照仅复制绑定：此常量跟踪机制不支持编译期间修改任意配置对象
-内部状态，或修改编译器/源码文件。本改动不启用持久产物缓存，编译对象仍在进程内复用。
+内部状态，或修改编译器/源码文件。持久复用还需要完整的
+[产物身份与缓存策略](../10-jit-cache.md)。
 
 ### 编译选项与诊断请求
 
@@ -78,6 +79,51 @@ cached = slice_kernel.compile()
 slice_kernel.compile(config=RunConfig(dump_passes=True, save_kernels_dir="debug_kernel"))
 assert slice_kernel.compile() is cached
 ```
+
+### 预备二进制而不执行
+
+`kernel.warmup()` 与 `kernel.compile()` 使用相同的特化、配置和进程内对象缓存，
+并在返回前完成所有 kernel 与 orchestration 二进制的准备。它不会初始化 NPU，
+也不会创建运行时 worker。构建主机仍需安装目标编译器、SDK，以及运行时的 Python
+和原生依赖。
+
+```python
+import pypto.language as pl
+from pypto.runtime import RunConfig
+
+@pl.jit
+def add_three(
+    x: pl.Tensor[[16, 16], pl.FP32],
+    out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        tile = pl.load(x, [0, 0], [16, 16])
+        pl.store(pl.add(tile, 3.0), [0, 0], out)
+    return out
+
+config = RunConfig(platform="a2a3")
+prepared = add_three.warmup(config=config)  # No sample tensor allocation.
+# Later, on a host with an available NPU:
+# prepared(x, out, config=config)
+```
+
+与 `compile()` 一样，可以提供样本张量；预热只读取元数据，不读取张量内容。
+张量注解完整时可省略张量实参，通过标量默认值或关键字值完成特化。
+在注解驱动模式下，`pl.RUNTIME` 保留未特化的标量，动态维度沿用现有编译规则。
+调用返回的编译对象时，需提供包含标量实参在内的完整参数列表；JIT 默认值在编译时解析。
+`codegen_only` 等仅影响执行的设置不会禁止二进制准备。
+
+返回值是 `compile()` 选中的同一个编译对象，新编译对象仍保留 IR。
+预热覆盖 `DistributedCompiledProgram` 的所有芯片级子构建，以及多 orchestration
+`CompiledProgram` 的每个 orchestration 子构建。它不会调用分布式对象的
+`prepare()`，后者用于创建执行所需的活动 worker。编译错误直接传递给调用方；
+二进制构建失败后，可以再次调用 warmup 重试。诊断和显式输出请求仍按上文规则重新编译。
+
+启用[持久缓存](../10-jit-cache.md) 后，warmup 通过[运行时协议](../09-artifact-store.md)
+自动发布或复用 READY 产物。持久缓存默认关闭；只读未命中、不支持的输入和存储故障
+可以生成私有结果。从缓存恢复的结果 `.program is None`；需要 IR 时关闭持久缓存，
+或使用 `specialize()`/`lower()`。公共缓存策略、统计和仅用元数据预热的 CLI 参见
+[JIT 持久缓存](../10-jit-cache.md)。
 
 ## 函数
 

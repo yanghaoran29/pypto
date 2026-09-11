@@ -67,9 +67,10 @@ bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const
 
 /// True when a `tile.load`'s source tensor carries the NZ layout.
 ///
-/// `BlockNzTensorViews` has already put such a load into its final form — a
-/// blocked rank-(r+2) GM window feeding a logical 2D tile — so this pass must
-/// leave it alone rather than collapse the window or re-deduce the tile type.
+/// `BlockNzTensorViews` runs right after this pass and will put such a load
+/// into its final form — a blocked rank-5 GM window feeding a logical 2D tile —
+/// so this pass must leave it alone rather than collapse the window or
+/// re-deduce the tile type.
 bool IsNzSourceLoad(const std::vector<ExprPtr>& args) {
   if (args.empty()) return false;
   auto tensor = AsVarLike(args[0]);
@@ -996,7 +997,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         // The collapse below exists because a natural Mat load lowers to ND2NZ,
         // which pto-isa only accepts on a 2D GlobalTensor. An NZ *source* takes
         // the NZ2NZ path instead, and BlockNzTensorViews (which runs right after
-        // this pass) will give it the blocked rank-(r+2) window that path wants.
+        // this pass) will give it the blocked rank-5 window that path wants.
         // Collapsing here would flatten the fractal dims into a row count and
         // destroy that structure, so leave the window at tensor rank and only
         // flatten the tile.
@@ -1116,20 +1117,28 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
       auto out_tensor_type = As<TensorType>(new_args[2]->GetType());
       if (orig_tile_type && out_tensor_type && out_tensor_type->shape_.size() > 2) {
-        // Inject the original tensor-rank partition shape tuple as the 4th argument.
-        // The partition shape has the same rank as the tensor, with 1s for
-        // batch dims that are not covered by the tile, followed by the tile dims.
-        const size_t tensor_rank = out_tensor_type->shape_.size();
-        const size_t tile_rank = orig_tile_type->shape_.size();
-        std::vector<ExprPtr> partition_shape;
-        partition_shape.reserve(tensor_rank);
-        for (size_t i = tile_rank; i < tensor_rank; ++i) {
-          partition_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, span));
-        }
-        for (const auto& dim : orig_tile_type->shape_) {
-          partition_shape.push_back(dim);
-        }
-        new_args.push_back(std::make_shared<MakeTuple>(partition_shape, span));
+        // Inject the tensor-rank partition shape tuple as the 4th argument. It
+        // must be a box the destination actually contains, and the offsets are
+        // part of deciding that — see ComputeStorePartitionShape for why
+        // aligning the tile's dims against the tensor's trailing dims is not
+        // enough once the tile's leading extent collapses several tensor dims.
+        //
+        // Derived from the tile's VALID shape, not its physical shape: the
+        // partition describes the region the store actually transfers, which is
+        // what the 2D path in codegen also sizes it from (`tile.store` reads
+        // GetEffectiveTileView(...).valid_shape there). A chunked tail block —
+        // physical [1, 16, 512] carrying valid [1, 10, 512] — writes 10 rows,
+        // and deriving the window from 16 would both overstate the destination
+        // region and refuse the store outright when 16 does not divide the axis
+        // it would have to span. GetEffectiveTileView falls back to the physical
+        // shape when no valid_shape is set, so the aligned case is unchanged.
+        const auto store_tile_view = tile_view_semantics::GetEffectiveTileView(*orig_tile_type);
+        auto store_offsets = As<MakeTuple>(new_args[1]);
+        INTERNAL_CHECK_SPAN(store_offsets, span) << "Internal error: tile.store offsets must be a tuple";
+        new_args.push_back(std::make_shared<MakeTuple>(
+            ComputeStorePartitionShape(store_tile_view.valid_shape, out_tensor_type->shape_,
+                                       store_offsets->elements_, span),
+            span));
       }
 
       // Construct call directly: store result type = output tensor type (args[2])

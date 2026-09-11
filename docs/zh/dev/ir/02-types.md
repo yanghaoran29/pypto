@@ -21,6 +21,95 @@ float_type = ir.ScalarType(DataType.FP32)
 >
 > **注意：** `TASK_ID` 是一个不透明的 64-bit handle（类型代码 `0x50`），表示 runtime 的 `TaskId`。它**不是**数值类型——上面没有任何算术运算。`Scalar[TASK_ID]` 值由 `with pl.manual_scope():` 内的 `pl.submit(...)` 产生（它返回的二元组第二个元素命名 producer task）。Python 字面量 `None` 是 "暂无 producer" 的哨兵——它用作 TaskId 循环 iter_arg 的种子，也可作为 `deps=[None]` 条目；当 `None` 出现在 TaskId 位置时，会下沉为 [`system.task_invalid`](05-operators.md) builtin → `TaskId::invalid()`。TaskId 值通过 `pl.submit(...)` 的 `deps=[tid1, tid2]` kwarg 传入。codegen 把 `TASK_ID` 下沉为 `TaskId`。
 
+### 内部 Buffer 类型
+
+`BufferType` 描述最终设备 IR 中的可变片上缓冲区，直接继承 `Type`，
+不包含 `MemRef`、base pointer、地址或运行时表达式字段。
+存储身份由定义该缓冲区的 SSA 值表达，所有权由定义算子声明。
+
+```python
+buffer_type = ir.BufferType(
+    [32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64]
+)
+multi_type = ir.MultiBufferType(buffer_type, slot_count=2)
+```
+
+物理维度目前必须是静态正整数。`valid_shape` 可以是零到物理维度之间的
+静态有效长度，也可以用 `-1` 标记由算子操作数提供的运行时有效长度；
+省略时使用完整物理形状。布局、以字节为单位的 fractal 大小、padding
+和 compact mode 都是显式描述符字段。`MultiBufferType` 描述一次
+多缓冲分配中的相同槽位，槽位数必须为正数。控制流类型检查会在分支结果
+和循环携带值之间比较完整描述符，包括槽位数及嵌套 tuple 中的元素。
+
+`VoidType` 表示确定没有 SSA 结果，与 `UnknownType` 不同。
+Void call 应放在 `EvalStmt` 中，不能绑定变量、用作操作数、放入 tuple，
+也不能作为值 yield 或 return。分配大小表达式（包括 `WindowBuffer.size`）
+也必须产生一个值。
+`Call` 和 `Submit` 的 attrs、kwargs 中的表达式值同样遵循此规则，
+在构造时即进行校验，通过 `ir.set_call_attrs` 附加属性时也会校验。
+
+这些类型支持构造、结构比较和二进制序列化。Buffer 类型 dump 使用原生
+`pypto.ir.BufferType(...)` 构造表达式，并保留完整描述符。内部 buffer 算子
+使用下文契约；表示验证和 PTO 代码生成将分别集成。自动 tile-to-buffer
+lowering 尚未启用，公开 Tile DSL 和默认流水线仍使用 `TileType`。
+目前不支持通过 DSL parser 重新解析完整的 buffer 程序 dump。
+
+#### Buffer 算子契约
+
+算子注册默认为 `OpIRStage::Functional`。内部 buffer 算子显式选择
+`OpIRStage::Buffer` 并调用 `set_internal_only()`。结果数量必须声明：
+零结果要求 `VoidType`，单结果使用原生类型，多结果使用数量匹配的
+`TupleType`。Functional 注册仍按现有契约要求至少一个结果。
+
+每个 buffer 操作数通过 `set_buffer_arg_effect(i, data, metadata)`
+分别声明数据与元数据访问；标量操作数使用 `set_buffer_non_memory_arg(i)`。
+两个访问维度都使用 `BufferAccess`（`None`、`Read`、`Write`、`ReadWrite`），
+缺少声明不会默认视为读取。`set_buffer_result_behavior(...)` 将结果分类为
+分配、别名、借用句柄或原生值，void call 声明 `None`。别名和借用结果
+需要指定来源操作数。`Allocate` 声明 root 句柄；指定地址的 root 可以相互
+重叠，因此它不证明存储独立或已初始化。描述符及内存空间合法性由各算子的
+类型推导或显式结果验证检查。
+
+`buffer.alloc` 使用 `f_validate_explicit_type(...)`，不使用类型推导器：
+物理描述符只存在于 `Call.type` 中。两种模式互斥，避免在 kwargs 中重复
+存储描述符。私有 IR 构造器在 span 前接收结果类型：
+
+```python
+from pypto.pypto_core import ir as _ir
+
+span = ir.Span.unknown()
+valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+descriptor = ir.BufferType([32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64])
+allocation = _ir._create_internal_op_call(
+    "buffer.alloc", [ir.MakeTuple([valid_rows], span)], {}, descriptor, span
+)
+```
+
+第一个操作数始终是 `MakeTuple`，只包含描述符中 `-1` 维度对应的运行时
+valid extent，按维度顺序排列。静态描述符使用空 tuple。可选的第二个操作数
+是最终有效字节地址，不再叠加 base 或 offset。省略地址表示请求独立存储；
+显式零地址是合法的指定地址分配。负常量地址（包括 `-1`）会被拒绝。
+两个操作数都属于非内存值，运行时值必须是整数或 `INDEX` 标量。
+常量 valid extent 必须介于零和对应物理维度之间；无法静态检查时，运行时
+extent 的边界及地址非负性属于构造调用的前置条件。
+
+`buffer.set_validshape(buffer, valid_extents)` 返回 `VoidType`，只写入元数据。
+其 `MakeTuple` 操作数包含**所有**维度。标记为 `-1` 的维度可在物理边界内
+变化；静态 valid 维度必须传入与描述符一致的常量。该操作不改变不可变类型
+或 buffer 身份。对于句柄生命周期内会变化的 valid 维度，lowering 必须提前
+选择动态描述符。
+
+`OpRegistry::ValidateBufferCall` 按创建调用时的同一 schema 检查已有 call，
+包括其原始结果类型和 kwargs。存储生命周期、重叠和初始化证明属于后续验证。
+
+首批 `buffer.copy(src, dst)` 和 `buffer.mul(lhs, rhs, dst)` 写入显式
+destination 并返回 `VoidType`，目前要求所有参数的 Vec buffer 描述符
+相同。写效应并不表示所有字节都已初始化。允许输入和 destination 是同一
+句柄；构造调用前需要保证运行时 valid extent 一致，并完成部分重叠 view
+的合法化。现有 Functional 阶段的
+`ArgEffect` 查询会显式拒绝 buffer 算子，buffer 消费方必须使用
+`GetBufferArgEffect`。
+
 ### TensorType
 
 带可选内存引用 (MemRef) 的多维张量 (Tensor)。
@@ -164,7 +253,7 @@ Packed canonical 公式（`BuildLogicalStridesFromLayout`，见
 | ------ | ---------------- |
 | `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
 | `DN`（`n ≥ 2`） | `stride[n-2] = 1`；`stride[n-1] = shape[n-2]`；`stride[n-3] = shape[n-2] * shape[n-1]`；外层按行主序 |
-| `NZ` | 对*分块*后的 rank-(r+2) shape `[..., C/c0, R/16, 16, c0]` 求行主序 —— 见 [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
+| `NZ` | 对*分块*后的 rank-5 shape `[B, C/c0, R/16, 16, c0]` 求行主序 —— 见 [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
 
 **同一 canonical TensorView 的两种写法**：
 
@@ -494,6 +583,9 @@ tile_type = ir.TileType(shape, DataType.FP16, memref, tile_view, ir.Mem.Left)
 | **ScalarType** | 0 | - | 单个值 |
 | **TensorType** | N（任意） | 可选 MemRef | 通用张量 |
 | **TileType** | N（任意）* | 可选 MemRef + TileView | 硬件优化 Tile |
+| **BufferType** | 静态物理维度 | 定义它的 SSA 句柄 | 显式设备存储 |
+| **MultiBufferType** | 元素 BufferType | 原生 slot 组 | 相同描述符的 buffer slots |
+| **VoidType** | - | - | 确定不存在 SSA 结果 |
 | **TupleType** | - | - | 多返回值 |
 | **PipeType** | - | - | 硬件同步 |
 | **UnknownType** | - | - | 类型推断占位符 |
