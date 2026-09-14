@@ -18,6 +18,7 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/op_registry.h"
@@ -73,22 +74,29 @@ class InitCondFinder : public IRVisitor {
   bool found_ = false;
 };
 
-class InitCondSpecializer : public IRMutator {
+class ProvableInitCondSpecializer : public IRMutator {
  public:
-  InitCondSpecializer(bool initializing, VarPtr loop_var, ExprPtr start)
-      : initializing_(initializing), loop_var_(std::move(loop_var)), start_(std::move(start)) {}
+  ProvableInitCondSpecializer() : analyzer_(std::make_shared<arith::Analyzer>()) {}
+
+  ProvableInitCondSpecializer(const VarPtr& loop_var, int64_t min_value, int64_t max_value_exclusive)
+      : ProvableInitCondSpecializer() {
+    analyzer_->Bind(loop_var, min_value, max_value_exclusive);
+  }
 
  protected:
   ExprPtr VisitExpr_(const CallPtr& op) override {
     auto visited = As<Call>(IRMutator::VisitExpr_(op));
     INTERNAL_CHECK_SPAN(visited, op->span_) << "Internal error: Call mutation returned a non-Call";
-    if (!IsMxAccWithInitCond(visited) || !IsLoopStartPredicate(visited->args_[5], loop_var_, start_)) {
-      return visited;
-    }
+    if (!IsMxAccWithInitCond(visited)) return visited;
+
+    auto cond = analyzer_->Simplify(visited->args_[5]);
+    const bool initializing = analyzer_->CanProve(cond);
+    const bool accumulating = !initializing && analyzer_->CanProve(MakeNot(cond, cond->span_));
+    if (!initializing && !accumulating) return visited;
 
     std::vector<ExprPtr> args;
     OpPtr target_op;
-    if (initializing_) {
+    if (initializing) {
       target_op = OpRegistry::GetInstance().GetOp("tile.matmul_mx");
       args.assign(visited->args_.begin() + 1, visited->args_.begin() + 5);
     } else {
@@ -100,9 +108,7 @@ class InitCondSpecializer : public IRMutator {
   }
 
  private:
-  bool initializing_;
-  VarPtr loop_var_;
-  ExprPtr start_;
+  arith::AnalyzerPtr analyzer_;
 };
 
 void AttachLoopComments(const StmtPtr& body, const std::vector<std::string>& comments) {
@@ -140,22 +146,37 @@ class PeelMatmulMxInitCondMutator : public IRMutator {
     for (const auto& iter_arg : visited->iter_args_) {
       first_substitutions.emplace(iter_arg.get(), iter_arg->initValue_);
     }
-    InitCondSpecializer init_specializer(/*initializing=*/true, visited->loop_var_, visited->start_);
-    auto first_template = init_specializer.VisitStmt(visited->body_);
-    auto first_clone = DeepClone(first_template, first_substitutions, /*clone_def_vars=*/true);
-    auto [first_stmts, first_yields] = SplitBodyYield(first_clone.cloned_body);
-    AttachLoopComments(first_stmts, visited->leading_comments_);
+    auto first_clone = DeepClone(visited->body_, first_substitutions, /*clone_def_vars=*/true);
+    auto specialized_first = ProvableInitCondSpecializer().VisitStmt(first_clone.cloned_body);
+    auto [first_stmts, first_yields] = SplitBodyYield(specialized_first);
     INTERNAL_CHECK_SPAN(first_yields.size() == visited->iter_args_.size(), visited->span_)
         << "Internal error: peeled MX loop body must yield one value per iter_arg";
 
-    std::vector<StmtPtr> replacement{first_stmts};
+    std::vector<StmtPtr> replacement;
     if (trip_count == 1) {
+      // A post-LowerPipelineLoops marker scopes CanonicalizeIOOrder over the F
+      // cloned stages. Keep that one-trip wrapper until IO has been clustered;
+      // Canonicalize demotes it and the final Simplify pass removes it. Dropping
+      // the wrapper here would leave the cloned loads in serial source order.
+      if (visited->kind_ == ForKind::Pipeline && visited->GetAttr<int>(kPipelineStagesAttr, 0) == 1) {
+        std::vector<StmtPtr> body_parts{first_stmts};
+        body_parts.push_back(std::make_shared<YieldStmt>(first_yields, visited->span_));
+        auto kept = MutableCopy(visited);
+        kept->body_ = SeqStmts::Flatten(std::move(body_parts), visited->span_);
+        return kept;
+      }
+
+      AttachLoopComments(first_stmts, visited->leading_comments_);
+      replacement.push_back(first_stmts);
       for (size_t i = 0; i < visited->return_vars_.size(); ++i) {
         replacement.push_back(
             std::make_shared<AssignStmt>(visited->return_vars_[i], first_yields[i], visited->span_));
       }
       return SeqStmts::Flatten(std::move(replacement), visited->span_);
     }
+
+    AttachLoopComments(first_stmts, visited->leading_comments_);
+    replacement.push_back(first_stmts);
 
     VarPtr remainder_var = CloneLoopVar(visited->loop_var_);
     std::vector<IterArgPtr> remainder_iter_args;
@@ -168,11 +189,13 @@ class PeelMatmulMxInitCondMutator : public IRMutator {
       remainder_iter_args.push_back(std::move(fresh));
     }
 
-    InitCondSpecializer acc_specializer(/*initializing=*/false, visited->loop_var_, visited->start_);
-    auto remainder_template = acc_specializer.VisitStmt(visited->body_);
-    auto remainder_clone = DeepClone(remainder_template, remainder_substitutions, /*clone_def_vars=*/true);
-    auto remainder_body = remainder_clone.cloned_body;
-    auto remainder_start = MakeConstIndex(*start + *step, visited->span_);
+    auto remainder_clone = DeepClone(visited->body_, remainder_substitutions, /*clone_def_vars=*/true);
+    const int64_t remainder_start_value = *start + *step;
+    const int64_t range_min = *step > 0 ? remainder_start_value : *stop + 1;
+    const int64_t range_max_exclusive = *step > 0 ? *stop : remainder_start_value + 1;
+    auto remainder_body = ProvableInitCondSpecializer(remainder_var, range_min, range_max_exclusive)
+                              .VisitStmt(remainder_clone.cloned_body);
+    auto remainder_start = MakeConstIndex(remainder_start_value, visited->span_);
     auto remainder = std::make_shared<ForStmt>(
         remainder_var, remainder_start, visited->stop_, visited->step_, std::move(remainder_iter_args),
         remainder_body, visited->return_vars_, visited->span_, visited->kind_, visited->attrs_);

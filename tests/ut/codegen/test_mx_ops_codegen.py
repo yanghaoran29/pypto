@@ -264,6 +264,51 @@ class TestMxMatmulCodegen:
         first_tget = next(i for i, line in enumerate(lines) if "pto.tget_scale_addr" in line)
         assert any("pto.tmov" in line and "scaling" in line for i, line in enumerate(lines) if i < first_tget)
 
+    def test_autotiles_64k_right_panel_with_data_and_scale_pipeline(self):
+        """A 64 KiB MX Right panel is split into two prefetched L0B stages."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[16, 256], pl.FP8E4M3FN],
+                a_s: pl.Tensor[[16, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+                b: pl.Tensor[[256, 256], pl.FP8E4M3FN],
+                b_s: pl.Tensor[[8, 256], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Tensor[[16, 256], pl.FP32],
+            ):
+                # Match model code: direct cube input leaves its source space
+                # unset until InferTileMemorySpace, which runs after AutoTile.
+                ta = pl.load(a, [0, 0], [16, 256])
+                tas = pl.load(a_s, [0, 0], [16, 8], target_memory=pl.Mem.Mat)
+                tb = pl.load(b, [0, 0], [256, 256], target_memory=pl.Mem.Mat)
+                tbs = pl.load(b_s, [0, 0], [8, 256], target_memory=pl.Mem.Mat)
+                c = pl.matmul_mx(ta, tas, tb, tbs)
+                pl.store(c, [0, 0], out)
+
+        mlir = _emit_incore_mlir(Program)
+        assert "pto.tmatmul.mx" in mlir
+        right_allocs = [
+            line for line in mlir.splitlines() if "pto.alloc_tile" in line and "loc=right" in line
+        ]
+        assert len(right_allocs) == 2
+        assert all("rows=128, cols=256" in line for line in right_allocs)
+        assert all("rows=256, cols=256" not in line for line in right_allocs)
+        right_addresses = {line.split("addr = ", 1)[1].split()[0] for line in right_allocs}
+        assert len(right_addresses) == 2, "the two K stages must use distinct L0B ping-pong buffers"
+        scale_extracts = [
+            line
+            for line in mlir.splitlines()
+            if "pto.textract" in line and "outs(" in line and "loc=scaling" in line
+        ]
+        assert len(scale_extracts) == 4
+        assert mlir.count("pto.tget_scale_addr") == 4
+        first_matmul = next(i for i, line in enumerate(mlir.splitlines()) if "pto.tmatmul.mx" in line)
+        prefix = mlir.splitlines()[:first_matmul]
+        assert sum("pto.textract" in line for line in prefix) == 6
+        assert sum("pto.tget_scale_addr" in line for line in prefix) == 2
+
     def test_nd_backing_alias_only_emits_physical_rank5_mx_views(self):
         @pl.program
         class Program:

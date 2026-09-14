@@ -186,6 +186,76 @@ class TestAutoTileMatmulL0ExplicitL0Diagnostics:
 class TestAutoTileMatmulL0KOnly:
     """K-tiling rewrites for Mat-resident tile.matmul."""
 
+    def test_mx_skinny_gemm_pipelines_data_and_scale_bundle(self):
+        """MX uses K=128 so two 32 KiB Right panels fit in A5 L0B."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 256], pl.FP8E4M3FN],
+                lhs_scale: pl.Tensor[[16, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+                rhs: pl.Tensor[[256, 256], pl.FP8E4M3FN],
+                rhs_scale: pl.Tensor[[8, 256], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [16, 256], target_memory=pl.Mem.Mat)
+                lhs_scale_mat = pl.tile.load(lhs_scale, [0, 0], [16, 8], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [256, 256], target_memory=pl.Mem.Mat)
+                rhs_scale_mat = pl.tile.load(rhs_scale, [0, 0], [8, 256], target_memory=pl.Mem.Mat)
+                result = pl.tile.matmul_mx(lhs_mat, lhs_scale_mat, rhs_mat, rhs_scale_mat)
+                out = pl.tile.store(result, [0, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 256], pl.FP8E4M3FN],
+                lhs_scale: pl.Tensor[[16, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+                rhs: pl.Tensor[[256, 256], pl.FP8E4M3FN],
+                rhs_scale: pl.Tensor[[8, 256], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [16, 256], target_memory=pl.Mem.Mat)
+                lhs_scale_mat = pl.tile.load(lhs_scale, [0, 0], [16, 8], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [256, 256], target_memory=pl.Mem.Mat)
+                rhs_scale_mat = pl.tile.load(rhs_scale, [0, 0], [8, 256], target_memory=pl.Mem.Mat)
+                result_init = pl.tile.create([16, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                for ko, (result_iter,) in pl.pipeline(0, 256, 128, init_values=(result_init,), stage=2):
+                    lhs_l0 = pl.tile.extract(lhs_mat, 0, ko, shape=[16, 128], target_memory=pl.Mem.Left)
+                    lhs_scale_l0 = pl.tile.extract(
+                        lhs_scale_mat,
+                        0,
+                        ko // 32,
+                        shape=[16, 4],
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    rhs_l0 = pl.tile.extract(rhs_mat, ko, 0, shape=[128, 256], target_memory=pl.Mem.Right)
+                    rhs_scale_l0 = pl.tile.extract(
+                        rhs_scale_mat,
+                        ko // 32,
+                        0,
+                        shape=[4, 256],
+                        target_memory=pl.Mem.RightScale,
+                    )
+                    result_acc = pl.tile.matmul_mx_acc(
+                        result_iter,
+                        lhs_l0,
+                        lhs_scale_l0,
+                        rhs_l0,
+                        rhs_scale_l0,
+                        ko == 0,
+                    )
+                    result = pl.yield_(result_acc)
+                out = pl.tile.store(result, [0, 0], out)
+                return out
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_skinny_gemm_pipelined(self):
         """16×64 @ 2048 BF16 → ChooseL0Tile picks (m=16, n=64, k=256).
 

@@ -185,18 +185,18 @@ class PassManager:
             # its ND2NZ window collapse for NZ sources so the logical window is
             # still intact here.
             passes.block_nz_tensor_views,
-            # Physicalize logical MX_A_ZZ / MX_B_NN scale tensors and their
-            # tile.load windows into A5's packed rank-5 SFractal form. This is
-            # independent from NZ blocking and owns its own offset proofs.
-            passes.block_mx_scale_tensor_views,
             # Expand non-native tile.cast (src,dst) pairs into shortest native
             # cast chains (e.g. A5 INT32→FP16 → INT32→FP32→FP16) before
             # AutoTileMatmulL0 may FIXPIPE-fold already-native f32→bf16/f16.
             passes.legalize_tile_cast,
             passes.auto_tile_matmul_l0,
             passes.canonicalize_tile_slice,
+            # Physicalize logical MX_A_ZZ / MX_B_NN scale tensors and every
+            # scale window load introduced by AutoTile into A5's packed rank-5
+            # SFractal form. Keeping this after AutoTile lets that pass rebuild
+            # legal logical tile.load windows instead of boxed Mat subviews.
+            passes.block_mx_scale_tensor_views,
             passes.infer_tile_memory_space,
-            passes.peel_matmul_mx_init_cond,
             passes.insert_mx_scale_addr,
             passes.resolve_backend_op_layouts,
             # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit
@@ -223,6 +223,11 @@ class PassManager:
             # unchanged — hence both passes run, rather than one replacing the other.
             passes.lower_pipeline_to_slots,
             passes.lower_pipeline_loops,
+            # Keep a compiler-generated MX K-loop intact until its pipeline
+            # stages have been cloned. Peeling earlier turns a two-trip,
+            # stage-2 loop into one straight-line seed plus a one-trip tail,
+            # which removes the L0A/L0B ping-pong opportunity.
+            passes.peel_matmul_mx_init_cond,
             passes.canonicalize_io_order,
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).

@@ -1,10 +1,10 @@
 # AutoTileMatmulL0 Pass
 
-针对静态 2D `tile.matmul`、`tile.matmul_acc` 与 `tile.matmul_bias` 进行 L0 切分：从当前 backend 的 L0 容量中挑选 L0 tile 形状 `(m, n, k)`，并把调用改写成一个 2 阶段流水化的 K-loop，每个迭代用 `tile.extract` 从 Mat 抽取 Left/Right 操作数。容量检查采用累加器在 L0C 中的物理占用，而不只是逻辑形状。该物理占用超过 L0c 时，本 pass 会对新的普通或带 bias 的 matmul，或前端规范的 split-K create/pipeline/store 链做 M/N 切分。
+针对静态 2D 的普通与 MX `tile.matmul`、`tile.matmul_acc` 与 `tile.matmul_bias` 进行 L0 切分：从当前 backend 的 L0 容量中挑选 L0 tile 形状 `(m, n, k)`，并把调用改写成一个 2 阶段流水化的 K-loop，每个迭代用 `tile.extract` 从 Mat 抽取操作数。MX 改写当前仅覆盖 K-only 切分：使用 64 元素的 K 对齐，让完整 `[M, K/32]` 与 `[K/32, N]` scale tile 常驻 Mat，再把匹配的 K 窗口直接 extract 到 `LeftScale` / `RightScale`，并把 data/scale 传输作为一个操作数 bundle 进入流水线。容量检查采用累加器在 L0C 中的物理占用，而不只是逻辑形状。该物理占用超过 L0c 时，本 pass 会对新的普通或带 bias 的 matmul，或前端规范的 split-K create/pipeline/store 链做 M/N 切分；需要 M/N 切分的 MX 调用保持不变。
 
 ## 概览
 
-由 `ConvertTensorToTileOps` + [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) 生成的 Mat-resident matmul 通常带有完整的 `(M, N, K)` 操作数形状——几乎一定大于 cube unit 的 L0a/L0b/L0c 容量。本 pass 选取一个能放进 L0 的 `(m, n, k)`，并把该 matmul 改写成一个 K-loop：循环体内用 `tile.extract` 把 `[m, k]` 与 `[k, n]` 的切片送入 `Left` / `Right`，并把累加器写入 `Acc`-resident 的 iter-arg。该循环带有 `ForKind::Pipeline` 与 `pipeline_stages=2`，使下游 [`LowerPipelineLoops`](31-lower_pipeline_loops.md) 可对每次迭代的操作数 `tile.extract` 生成 2 级 ping-pong。
+由 `ConvertTensorToTileOps` + [`FlattenTileNdTo2D`](14-flatten_tile_nd_to_2d.md) 生成的 Mat-resident matmul 通常带有完整的 `(M, N, K)` 操作数形状——几乎一定大于 cube unit 的 L0a/L0b/L0c 容量。本 pass 选取一个能放进 L0 的 `(m, n, k)`，并把该 matmul 改写成一个 K-loop：循环体内用 `tile.extract` 把 `[m, k]` 与 `[k, n]` 的切片送入 `Left` / `Right`，并把累加器写入 `Acc`-resident 的 iter-arg。对 MX 操作，本 pass 把每个单次使用的直接 scale load 保留为一块常驻 Mat 的完整 tile，再把 `ko/32` 窗口直接 extract 到 `LeftScale` / `RightScale`，并发出匹配的 MX accumulate 操作。随后 [`BlockMxScaleTensorViews`](16-block_mx_scale_tensor_views.md) 只需把保留的完整 scale load 物理化一次；K-loop 不再为每个窗口重建一次 GM load。scale 操作数不是单次使用的直接 load 时，MX 调用保持不变。该循环带有 `ForKind::Pipeline` 与 `pipeline_stages=2`，使下游 [`LowerPipelineLoops`](31-lower_pipeline_loops.md) 可对完整的 data/scale 操作数 bundle 生成 2 级 ping-pong。例如，占满 A5 L0B 64 KiB 的 FP8 `Right[256, 256]` 面板会被分为两个流水化的 `Right[128, 256]` 面板，从而在不改动公开 matmul API 的前提下容纳两个物理 L0B stage。
 
 已经放入 `Left` 或 `Right` 的操作数表示程序员手工做出的 L0 调度决策，因此 AutoTile 不会静默替换或再次切分它；合法的手工 tile 保持不变。若一个静态操作数自身就超过 backend 对应空间的容量——例如 FP16 `Right[256, 256]` 需要 131072 字节，而 L0B 只有 65536 字节——本 pass 会在该操作数处报错，给出变量名、物理形状、dtype、所需/可用字节数以及两种修复方式：让操作数保留在 `Mat` 并直接传给 matmul，由 AutoTile 选择合法的 L0 tile；或手工抽取更小的 L0 tile。这个更早、面向具体算子的错误也避免了随后出现无关的 MemoryReuse 回退 warning。
 
@@ -16,7 +16,7 @@
 
 **Fits-L0c 链式 cast-fold（cast 折叠）。** 当链式 matmul 的 `[M, N]` 结果*能放进* L0c（无需 M/N 切分），但经一次降精度后再喂给第二个 matmul —— `c = matmul(a, b); cb = cast(c, bf16); d = matmul(cb, e)` —— 消费者需要 bf16 中间值位于 **Mat**（L1）。若不处理，`tile.cast` 会 lower 成 **Vector** 的 `pto.tcvt`（一次 cube→vector→cube 往返，在 `[128, 128]` 形状下会撑爆 Vec buffer）。本 pass 改为把 cast 折叠成**一次整窗**的 Acc→Mat `tile.assemble` —— 与超大 Mat-scratch 路径用的是同一个 `MatScratchPlacer`，只是单次 `PlaceAt` 于偏移 `(0, 0)` 而非一个网格 —— 从而让降精度留在 cube 上，作为 FIXPIPE 的 `pto.tinsert`。这是一个与 K 切分无关的 cast-peephole：无论 producer 是保持整体（`k == K`）还是被 K-loop 切分（`k < K`）都会触发，且仅当 cast 结果的每一处使用都是矩阵乘操作数时才折叠（非矩阵乘消费者保留 Vector cast）。折叠还严格对齐 FIXPIPE 能复现的能力——即 **`f32 → bf16/f16`** 降精度、且舍入模式为 **`rint`**（就近、**取偶**），这是 FIXPIPE 固定的 tie 规则——A2/A3 与 A5 一致（pto-isa 的 CPU 参考实现用 `std::bfloat16_t` 降精度、无 arch 分支，且 `pto.tinsert` 不带 `rmode`；两个 backend 仅 scratch dtype 不同，舍入相同）。若源不是 `f32`（例如 `int32` 矩阵乘结果，需要带 scale 的 *dequant*）、为 cast 默认的 **`round`** 模式（就近、**远离零**），或为有方向/截断的模式（`none`/`floor`/`ceil`/`trunc`/`odd`），则都保留 Vector `pto.tcvt`——只有它才会遵循所请求的 `rmode`——并由本 pass 发出指向 `mode="rint"` 的 `PH-AT-010` 提示。同一道 gate（`CastFoldableToFixpipeMat`）也用于下面的超大 Mat-scratch 折叠。超大结果不会到达这个 peephole——它们的 cast 由上面的 M/N 路径逐子块折叠。
 
-**Pipeline 位置**：紧跟在 [`LegalizeTileCast`](17-legalize_tile_cast.md) 之后，先于 [`CanonicalizeTileSlice`](19-canonicalize_tile_slice.md) 与 [`InferTileMemorySpace`](20-infer_tile_memory_space.md)。此时 tile op 已是 2D，但 memory space 尚未推断。
+**Pipeline 位置**：紧跟在 [`LegalizeTileCast`](17-legalize_tile_cast.md) 之后，先于 [`CanonicalizeTileSlice`](19-canonicalize_tile_slice.md)、[`BlockMxScaleTensorViews`](16-block_mx_scale_tensor_views.md) 与 [`InferTileMemorySpace`](20-infer_tile_memory_space.md)。此时 tile op 与 MX scale load 仍是逻辑 2D 值，memory space 尚未推断。
 
 **前置属性 (Required)**：`SSAForm`、`SplitIncoreOrch`、`IncoreTileOps`、`TileOps2D`、`NormalizedStmtStructure`。
 
@@ -338,6 +338,7 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | 输出超过 L0c、被**完全作为矩阵乘操作数**消费（链式 matmul）、且 `[M, N]` scratch 能放进 Mat/L1 的普通 `tile.matmul` | M/N 切分到 L1/**Mat** scratch（逐子块 Acc→Mat `tile.assemble`），保留在片上供消费者读取（Mat-scratch） |
 | 输出*能放进* L0c、经 `tile.cast(c, bf16/f16)` 降精度、且 cast 结果被**完全作为矩阵乘操作数**消费（链式）的 `tile.matmul` | cast-fold：一次整窗 Acc→Mat `tile.assemble`（cube `pto.tinsert`），并删除 cast —— 无 Vector `pto.tcvt` 往返 |
 | 静态 2D、右操作数为 Mat（左为 Mat 或 PV 的 Vec）、输出可放进 L0c 的 `tile.matmul_acc` | 改写为 2 阶段流水化 K-loop（循环体统一为 `matmul_acc`） |
+| scale 来自单次使用的直接逻辑 load、输出可放进 L0c 且 K 需要切分的 `tile.matmul_mx`、`tile.matmul_mx_acc` 或 `tile.matmul_mx_bias` | 改写为 data/scale 窗口配对的 2 阶段流水化 K-loop；MX 的 M/N 切分仍延后处理 |
 | 同一调用带调用方 `init_cond`（4 操作数） | 同样做 K 切分：循环体携带 `init_cond and ko == 0`，单个直线完整块原样携带 `init_cond`，剥离出的尾块保持 3 操作数 |
 | 规范 split-K `create([M,N])` → pipeline（首块 `matmul` + 后续循环携带 `matmul_acc`，或单个谓词化的 `matmul_acc(acc, lhs, rhs, <循环变量> == 0)`）→ 单个 2D store，且物理输出超过 L0c | 在 K-loop 外做 M/N 切分；每个 `[m,n]` 子块完成全部 K 归约后再 store |
 | 右（B）操作数为 Vec 的 `tile.matmul[_acc]` | 跳过（B 操作数必须从 L1 送入 L0B） |
@@ -345,8 +346,8 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | 静态 Mat 矩阵操作数与仅使用一次、且到调用之间只有同层 load 的 Mat-resident bias load 的 `tile.matmul_bias`，输出超过 L0c，且只有一次 direct store 或只被后续矩阵乘操作数使用 | 用逐 N 块 tensor→Mat 窗口 load 替换完整 load 后做 M/N 切分；使用与新 `tile.matmul` 相同的 direct-GM 或 Mat-scratch 放置 |
 | 左操作数为 Vec，或已位于 Bias 且需要 N 切分的 `tile.matmul_bias` | 跳过；新路径要求原生 Mat 矩阵操作数，且不能发出 Bias-to-Bias 子窗口抽取 |
 | 已经是 L0 大小（`(m, n, k) == (M, N, K)`）的 matmul | 不动 |
-| 输出超过 L0c 但 M/N 放置不适用——非规范的独立 `matmul_acc`、Vec 左操作数、非矩阵乘操作数消费者、或 `[M, N]` 超过 Mat/L1 的链式 matmul scratch | 以 `PerfHint`（`PH-AT-006`）跳过 |
-| `K` 不是 cube 分形 16 的倍数 | 以 `PerfHint`（`PH-AT-007`）跳过——不存在分形对齐的 K 切分 |
+| 输出超过 L0c 但 M/N 放置不适用——包括 MX、非规范的独立 `matmul_acc`、Vec 左操作数、非矩阵乘操作数消费者、或 `[M, N]` 超过 Mat/L1 的链式 matmul scratch | 以 `PerfHint`（`PH-AT-006`）跳过 |
+| `K` 不是当前操作所需 K 对齐的倍数（普通为 16，MX 为 64） | 以 `PerfHint`（`PH-AT-007`）跳过——不存在合法对齐的 K 切分 |
 | 子字节 dtype | 以 `PerfHint` 跳过 |
 | 非 InCore 函数（Orchestration、Opaque） | 不动 |
 
@@ -358,8 +359,8 @@ L0/Mat 容量与 fractal 对齐都来自当前 `BackendHandler`。Pass 优先从
 | ---- | ---- |
 | `PH-AT-003` | 操作数或累加器使用了子字节 dtype |
 | `PH-AT-005` | `ChooseL0Tile` 拒绝了该配置 |
-| `PH-AT-006` | 输出超过 L0c，但没有受支持的 M/N 放置。对 `tile.matmul_acc` 而言，这特指位于规范 create/split-K-pipeline/store 链之外、由调用方持有的累加器，或者位于该链之内、但 `init_cond` 不是对循环归纳变量的首块判定的 4 操作数调用。该提示也覆盖 Vec 左操作数、需要 N 子窗口的已在 Bias 中的 `tile.matmul_bias` 源、并非完全作为矩阵乘操作数消费的片上结果、或超过 Mat/L1 容量的链式 matmul scratch。Issue #2232 的规范 split-K 情形不会发出此提示。 |
-| `PH-AT-007` | 非 16 对齐的 `K`——不存在分形对齐的 K 切分（任何剥离尾块或整段 K 块的列数都非分形），故该 matmul 保持不变 |
+| `PH-AT-006` | 输出超过 L0c，但没有受支持的 M/N 放置；MX 的 M/N 切分仍延后处理。对普通 `tile.matmul_acc` 而言，这特指位于规范 create/split-K-pipeline/store 链之外、由调用方持有的累加器，或者位于该链之内、但 `init_cond` 不是对循环归纳变量的首块判定的 4 操作数调用。该提示也覆盖 Vec 左操作数、需要 N 子窗口的已在 Bias 中的 `tile.matmul_bias` 源、并非完全作为矩阵乘操作数消费的片上结果、或超过 Mat/L1 容量的链式 matmul scratch。Issue #2232 的规范 split-K 情形不会发出此提示。 |
+| `PH-AT-007` | `K` 不满足当前操作所需对齐（普通为 16，MX 为 64），因此不存在合法的 K 切分，该 matmul 保持不变 |
 | `PH-AT-008` | `ChooseL0Tile` 返回了 fallback 配置并附带 perf hint |
 | `PH-AT-009` | 该 backend 需要 bf16/f16 的片上 Mat scratch（如 Ascend910B），但超大链式 matmul 的中间结果是 f32——在消费 matmul 之前把 matmul 结果 cast 成 bf16/f16；否则留在延后路径上 |
 | `PH-AT-010` | fits-L0c 链式 matmul 的 cast 无法折叠进 cube FIXPIPE（FIXPIPE 仅以就近取偶把 `f32 → bf16/f16` 降精度）：源非 f32，或舍入模式不是 `rint`（例如默认的 `round`，或 `floor`/`ceil`/`trunc`/`odd`/`none`）。保留在 Vector `pto.tcvt` 路径——一次 cube→vector→cube 往返，在较大 `[M, N]` 下可能撑爆 Vec buffer。对 f32 结果使用 `mode="rint"` 即可留在 cube 上。 |
