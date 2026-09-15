@@ -2378,12 +2378,18 @@ class ForbidAliasCollector : public IRVisitor {
         // in place: element i is read at i*in_bytes but written at i*out_bytes,
         // so with out_bytes > in_bytes the write cursor outruns the read cursor
         // and clobbers input elements not yet converted -> corrupt results.
-        // Narrowing / same-width casts are in-place-safe and keep the cross-dtype
-        // reuse the removed gate enables, so forbid only the widening direction.
+        // Packed FP4 is unsafe in either direction: the f4E2M1x2 output cursor
+        // addresses pairs of logical elements and A5 TCVT may overwrite a later
+        // BF16 input vector before it is consumed.  This is observable for wide
+        // BF16 -> FP4 rows even though ordinary narrowing casts are safe.
         if (IsOp(call, "tile.cast") && !call->args_.empty()) {
           auto out_t = As<TileType>(op->var_->GetType());
           auto in_t = As<TileType>(call->args_[0]->GetType());
-          if (out_t && in_t && out_t->dtype_.GetBit() > in_t->dtype_.GetBit()) forbid_arg(0);
+          if (out_t && in_t &&
+              (out_t->dtype_ == DataType::FP4 || in_t->dtype_ == DataType::FP4 ||
+               out_t->dtype_.GetBit() > in_t->dtype_.GetBit())) {
+            forbid_arg(0);
+          }
         }
         RecordForOutput(op->var_, forbidden_inputs);
         // tile.transpose is registered not_inplace_safe(), so its output is

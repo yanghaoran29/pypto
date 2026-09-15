@@ -11,7 +11,7 @@
 
 /**
  * @file reinterpret_view_semantics.h
- * @brief Shared byte-preserving shape inference for tensor/tile reinterpret views
+ * @brief Shared storage-preserving shape inference for tensor/tile reinterpret views
  */
 
 #ifndef PYPTO_IR_REINTERPRET_VIEW_SEMANTICS_H_
@@ -36,7 +36,7 @@
 
 namespace pypto::ir::reinterpret_view_semantics {
 
-/** Result of resolving a byte-preserving reinterpret view. */
+/** Result of resolving a storage-preserving reinterpret view. */
 struct ReinterpretViewPlan {
   std::vector<ExprPtr> shape;
   std::vector<ExprPtr> valid_shape;
@@ -135,18 +135,18 @@ inline std::optional<int64_t> StaticElementCount(const std::vector<ExprPtr>& sha
   return count;
 }
 
-inline ExprPtr ScaleExtent(const ExprPtr& extent, size_t src_bytes, size_t dst_bytes,
+inline ExprPtr ScaleExtent(const ExprPtr& extent, size_t src_bits, size_t dst_bits,
                            const std::string& extent_name, size_t axis, const std::string& op_name,
                            const Span& span) {
-  INTERNAL_CHECK_SPAN(src_bytes != 0 && dst_bytes != 0, span)
-      << "Internal error: " << op_name << " dtype byte widths must be nonzero, got source=" << src_bytes
-      << " and target=" << dst_bytes;
-  if (src_bytes == dst_bytes) return extent;
+  INTERNAL_CHECK_SPAN(src_bits != 0 && dst_bits != 0, span)
+      << "Internal error: " << op_name << " dtype bit widths must be nonzero, got source=" << src_bits
+      << " and target=" << dst_bits;
+  if (src_bits == dst_bits) return extent;
 
-  if (src_bytes > dst_bytes) {
-    CHECK_SPAN(src_bytes % dst_bytes == 0, span)
-        << op_name << " cannot represent dtype byte ratio " << src_bytes << ":" << dst_bytes;
-    const int64_t factor = static_cast<int64_t>(src_bytes / dst_bytes);
+  if (src_bits > dst_bits) {
+    CHECK_SPAN(src_bits % dst_bits == 0, span)
+        << op_name << " cannot represent dtype bit ratio " << src_bits << ":" << dst_bits;
+    const int64_t factor = static_cast<int64_t>(src_bits / dst_bits);
     if (auto value = As<ConstInt>(extent)) {
       int64_t scaled = 0;
       CHECK_SPAN(!__builtin_mul_overflow(value->value_, factor, &scaled), span)
@@ -157,9 +157,9 @@ inline ExprPtr ScaleExtent(const ExprPtr& extent, size_t src_bytes, size_t dst_b
     return std::make_shared<Mul>(extent, factor_expr, DataType::INDEX, span);
   }
 
-  CHECK_SPAN(dst_bytes % src_bytes == 0, span)
-      << op_name << " cannot represent dtype byte ratio " << src_bytes << ":" << dst_bytes;
-  const int64_t divisor = static_cast<int64_t>(dst_bytes / src_bytes);
+  CHECK_SPAN(dst_bits % src_bits == 0, span)
+      << op_name << " cannot represent dtype bit ratio " << src_bits << ":" << dst_bits;
+  const int64_t divisor = static_cast<int64_t>(dst_bits / src_bits);
   auto value = As<ConstInt>(extent);
   CHECK_SPAN(value, span) << op_name << " cannot prove that dynamic " << extent_name << " dimension " << axis
                           << " is divisible by " << divisor
@@ -170,13 +170,13 @@ inline ExprPtr ScaleExtent(const ExprPtr& extent, size_t src_bytes, size_t dst_b
   return std::make_shared<ConstInt>(value->value_ / divisor, value->dtype(), extent->span_);
 }
 
-inline std::optional<ExprPtr> TryScaleExtent(const ExprPtr& extent, size_t src_bytes, size_t dst_bytes,
+inline std::optional<ExprPtr> TryScaleExtent(const ExprPtr& extent, size_t src_bits, size_t dst_bits,
                                              const Span& span) {
-  if (src_bytes == 0 || dst_bytes == 0) return std::nullopt;
-  if (src_bytes == dst_bytes) return extent;
-  if (src_bytes > dst_bytes) {
-    if (src_bytes % dst_bytes != 0) return std::nullopt;
-    const int64_t factor = static_cast<int64_t>(src_bytes / dst_bytes);
+  if (src_bits == 0 || dst_bits == 0) return std::nullopt;
+  if (src_bits == dst_bits) return extent;
+  if (src_bits > dst_bits) {
+    if (src_bits % dst_bits != 0) return std::nullopt;
+    const int64_t factor = static_cast<int64_t>(src_bits / dst_bits);
     if (auto value = As<ConstInt>(extent)) {
       int64_t scaled = 0;
       if (__builtin_mul_overflow(value->value_, factor, &scaled)) return std::nullopt;
@@ -186,8 +186,8 @@ inline std::optional<ExprPtr> TryScaleExtent(const ExprPtr& extent, size_t src_b
     return std::make_shared<Mul>(extent, factor_expr, DataType::INDEX, span);
   }
 
-  if (dst_bytes % src_bytes != 0) return std::nullopt;
-  const int64_t divisor = static_cast<int64_t>(dst_bytes / src_bytes);
+  if (dst_bits % src_bits != 0) return std::nullopt;
+  const int64_t divisor = static_cast<int64_t>(dst_bits / src_bits);
   if (auto value = As<ConstInt>(extent)) {
     if (value->value_ % divisor != 0) return std::nullopt;
     return std::make_shared<ConstInt>(value->value_ / divisor, value->dtype(), extent->span_);
@@ -206,57 +206,57 @@ inline std::optional<ExprPtr> TryScaleExtent(const ExprPtr& extent, size_t src_b
 }
 
 inline std::vector<ExprPtr> BuildAutoShape(const std::vector<ExprPtr>& source, size_t contiguous_axis,
-                                           size_t src_bytes, size_t dst_bytes, const std::string& shape_name,
+                                           size_t src_bits, size_t dst_bits, const std::string& shape_name,
                                            const std::string& op_name, const Span& span) {
   CHECK_SPAN(!source.empty(), span) << op_name << " requires rank >= 1";
   CHECK_SPAN(contiguous_axis < source.size(), span)
       << op_name << " contiguous axis " << contiguous_axis << " is out of range for rank " << source.size();
   std::vector<ExprPtr> result = source;
   result[contiguous_axis] =
-      ScaleExtent(source[contiguous_axis], src_bytes, dst_bytes, shape_name, contiguous_axis, op_name, span);
+      ScaleExtent(source[contiguous_axis], src_bits, dst_bits, shape_name, contiguous_axis, op_name, span);
   return result;
 }
 
 inline std::optional<std::vector<ExprPtr>> TryBuildAutoShape(const std::vector<ExprPtr>& source,
-                                                             size_t contiguous_axis, size_t src_bytes,
-                                                             size_t dst_bytes, const Span& span) {
+                                                             size_t contiguous_axis, size_t src_bits,
+                                                             size_t dst_bits, const Span& span) {
   if (source.empty() || contiguous_axis >= source.size()) return std::nullopt;
-  auto scaled = TryScaleExtent(source[contiguous_axis], src_bytes, dst_bytes, span);
+  auto scaled = TryScaleExtent(source[contiguous_axis], src_bits, dst_bits, span);
   if (!scaled.has_value()) return std::nullopt;
   std::vector<ExprPtr> result = source;
   result[contiguous_axis] = *scaled;
   return result;
 }
 
-inline void CheckExplicitByteSize(const std::vector<ExprPtr>& source_shape,
-                                  const std::vector<ExprPtr>& target_shape, size_t src_bytes,
-                                  size_t dst_bytes, const std::string& op_name, const Span& span) {
+inline void CheckExplicitStorageSize(const std::vector<ExprPtr>& source_shape,
+                                     const std::vector<ExprPtr>& target_shape, size_t src_bits,
+                                     size_t dst_bits, const std::string& op_name, const Span& span) {
   auto source_count = StaticElementCount(source_shape, "source shape", op_name, span);
   auto target_count = StaticElementCount(target_shape, "target shape", op_name, span);
   CHECK_SPAN(source_count.has_value() && target_count.has_value(), span)
       << op_name
-      << " cannot prove byte-size equality for an explicit shape with dynamic dimensions; omit shape to "
+      << " cannot prove storage-size equality for an explicit shape with dynamic dimensions; omit shape to "
          "use layout-aware auto detection, or provide fully static shapes";
 
-  int64_t source_bytes = 0;
-  int64_t target_bytes = 0;
-  CHECK_SPAN(!__builtin_mul_overflow(*source_count, static_cast<int64_t>(src_bytes), &source_bytes), span)
-      << op_name << " source byte size overflows int64";
-  CHECK_SPAN(!__builtin_mul_overflow(*target_count, static_cast<int64_t>(dst_bytes), &target_bytes), span)
-      << op_name << " target byte size overflows int64";
-  CHECK_SPAN(source_bytes == target_bytes, span)
-      << op_name << " requires equal source and target byte sizes, but source has " << source_bytes
-      << " bytes and target has " << target_bytes << " bytes";
+  int64_t source_bits = 0;
+  int64_t target_bits = 0;
+  CHECK_SPAN(!__builtin_mul_overflow(*source_count, static_cast<int64_t>(src_bits), &source_bits), span)
+      << op_name << " source storage size overflows int64";
+  CHECK_SPAN(!__builtin_mul_overflow(*target_count, static_cast<int64_t>(dst_bits), &target_bits), span)
+      << op_name << " target storage size overflows int64";
+  CHECK_SPAN(source_bits == target_bits, span)
+      << op_name << " requires equal source and target storage sizes, but source has " << source_bits
+      << " bits and target has " << target_bits << " bits";
 }
 
 }  // namespace detail
 
 /**
- * Resolve an exact-byte reinterpretation, including layout-aware auto shape and valid shape.
+ * Resolve an exact-storage reinterpretation, including layout-aware auto shape and valid shape.
  *
  * An explicit arbitrary shape is accepted only for a fully-valid source. A partially-valid
  * rectangle can only be represented by the automatically derived shape, whose physically
- * contiguous axis is scaled by the dtype byte ratio.
+ * contiguous axis is scaled by the dtype storage-bit ratio.
  */
 inline ReinterpretViewPlan Resolve(const std::vector<ExprPtr>& source_shape,
                                    const std::vector<ExprPtr>& source_valid_shape, DataType source_dtype,
@@ -267,26 +267,31 @@ inline ReinterpretViewPlan Resolve(const std::vector<ExprPtr>& source_shape,
                         (source_dtype == DataType::FP8E4M3FN && target_dtype == DataType::INT8) ||
                         (source_dtype == DataType::UINT8 && target_dtype == DataType::FP8E8M0) ||
                         (source_dtype == DataType::FP8E8M0 && target_dtype == DataType::UINT8);
+  const bool packed_fp4_alias =
+      (source_dtype == DataType::FP4 && target_dtype == DataType::UINT8) ||
+      (source_dtype == DataType::UINT8 && target_dtype == DataType::FP4);
   const bool uses_unsupported_fp8 =
       (!IsSupportedDType(source_dtype) && source_dtype.IsFloat() && source_dtype.GetBit() == 8) ||
       (!IsSupportedDType(target_dtype) && target_dtype.IsFloat() && target_dtype.GetBit() == 8);
   CHECK_SPAN(mx_alias || !uses_unsupported_fp8, span)
       << op_name << " only supports FP8 reinterpretation for INT8<->FP8E4M3FN and UINT8<->FP8E8M0";
-  CHECK_SPAN(IsSupportedDType(source_dtype) || mx_alias, span)
+  CHECK_SPAN(IsSupportedDType(source_dtype) || mx_alias || packed_fp4_alias, span)
       << op_name << " does not support source dtype " << source_dtype.ToString()
-      << "; FP8 aliases are limited to INT8<->FP8E4M3FN and UINT8<->FP8E8M0";
-  CHECK_SPAN(IsSupportedDType(target_dtype) || mx_alias, span)
+      << "; low-precision aliases are limited to INT8<->FP8E4M3FN, UINT8<->FP8E8M0, and "
+         "UINT8<->FP4";
+  CHECK_SPAN(IsSupportedDType(target_dtype) || mx_alias || packed_fp4_alias, span)
       << op_name << " does not support target dtype " << target_dtype.ToString()
-      << "; FP8 aliases are limited to INT8<->FP8E4M3FN and UINT8<->FP8E8M0";
+      << "; low-precision aliases are limited to INT8<->FP8E4M3FN, UINT8<->FP8E8M0, and "
+         "UINT8<->FP4";
   CHECK_SPAN(source_dtype != target_dtype, span)
       << op_name << " requires source and target dtypes to differ; use reshape/view for shape-only changes";
   detail::ValidatePhysicalShape(source_shape, "source shape", op_name, span);
   detail::ValidateValidShape(source_valid_shape, source_shape, op_name, span);
 
-  const size_t src_bytes = source_dtype.GetByte();
-  const size_t dst_bytes = target_dtype.GetByte();
+  const size_t src_bits = source_dtype.GetBit();
+  const size_t dst_bits = target_dtype.GetBit();
   std::optional<std::vector<ExprPtr>> auto_shape =
-      detail::TryBuildAutoShape(source_shape, contiguous_axis, src_bytes, dst_bytes, span);
+      detail::TryBuildAutoShape(source_shape, contiguous_axis, src_bits, dst_bits, span);
 
   std::vector<ExprPtr> target_shape;
   if (requested_shape.has_value()) {
@@ -295,13 +300,13 @@ inline ReinterpretViewPlan Resolve(const std::vector<ExprPtr>& source_shape,
     const bool matches_auto =
         auto_shape.has_value() && tile_view_semantics::ShapeExprListsEquivalent(target_shape, *auto_shape);
     if (!matches_auto) {
-      detail::CheckExplicitByteSize(source_shape, target_shape, src_bytes, dst_bytes, op_name, span);
+      detail::CheckExplicitStorageSize(source_shape, target_shape, src_bits, dst_bits, op_name, span);
     }
   } else {
     // Use the diagnostic-producing path when automatic widening is not provable.
     target_shape = auto_shape.has_value() ? *auto_shape
-                                          : detail::BuildAutoShape(source_shape, contiguous_axis, src_bytes,
-                                                                   dst_bytes, "shape", op_name, span);
+                                          : detail::BuildAutoShape(source_shape, contiguous_axis, src_bits,
+                                                                   dst_bits, "shape", op_name, span);
   }
 
   const bool has_explicit_valid = !source_valid_shape.empty();
@@ -312,7 +317,7 @@ inline ReinterpretViewPlan Resolve(const std::vector<ExprPtr>& source_shape,
   if (requested_shape.has_value() && is_partial) {
     if (!auto_shape.has_value()) {
       auto_shape =
-          detail::BuildAutoShape(source_shape, contiguous_axis, src_bytes, dst_bytes, "shape", op_name, span);
+          detail::BuildAutoShape(source_shape, contiguous_axis, src_bits, dst_bits, "shape", op_name, span);
     }
     CHECK_SPAN(tile_view_semantics::ShapeExprListsEquivalent(target_shape, *auto_shape), span)
         << op_name
@@ -321,7 +326,7 @@ inline ReinterpretViewPlan Resolve(const std::vector<ExprPtr>& source_shape,
   }
 
   std::vector<ExprPtr> target_valid =
-      is_partial ? detail::BuildAutoShape(effective_valid, contiguous_axis, src_bytes, dst_bytes,
+      is_partial ? detail::BuildAutoShape(effective_valid, contiguous_axis, src_bits, dst_bits,
                                           "valid_shape", op_name, span)
                  : target_shape;
   return ReinterpretViewPlan{std::move(target_shape), std::move(target_valid)};

@@ -2009,14 +2009,15 @@ def reinterpret_view(
     *,
     shape: Sequence[IntLike] | None = None,
 ) -> Tensor:
-    """Reinterpret a tensor over the same bytes with a different dtype.
+    """Reinterpret a tensor over the same storage with a different dtype.
 
     Args:
         data: Input tensor.
         dtype: Target element dtype, which must differ from the source dtype.
-        shape: Optional byte-equivalent target shape. When omitted, the
+        shape: Optional storage-equivalent target shape. When omitted, the
             physically contiguous dimension is scaled according to the
-            source/target dtype byte ratio.
+            source/target dtype bit ratio. Packed FP4 and UINT8 may alias as
+            two logical FP4 values per UINT8 carrier byte.
 
     Returns:
         Tensor wrapping the zero-copy reinterpret-view operation.
