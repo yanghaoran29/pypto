@@ -1345,7 +1345,7 @@ def quant_mx(
     group_axis: int,
     dtype: DataType = DataType.FP8E4M3FN,
 ) -> tuple[Tile, Tile]:
-    """MXFP8 block-32 dynamic quantization with PTOAS ``grpAxis`` selection.
+    """MX block-32 dynamic quantization with PTOAS ``grpAxis`` selection.
 
     ``group_axis`` is required and must be ``0`` or ``1`` (same meaning as
     PTOAS ``#pto<mx_group_axis axis*>``). Axis 1 is the A-side ``[M, K]`` path;
@@ -1353,30 +1353,32 @@ def quant_mx(
     ``[K, N]`` before quantization). GM ``TensorLayout.MX_*`` is only for
     tensor / ``tensor.view`` annotations, not this tile op.
 
-    This release supports **MXFP8 only** (``dtype=FP8E4M3FN``). MXFP4 is out of
-    scope for this PR.
+    ``dtype=FP8E4M3FN`` (default) is MXFP8. ``dtype=FP4`` is MXFP4 E2M1 with
+    logical nibble shapes; PTOAS emits packed ``!pto.f4E2M1x2``. MXFP4 accepts
+    FP16/BF16 sources only (not FP32). Scale is FP8E8M0 in both cases.
 
     Args:
-        src: Source tile (FP16/FP32/BF16, 2D).
+        src: Source tile (2D). MXFP8: FP16/FP32/BF16. MXFP4: FP16/BF16.
             ``group_axis=1``: ``[M, K]`` with ``M%16==0``, ``K%64==0``.
             ``group_axis=0``: ``[N, K]`` with ``N%32==0``, ``K%64==0``.
         group_axis: PTOAS grouping axis — ``1`` (A-side) or ``0`` (B-side).
-        dtype: Must be ``FP8E4M3FN`` (default).
+        dtype: ``FP8E4M3FN`` (MXFP8, default) or ``FP4`` (MXFP4).
 
     Returns:
         ``group_axis=1``: ``(quant[M,K], scale[M,K/32])`` row/row ZZ scale.
         ``group_axis=0``: ``(quant[K,N], scale[K/32,N])`` — data transposed to
-        Cube RHS layout; scale col/col NN.
+        Cube RHS layout; scale col/col NN. Quant dtype matches ``dtype``.
 
     Note:
         On Ascend950, ``quant_mx`` and ``matmul_mx`` may share one InCore mixed
         task. The compiler carries both generated results over V2C; the
-        FP8E8M0 scale keeps its logical MX scale layout.
+        FP8E8M0 scale keeps its logical MX scale layout. Native FP4×FP4
+        ``matmul_mx`` is still unsupported; cast FP4 lhs to FP8E4M3FN first.
     """
     if group_axis not in (0, 1):
         raise ValueError(f"pl.quant_mx group_axis must be 0 or 1, but got {group_axis!r}")
-    if dtype != DataType.FP8E4M3FN:
-        raise ValueError(f"pl.quant_mx supports only FP8E4M3FN (MXFP8), but got {dtype}")
+    if dtype not in (DataType.FP8E4M3FN, DataType.FP4):
+        raise ValueError(f"pl.quant_mx dtype must be FP8E4M3FN or FP4, but got {dtype}")
     call_expr = _ir_ops.tquant_mx(src.unwrap(), dtype=dtype, group_axis=group_axis)
     span = call_expr.span
     return (

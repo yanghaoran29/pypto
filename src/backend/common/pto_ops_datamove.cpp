@@ -1014,8 +1014,11 @@ struct StaticValidTileView {
 // pl.set_validshape / runtime ctx_len work for ordinary Vec ops). That ABI
 // cannot satisfy TQUANT/X2ZZ, so at these instruction sites only we insert a
 // zero-copy pto.treshape whose *result type* carries the static valid extents
-// from GetViewTileBufTypeStringFromTileType. Do not drop this bridge without a
-// matching PTOAS change that accepts dynamic-valid tile_bufs on those ops.
+// from GetViewTileBufTypeStringFromTileType.
+//
+// Exception: Vec FP4 destinations. PTOAS treshape rejects !pto.f4E2M1x2, so
+// PrepareTupleOutputs emits those allocs with static v_row/v_col already in
+// the type (no valid operands). Reuse that SSA instead of reshaping.
 static StaticValidTileView EmitStaticValidTileView(codegen::PTOCodegen& codegen, const ir::ExprPtr& arg,
                                                    const std::string& name_hint) {
   auto tile_type = As<ir::TileType>(arg->GetType());
@@ -1029,6 +1032,12 @@ static StaticValidTileView EmitStaticValidTileView(codegen::PTOCodegen& codegen,
       static_type.find("v_row=?") == std::string::npos && static_type.find("v_col=?") == std::string::npos,
       arg->span_)
       << "Internal error: grouped MX operand must carry static valid dimensions";
+  if (source_type == static_type) {
+    return {source, static_type};
+  }
+  INTERNAL_CHECK_SPAN(tile_type->dtype_ != DataType::FP4, arg->span_)
+      << "Internal error: Vec FP4 MX operand must be allocated with static valid extents; "
+         "pto.treshape does not support !pto.f4E2M1x2";
   const std::string view = codegen.NewNamedTemp(name_hint);
   codegen.RegisterTileBufType(view, static_type);
   codegen.Emit(view + " = pto.treshape " + source + " : " + source_type + " -> " + static_type);
@@ -1038,7 +1047,7 @@ static StaticValidTileView EmitStaticValidTileView(codegen::PTOCodegen& codegen,
 // Helper for tile.tquant_mx_raw (value-returning MX block-32 quant) → pto.tquant.mx:
 //   pto.tquant.mx ins(src : src_ty)
 //                 outs(dst, scale, max, scaling : dst_ty, scale_ty, max_ty, scaling_ty)
-//                 {quant_type = #pto<quant_type MXFP8>, grpAxis = ...}
+//                 {quant_type = #pto<quant_type MXFP8|MXFP4_E2M1>, grpAxis = ...}
 //
 // Op surface: 3 inputs (src, max_ws, scaling_ws) / TupleType{INT8 dst, UINT8 exp}.
 // DPS dst/exp buffers are bound by downstream `tq_dst = raw[0]` / `tq_exp = raw[1]`
@@ -1049,9 +1058,10 @@ static std::string MakeTQuantMxCodegenPTO(const CallPtr& op, codegen::CodegenBas
       << "tile.tquant_mx_raw requires src, max, and scaling workspaces, but got " << op->args_.size();
 
   const DataType dtype = op->GetKwarg<DataType>("dtype", DataType::FP8E4M3FN);
-  INTERNAL_CHECK_SPAN(dtype == DataType::FP8E4M3FN, op->span_)
+  INTERNAL_CHECK_SPAN(dtype == DataType::FP8E4M3FN || dtype == DataType::FP4, op->span_)
       << "Internal error: tile.tquant_mx_raw reached codegen with unsupported dtype " << dtype.ToString()
-      << "; this PR only supports MXFP8 (FP8E4M3FN)";
+      << "; supported dtypes are FP8E4M3FN (MXFP8) and FP4 (MXFP4)";
+  const char* quant_type = dtype == DataType::FP4 ? "MXFP4_E2M1" : "MXFP8";
 
   const auto outs = codegen.PrepareTupleOutputs(op);
 
@@ -1069,7 +1079,7 @@ static std::string MakeTQuantMxCodegenPTO(const CallPtr& op, codegen::CodegenBas
       << "Internal error: tile.tquant_mx_raw group_axis must be 0 or 1";
   oss << ") outs(" << dst_view.ssa << ", " << scale_view.ssa << ", " << max_view.ssa << ", "
       << scaling_view.ssa << " : " << dst_view.type << ", " << scale_view.type << ", " << max_view.type
-      << ", " << scaling_view.type << ") {quant_type = #pto<quant_type MXFP8"
+      << ", " << scaling_view.type << ") {quant_type = #pto<quant_type " << quant_type
       << ">, grpAxis = #pto<mx_group_axis axis" << group_axis << ">}";
   codegen.Emit(oss.str());
   return "";

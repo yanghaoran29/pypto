@@ -392,7 +392,8 @@ class PTOCodegen : public CodegenBase {
    * uses this to eagerly allocate DPS dst/cdst tiles bound by downstream
    * `dst = tuple_var[i]` AssignStmts before they are visited.
    */
-  void EmitAllocTileForVar(const ir::VarPtr& tile_var, const std::shared_ptr<const ir::TileType>& tile_type);
+  void EmitAllocTileForVar(const ir::VarPtr& tile_var, const std::shared_ptr<const ir::TileType>& tile_type,
+                           bool static_valid_in_type = false);
 
   /**
    * @brief Resolve the DPS element vars of a tuple-returning op call
@@ -849,9 +850,14 @@ class PTOCodegen : public CodegenBase {
    * @param tile_type Tile type carrying shape/tile_view/memref metadata.
    * @param use_physical_valid_shape Use `shape_`, ignoring an explicit logical
    *        `tile_view_.valid_shape`, for the alloc operands.
+   * @param static_valid_in_type When true, put concrete v_row/v_col in the
+   *        result type and omit valid_row/valid_col operands. Required for
+   *        Vec FP4 destinations: PTOAS `pto.treshape` rejects `!pto.f4E2M1x2`,
+   *        so the static-valid TQUANT bridge cannot be a reshape.
    */
   AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type,
-                                         bool use_physical_valid_shape = false);
+                                         bool use_physical_valid_shape = false,
+                                         bool static_valid_in_type = false);
 
   /**
    * @brief The tile_buf handle already bound to the buffer `memref` denotes.

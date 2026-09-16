@@ -161,6 +161,112 @@ class TestQuantMx(PTOTestCase):
         tensors["out_scale"][:] = expected_scale
 
 
+_E2M1_CODES = torch.tensor(
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] * 2,
+    dtype=torch.uint8,
+)
+_E2M1_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0] * 2,
+    dtype=torch.float32,
+)
+
+
+def _pack_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
+    """Pack logical E2M1 nibbles along the last dim into float4_e2m1fn_x2."""
+    packed = ((codes[..., 1::2] & 0x0F) << 4) | (codes[..., 0::2] & 0x0F)
+    return packed.contiguous().view(torch.float4_e2m1fn_x2)
+
+
+def _quant_mxfp4_inputs_and_golden(group_axis: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build exact MXFP4 blocks with known E2M1 codes and E8M0 scales."""
+    src_shape, quant_shape = _case_shapes(group_axis)
+    groups = src_shape[1] // MX_GROUP_SIZE
+    exponent_shape = (src_shape[0], groups) if group_axis == 1 else (groups, src_shape[0])
+    group_exponents = (torch.arange(exponent_shape[0] * exponent_shape[1]) % 4 - 1).reshape(exponent_shape)
+    scales = torch.pow(2.0, group_exponents).to(torch.float32)
+    codes = _E2M1_CODES
+    values = _E2M1_VALUES
+    if group_axis == 1:
+        src = (values.reshape(1, 1, MX_GROUP_SIZE) * scales.unsqueeze(-1)).reshape(src_shape)
+        logical_codes = codes.repeat(src_shape[0], groups).reshape(quant_shape)
+    else:
+        src_kn = (values.reshape(1, MX_GROUP_SIZE, 1) * scales.unsqueeze(1)).reshape(quant_shape)
+        src = src_kn.transpose(0, 1)
+        logical_codes = (
+            codes.reshape(1, MX_GROUP_SIZE, 1).expand(groups, MX_GROUP_SIZE, src_shape[0]).reshape(quant_shape)
+        )
+    quantized = _pack_fp4_codes(logical_codes)
+    scale = _pack_scale_codes((group_exponents + 127).to(torch.uint8), group_axis)
+    return src.to(torch.bfloat16).contiguous(), quantized.contiguous(), scale.contiguous()
+
+
+class TestQuantMxFp4(PTOTestCase):
+    """Quantize BF16 blocks to MXFP4 through either public grouping path."""
+
+    __test__ = False
+
+    def __init__(self, group_axis: int, *, platform: str | None = None):
+        super().__init__(RunConfig(rtol=0, atol=0), platform=platform)
+        self.group_axis = group_axis
+        self.src_shape, self.quant_shape = _case_shapes(group_axis)
+        self.scale_elements = self.src_shape[0] * self.src_shape[1] // MX_GROUP_SIZE
+        self.packed_quant_shape = [self.quant_shape[0], self.quant_shape[1] // 2]
+
+    def get_name(self) -> str:
+        return f"quant_mx_fp4_axis{self.group_axis}_{self.src_shape[0]}x{self.src_shape[1]}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        src, _expected_quant, _expected_scale = _quant_mxfp4_inputs_and_golden(self.group_axis)
+        return [
+            TensorSpec("src", list(self.src_shape), DataType.BF16, init_value=src),
+            TensorSpec("out_quant", self.packed_quant_shape, DataType.FP4, is_output=True),
+            TensorSpec(
+                "out_scale",
+                [1, self.scale_elements],
+                DataType.FP8E8M0,
+                is_output=True,
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        src_rows, src_cols = self.src_shape
+        quant_rows, quant_cols = self.quant_shape
+        scale_elements = self.scale_elements
+        group_axis = self.group_axis
+
+        @pl.program
+        class QuantMxFp4Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def quant_mx(
+                self,
+                src: pl.Tensor[[src_rows, src_cols], pl.BF16],
+                out_quant: pl.Out[pl.Tensor[[quant_rows, quant_cols], pl.FP4]],
+                out_scale: pl.Out[pl.Tensor[[1, scale_elements], pl.FP8E8M0]],
+            ):
+                src_tile = pl.load(src, [0, 0], [src_rows, src_cols])
+                quantized, scale = pl.quant_mx(src_tile, group_axis=group_axis, dtype=pl.FP4)
+                out_quant = pl.store(quantized, [0, 0], out_quant)
+                out_scale = pl.store(pl.reshape(scale, [1, scale_elements]), [0, 0], out_scale)
+                return out_quant, out_scale
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                src: pl.Tensor[[src_rows, src_cols], pl.BF16],
+                out_quant: pl.Out[pl.Tensor[[quant_rows, quant_cols], pl.FP4]],
+                out_scale: pl.Out[pl.Tensor[[1, scale_elements], pl.FP8E8M0]],
+            ):
+                out_quant, out_scale = self.quant_mx(src, out_quant, out_scale)
+                return out_quant, out_scale
+
+        return QuantMxFp4Program
+
+    def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
+        _src, expected_quant, expected_scale = _quant_mxfp4_inputs_and_golden(self.group_axis)
+        tensors["out_quant"][:] = expected_quant
+        tensors["out_scale"][:] = expected_scale
+
+
 @pytest.mark.platforms("a5")
 class TestQuantMxOperations:
     """Numerical execution coverage for the Ascend950-only quantization ops."""
@@ -171,6 +277,16 @@ class TestQuantMxOperations:
     )
     def test_quant_mx(self, test_runner, platform, group_axis):
         result = test_runner.run(TestQuantMx(group_axis, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize(
+        ("platform", "group_axis"),
+        [pytest.param("a5", 1, id="a5-axis1"), pytest.param("a5", 0, id="a5-axis0")],
+    )
+    def test_quant_mx_fp4(self, test_runner, platform, group_axis):
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            pytest.skip("torch.float4_e2m1fn_x2 required")
+        result = test_runner.run(TestQuantMxFp4(group_axis, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
 

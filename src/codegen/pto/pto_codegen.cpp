@@ -1467,12 +1467,16 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
 }
 
 PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
-    const std::shared_ptr<const ir::TileType>& tile_type, bool use_physical_valid_shape) {
+    const std::shared_ptr<const ir::TileType>& tile_type, bool use_physical_valid_shape,
+    bool static_valid_in_type) {
   AllocTileFields fields;
 
-  // Type string always uses dynamic valid dims (v_row=?, v_col=?); the actual
-  // extent is conveyed via valid_row / valid_col operands below.
-  fields.type_str = GetTileBufTypeStringFromTileType(tile_type);
+  // Default: type string uses dynamic valid dims (v_row=?, v_col=?); the actual
+  // extent is conveyed via valid_row / valid_col operands below. Static-valid
+  // Vec FP4 destinations instead bake v_row/v_col into the type because PTOAS
+  // treshape does not accept !pto.f4E2M1x2.
+  fields.type_str = static_valid_in_type ? GetViewTileBufTypeStringFromTileType(tile_type)
+                                         : GetTileBufTypeStringFromTileType(tile_type);
 
   // Every `pto.alloc_tile` PyPTO emits passes through here, so this is the one
   // place a physically illegal box grid can be caught with the IR location and
@@ -1554,7 +1558,7 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
     dims = &tile_type->shape_;
   }
 
-  if (dims != nullptr) {
+  if (!static_valid_in_type && dims != nullptr) {
     if (dims->size() == 1) {
       // Match ExtractTileTypeInfo: 1-D tile maps to rows=1, cols=shape[0].
       fields.valid_row_ssa = GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
@@ -1802,7 +1806,8 @@ void PTOCodegen::EmitMultiBufferRegionAllocs() {
 }
 
 void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
-                                     const std::shared_ptr<const ir::TileType>& tile_type) {
+                                     const std::shared_ptr<const ir::TileType>& tile_type,
+                                     bool static_valid_in_type) {
   auto var_key = GetVarKey(tile_var);
   if (!fs_.emitted_tile_alloc_vars.insert(var_key).second) {
     return;
@@ -1829,7 +1834,8 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
     return;
   }
 
-  AllocTileFields fields = ComputeAllocTileFields(tile_type);
+  AllocTileFields fields = ComputeAllocTileFields(tile_type, /*use_physical_valid_shape=*/false,
+                                                  static_valid_in_type);
 
   std::ostringstream line;
   line << tile_buf << " = pto.alloc_tile";
@@ -2338,7 +2344,13 @@ std::vector<PTOCodegen::TupleOutput> PTOCodegen::PrepareTupleOutputs(const ir::C
     // Eagerly allocate: the destinations are written by this instruction, before
     // the `<var> = tuple[i]` AssignStmts that would otherwise emit them. The
     // emission is idempotent, so those AssignStmts then skip re-emitting.
-    EmitAllocTileForVar(element_vars[i], tile_type);
+    // Vec FP4 TQUANT dests bake static valid into the alloc type: PTOAS
+    // treshape rejects !pto.f4E2M1x2, so EmitStaticValidTileView cannot
+    // bridge dynamic-valid allocs for MXFP4.
+    const bool static_valid_in_type =
+        tile_type->dtype_ == DataType::FP4 && tile_type->GetMemorySpace().value_or(ir::MemorySpace::Vec) ==
+                                                 ir::MemorySpace::Vec;
+    EmitAllocTileForVar(element_vars[i], tile_type, static_valid_in_type);
     outputs.push_back(TupleOutput{GetVarName(element_vars[i]), GetTileBufTypeStringFromTileType(tile_type),
                                   element_vars[i], tile_type});
   }

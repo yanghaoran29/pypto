@@ -24,9 +24,10 @@
  *
  * LowerCompositeOps expands tile.tquant_mx into value-returning
  * tile.tquant_mx_raw + tile.tmov_x2zz (gather_compare-style SSA), then
- * reinterpret / transpose_view to the public FP8 types. Those internal ops run
- * before InferTileMemorySpace; scratch tiles are created with an explicit
- * MemorySpace::Vec annotation so the later memory planner still gets addresses.
+ * reinterpret / transpose_view to the public FP8 types (MXFP8) or keeps the
+ * raw FP4 destination (MXFP4). Those internal ops run before InferTileMemorySpace;
+ * scratch tiles are created with an explicit MemorySpace::Vec annotation so the
+ * later memory planner still gets addresses.
  */
 
 #include <any>
@@ -66,9 +67,11 @@ struct MxQuantTypeInfo {
 };
 
 MxQuantTypeInfo ResolveMxQuantType(DataType dtype, const std::string& op_name, const Span& span) {
-  CHECK_SPAN(dtype == DataType::FP8E4M3FN, span)
-      << "The operator " << op_name << " requires dtype FP8E4M3FN (MXFP8-only), but got " << dtype.ToString();
-  return {DataType::FP8E4M3FN, DataType::INT8};
+  if (dtype == DataType::FP8E4M3FN) return {DataType::FP8E4M3FN, DataType::INT8};
+  CHECK_SPAN(dtype == DataType::FP4, span)
+      << "The operator " << op_name << " requires dtype FP8E4M3FN (MXFP8) or FP4 (MXFP4), but got "
+      << dtype.ToString();
+  return {DataType::FP4, DataType::FP4};
 }
 
 int64_t GetStaticElementCount(const TileTypePtr& type, const std::string& operand, const std::string& op_name,
@@ -124,7 +127,8 @@ DataType ParseDtype(const std::vector<std::pair<std::string, std::any>>& kwargs)
   return dtype;
 }
 
-void CheckSrcBasics(const TileTypePtr& src_type, const std::string& op_name, const Span& span) {
+void CheckSrcBasics(const TileTypePtr& src_type, DataType dst_dtype, const std::string& op_name,
+                    const Span& span) {
   CHECK_SPAN(src_type, span) << "The operator " << op_name << " requires src to be a TileType";
   CHECK_SPAN(src_type->shape_.size() == 2, span) << "The operator " << op_name << " requires 2D src tile";
   const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
@@ -132,23 +136,26 @@ void CheckSrcBasics(const TileTypePtr& src_type, const std::string& op_name, con
   CHECK_SPAN(tile_view_semantics::ShapeExprListsEquivalent(src_view.valid_shape, src_type->shape_), span)
       << "The operator " << op_name
       << " does not support a partial src valid_shape; valid_shape must match the physical shape";
-  const bool src_supported = src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::BF16 ||
-                             src_type->dtype_ == DataType::FP32;
+  const bool mxfp4 = dst_dtype == DataType::FP4;
+  const bool src_supported =
+      src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::BF16 ||
+      (!mxfp4 && src_type->dtype_ == DataType::FP32);
   CHECK_SPAN(src_supported, span) << "The operator " << op_name
-                                  << " requires src dtype in {FP16, FP32, BF16}, but got "
+                                  << (mxfp4 ? " with dtype FP4 requires src dtype in {FP16, BF16}, but got "
+                                            : " requires src dtype in {FP16, FP32, BF16}, but got ")
                                   << src_type->dtype_.ToString();
 }
 
-// Public tile.tquant_mx: one src -> TupleType{FP8 quant, FP8E8M0 scale}.
+// Public tile.tquant_mx: one src -> TupleType{FP8/FP4 quant, FP8E8M0 scale}.
 TypePtr DeducePublicTQuantMxType(const std::vector<ExprPtr>& args,
                                  const std::vector<std::pair<std::string, std::any>>& kwargs) {
   constexpr const char* kOpName = "tile.tquant_mx";
   const Span span = args.empty() ? Span::unknown() : args[0]->span_;
   CHECK_SPAN(args.size() == 1, span) << "The operator " << kOpName << " requires exactly 1 argument";
   auto src_type = As<TileType>(args[0]->GetType());
-  CheckSrcBasics(src_type, kOpName, span);
-
   const DataType dtype = ParseDtype(kwargs);
+  CheckSrcBasics(src_type, dtype, kOpName, span);
+
   const int group_axis = ParseGroupAxis(kwargs, kOpName, span, /*required=*/true);
   const MxQuantTypeInfo type_info = ResolveMxQuantType(dtype, kOpName, span);
 
@@ -199,7 +206,7 @@ TypePtr DeducePublicTQuantMxType(const std::vector<ExprPtr>& args,
   return std::make_shared<TupleType>(std::vector<TypePtr>{dst_type, scale_type});
 }
 
-// Internal tile.tquant_mx_raw: (src, max_ws, scaling_ws) -> TupleType{INT8, UINT8 exp}.
+// Internal tile.tquant_mx_raw: (src, max_ws, scaling_ws) -> TupleType{INT8 or FP4, UINT8 exp}.
 // max/scaling are write-only workspace inputs (gather_compare tmp style).
 TypePtr DeduceRawTQuantMxType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs) {
@@ -208,9 +215,9 @@ TypePtr DeduceRawTQuantMxType(const std::vector<ExprPtr>& args,
   CHECK_SPAN(args.size() == 3, span) << "The operator " << kOpName
                                      << " requires src, max, and scaling workspaces";
   auto src_type = As<TileType>(args[0]->GetType());
-  CheckSrcBasics(src_type, kOpName, span);
-
   const DataType dtype = ParseDtype(kwargs);
+  CheckSrcBasics(src_type, dtype, kOpName, span);
+
   const int group_axis = ParseGroupAxis(kwargs, kOpName, span, /*required=*/true);
   const MxQuantTypeInfo type_info = ResolveMxQuantType(dtype, kOpName, span);
 
@@ -387,10 +394,10 @@ TypePtr DeduceTileTMovX2ZzType(const std::vector<ExprPtr>& args,
 REGISTER_OP("tile.tquant_mx")
     .set_op_category("TileOp")
     .set_description(
-        "MXFP8 block-32 dynamic quantization: TupleType{quantized FP8E4M3FN, e8m0_scale FP8E8M0}. "
+        "MX block-32 dynamic quantization: TupleType{quantized FP8E4M3FN or FP4, e8m0_scale FP8E8M0}. "
         "LowerCompositeOps rewrites this into tile.tquant_mx_raw + tile.tmov_x2zz (value-returning), "
-        "then reinterpret/transpose_view to the public dtypes. dtype must be FP8E4M3FN. group_axis is "
-        "PTOAS grpAxis (1=A-side [M,K], 0=B-side [N,K] with transpose).")
+        "then reinterpret/transpose_view to the public dtypes. dtype is FP8E4M3FN (MXFP8) or FP4 "
+        "(MXFP4). group_axis is PTOAS grpAxis (1=A-side [M,K], 0=B-side [N,K] with transpose).")
     .add_argument("src", "Source tile (FP16/FP32/BF16, 2D)")
     .set_attr<DataType>("dtype")
     .set_attr<int>("group_axis")
@@ -409,8 +416,9 @@ REGISTER_OP("tile.tquant_mx")
 REGISTER_OP("tile.tquant_mx_raw")
     .set_op_category("TileOp")
     .set_description(
-        "Internal value-returning MXFP8 TQUANT: ins(src, max_ws, scaling_ws) outs TupleType{raw INT8 "
-        "dst, raw UINT8 exp}. max/scaling are write-only workspace inputs. Lowers to pto.tquant.mx.")
+        "Internal value-returning MX TQUANT: ins(src, max_ws, scaling_ws) outs TupleType{raw INT8 "
+        "(MXFP8) or FP4 (MXFP4) dst, raw UINT8 exp}. max/scaling are write-only workspace inputs. "
+        "Lowers to pto.tquant.mx.")
     .add_argument("src", "Source tile (FP16/FP32/BF16, 2D)")
     .add_argument("max", "Per-group max workspace matching src dtype (write-only)")
     .add_argument("scaling", "Per-group scaling workspace matching src dtype (write-only)")

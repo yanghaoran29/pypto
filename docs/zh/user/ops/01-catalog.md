@@ -119,7 +119,7 @@
 
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
-| `quant_mx` | `pl.` (t) | Ascend950 MXFP8 block-32 动态量化，生成 FP8E4M3FN 数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。本版本不含 MXFP4 quant。可在同一 InCore mixed task 内通过 data+scale 的直接 V2C 传输供 `matmul_mx` 使用（见 [类型](../language/00-types.md)） |
+| `quant_mx` | `pl.` (t) | Ascend950 MX block-32 动态量化，生成 FP8E4M3FN（MXFP8）或 FP4（MXFP4 E2M1，逻辑 nibble shape）数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。MXFP4 仅接受 FP16/BF16 源。可在同一 InCore mixed task 内通过 data+scale 的直接 V2C 传输供 `matmul_mx` 使用（见 [类型](../language/00-types.md)） |
 | `tmov_x2zz` | `pl.` (t) | Ascend950 指数 X-to-ZZ 布局转换（UINT8）。`tmp` 为只写 workspace；axis1 需 `dst_rows`/`dst_cols` 指定 ZZ `[M,G]`（相对 TQUANT 扁平 exp）。通常由 `quant_mx` 降级使用，而非直接调用 |
 
 ## 线性代数

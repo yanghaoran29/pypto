@@ -108,6 +108,45 @@ class TestQuantMxCodegen:
         for index, lhs in enumerate(ranges):
             assert all(lhs[1] <= rhs[0] or rhs[1] <= lhs[0] for rhs in ranges[index + 1 :])
 
+    @pytest.mark.parametrize(
+        ("group_axis", "src_shape", "out_shape"),
+        [
+            (1, (16, 64), (16, 64)),
+            (0, (32, 64), (64, 32)),
+        ],
+    )
+    def test_mxfp4_quant_codegen(self, group_axis, src_shape, out_shape):
+        src_rows, src_cols = src_shape
+        out_rows, out_cols = out_shape
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[src_rows, src_cols], pl.BF16],
+                out: pl.Tensor[[out_rows, out_cols], pl.FP4],
+            ):
+                quant, _scale = pl.quant_mx(
+                    pl.load(src, [0, 0], [src_rows, src_cols]),
+                    group_axis=group_axis,
+                    dtype=pl.FP4,
+                )
+                pl.store(quant, [0, 0], out)
+
+        mlir = _generate_mlir(Program)
+        tquant = next(line for line in mlir.splitlines() if "pto.tquant.mx" in line)
+        assert "quant_type MXFP4_E2M1" in tquant
+        assert f"grpAxis = #pto<mx_group_axis axis{group_axis}>" in tquant
+        packed_cols = src_cols // 2 if group_axis == 1 else src_rows // 2
+        dst_alloc = next(line for line in mlir.splitlines() if "tq_dst" in line and "pto.alloc_tile" in line)
+        assert "!pto.f4E2M1x2" in dst_alloc or "f4E2M1x2" in dst_alloc
+        assert f"cols={packed_cols}" in dst_alloc
+        assert f"v_row=" in dst_alloc and "v_row=?" not in dst_alloc
+        assert "valid_row" not in dst_alloc
+        assert "tq_quant" not in mlir
+        assert not any("treshape" in line and "f4E2M1x2" in line for line in mlir.splitlines())
+
     def test_raw_is_value_returning_after_optimization(self):
         @pl.program
         class Program:

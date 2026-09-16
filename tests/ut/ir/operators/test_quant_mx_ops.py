@@ -35,6 +35,8 @@ class TestQuantMxTypes:
         [
             (1, pl.FP8E4M3FN, (16, 64), (16, 64), (16, 2)),
             (0, pl.FP8E4M3FN, (32, 64), (64, 32), (2, 32)),
+            (1, pl.FP4, (16, 64), (16, 64), (16, 2)),
+            (0, pl.FP4, (32, 64), (64, 32), (2, 32)),
         ],
     )
     def test_public_result_types(self, group_axis, dtype, src_shape, quant_shape, scale_shape):
@@ -95,11 +97,15 @@ class TestQuantMxTypes:
         with pytest.raises(ValueError, match="group_axis must be 0 or 1"):
             pl.quant_mx(src, group_axis=2)
 
-    @pytest.mark.parametrize("dtype", [pl.FP8E5M2, pl.FP4])
+    @pytest.mark.parametrize("dtype", [pl.FP8E5M2, pl.HF4])
     def test_public_rejects_unsupported_dtype(self, dtype):
         src = pl.Tile(expr=_tile("src", (16, 64), pl.FP16))
-        with pytest.raises(ValueError, match="supports only FP8E4M3FN"):
+        with pytest.raises(ValueError, match="dtype must be FP8E4M3FN or FP4"):
             pl.quant_mx(src, group_axis=1, dtype=dtype)
+
+    def test_public_rejects_fp32_source_for_mxfp4(self):
+        with pytest.raises(ValueError, match="with dtype FP4 requires src dtype in"):
+            ir.op.tile.tquant_mx(_tile("src", (16, 64), pl.FP32), group_axis=1, dtype=pl.FP4)
 
     @pytest.mark.parametrize(
         ("shape", "dtype", "group_axis", "message"),
@@ -133,6 +139,18 @@ class TestQuantMxTypes:
         dst, exp = call.type.types
         assert isinstance(dst, ir.TileType) and dst.dtype == pl.INT8
         assert isinstance(exp, ir.TileType) and exp.dtype == pl.UINT8
+
+        fp4 = ir.op.tile.tquant_mx_raw(
+            src,
+            _tile("max4", (1, 32), pl.FP16),
+            _tile("scaling4", (1, 32), pl.FP16),
+            dtype=pl.FP4,
+            group_axis=1,
+        )
+        dst4, exp4 = fp4.type.types
+        assert isinstance(dst4, ir.TileType) and dst4.dtype == pl.FP4
+        assert _shape_values(dst4) == (16, 64)
+        assert isinstance(exp4, ir.TileType) and exp4.dtype == pl.UINT8
 
     def test_raw_rejects_wrong_scratch_size(self):
         with pytest.raises(ValueError, match="max scratch valid element count 32"):

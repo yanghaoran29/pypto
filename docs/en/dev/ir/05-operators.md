@@ -426,8 +426,8 @@ Torch/runtime carries `float4_e2m1fn_x2` in a physical x2 shape; JIT/compiled-ca
 
 An explicit left-side FP4→FP8 tile cast is legalized on A5 as
 FP4→BF16→FP32→FP8E4M3FN. Scale values are unchanged because this is a numerical
-cast of the data operand. Native packed-FP4 matmul remains unsupported; standalone MXFP4 quantization is
-out of scope for this release (`pl.quant_mx` is MXFP8-only).
+cast of the data operand. Native packed-FP4 matmul remains unsupported. Standalone MXFP4
+quantization is available via `pl.quant_mx(..., dtype=pl.FP4)` (E8M0 group-32; FP16/BF16 sources).
 
 #### MX / Ascend950: pto-isa constraints
 

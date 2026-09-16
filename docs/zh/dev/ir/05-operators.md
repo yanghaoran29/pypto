@@ -366,7 +366,7 @@ FP8E8M0 shaped alias（用于 GM 分核暂存）。在完整的 scale layout con
 
 FP4 Tensor/Tile shape 与 `valid_shape` 都以逻辑 nibble 计数；末维必须是正偶数，slice 的线性起点也不能落在一个字节的第二个 nibble。Torch/runtime 继续以物理 x2 shape 携带 `float4_e2m1fn_x2`，JIT/compiled-call 边界负责换算，因此 IR 不增加持久化 `storage_shape`。
 
-A5 会把左侧显式 FP4→FP8 tile cast 展开为 FP4→BF16→FP32→FP8E4M3FN。它是 data operand 的数值 cast，不修改 scale。原生 packed-FP4 矩阵乘仍不支持；独立 MXFP4 量化不在本版本范围内（`pl.quant_mx` 仅 MXFP8）。
+A5 会把左侧显式 FP4→FP8 tile cast 展开为 FP4→BF16→FP32→FP8E4M3FN。它是 data operand 的数值 cast，不修改 scale。原生 packed-FP4 矩阵乘仍不支持。独立 MXFP4 量化已由 `pl.quant_mx(..., dtype=pl.FP4)` 提供（E8M0 group-32；源为 FP16/BF16）。
 
 #### MX / Ascend950：pto-isa 约束
 

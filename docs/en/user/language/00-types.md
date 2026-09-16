@@ -210,8 +210,8 @@ physically). The matmul itself is `pl.matmul_mx` and its `_acc` /
 the op must be `FP8E4M3FN`. The supported FP4-input form is a left FP4 operand multiplied by a
 right FP8 operand: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
 legalization pass expands that request to FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
-reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
-`group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
+reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (`dtype=FP8E4M3FN` for MXFP8,
+`dtype=FP4` for MXFP4, with `group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
 task with `matmul_mx`; the generated data and scale cross directly over V2C, with a generated
 Vec-to-Mat-to-scale-memory path for the scale.
 

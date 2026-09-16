@@ -1068,13 +1068,15 @@ ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& a
   INTERNAL_CHECK_SPAN(public_types && public_types->types_.size() == 2, span)
       << "Internal error: tile.tquant_mx must return exactly two tile types";
   auto public_dst_type = As<TileType>(public_types->types_[0]);
-  INTERNAL_CHECK_SPAN(public_dst_type && public_dst_type->dtype_ == DataType::FP8E4M3FN, span)
-      << "Internal error: tile.tquant_mx public destination must be FP8E4M3FN";
+  DataType dtype = call->GetKwarg<DataType>("dtype", DataType::FP8E4M3FN);
+  INTERNAL_CHECK_SPAN(public_dst_type && public_dst_type->dtype_ == dtype, span)
+      << "Internal error: tile.tquant_mx public destination must match dtype";
+  INTERNAL_CHECK_SPAN(dtype == DataType::FP8E4M3FN || dtype == DataType::FP4, span)
+      << "Internal error: tile.tquant_mx dtype must be FP8E4M3FN or FP4";
 
   // Value-returning TQUANT (gather_compare-style): Bind the TupleType result,
   // then project dst/exp so InitMemRef + ResolveTupleResultElements see real
   // TupleGetItem consumers. max/scaling remain write-only workspace inputs.
-  DataType dtype = call->GetKwarg<DataType>("dtype", DataType::FP8E4M3FN);
   auto raw_tuple = b.Bind("tq_raw",
                           reg.Create("tile.tquant_mx_raw", {src, max_tile, scaling_tile},
                                      {{"dtype", dtype}, {"group_axis", group_axis}}, span),
@@ -1083,9 +1085,13 @@ ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& a
   auto raw_exp = b.Bind("tq_exp", std::make_shared<TupleGetItemExpr>(raw_tuple, 1, span), span);
 
   // MXFP8 uses PTOAS's raw INT8 destination and exposes a zero-copy FP8 alias.
-  ExprPtr dst_tile =
-      b.Bind("tq_quant",
-             reg.Create("tile.reinterpret_view", {raw_dst}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
+  // MXFP4 writes !pto.f4E2M1x2 directly, so the public dest is already FP4.
+  ExprPtr dst_tile = raw_dst;
+  if (dtype == DataType::FP8E4M3FN) {
+    dst_tile = b.Bind(
+        "tq_quant",
+        reg.Create("tile.reinterpret_view", {raw_dst}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
+  }
 
   // Axis1 X-to-ZZ tmp: 64 + ceil(rows/16)*cols bytes. Axis0 (TMovDnTo2Zz): ISA
   // still requires a Vec tmp operand; use one 32-byte Vec pad unit.

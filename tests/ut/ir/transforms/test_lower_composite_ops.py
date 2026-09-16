@@ -391,6 +391,49 @@ def test_tquant_mx_is_decomposed_to_value_returning_ops(
     ir.assert_structural_equal(twice, After)
 
 
+def test_tquant_mx_fp4_does_not_reinterpret_quant_data():
+    """MXFP4 lowering keeps the raw FP4 destination; only the scale is aliased."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            src: pl.Tensor[[16, 64], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP4]],
+        ) -> pl.Tensor[[16, 64], pl.FP4]:
+            quant, _scale = pl.quant_mx(
+                pl.load(src, [0, 0], [16, 64]),
+                group_axis=1,
+                dtype=pl.FP4,
+            )
+            return pl.store(quant, [0, 0], out)
+
+        @pl.function
+        def main(self, src: pl.Tensor[[16, 64], pl.BF16]) -> pl.Tensor[[16, 64], pl.FP4]:
+            out = pl.create_tensor([16, 64], dtype=pl.FP4)
+            return self.main_incore_0(src, out)
+
+    After = passes.lower_composite_ops()(Before)
+    names = _collect_op_names(After)
+    assert _OP_TILE_TQUANT_MX not in names
+    assert _OP_TILE_TQUANT_MX_RAW in names
+    assert _OP_TILE_TMOV_X2ZZ in names
+
+    reinterpret_dtypes = []
+
+    class ReinterpretCollector(ir.IRVisitor):
+        def visit_call(self, expr):
+            if expr.op.name == ir.get_op("tile.reinterpret_view").name:
+                reinterpret_dtypes.append(dict(expr.kwargs).get("dtype"))
+            super().visit_call(expr)
+
+    ReinterpretCollector().visit_program(After)
+    assert pl.FP8E4M3FN not in reinterpret_dtypes
+    assert pl.FP4 not in reinterpret_dtypes
+    assert pl.FP8E8M0 in reinterpret_dtypes
+
+
 def test_both_sin_and_cos_in_same_function():
     """Verify sin and cos lowering don't interfere when both appear in one function."""
 
