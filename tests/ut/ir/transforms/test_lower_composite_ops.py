@@ -31,10 +31,12 @@ from pypto.pypto_core import ir as _ir_core
 
 _OP_PLD_TILE_REMOTE_LOAD = ir.get_op("pld.tile.remote_load").name
 _OP_TILE_LOAD = ir.get_op("tile.load").name
+_OP_TILE_MOVE = ir.get_op("tile.move").name
 _OP_TILE_TQUANT_MX = ir.get_op("tile.tquant_mx").name
 _OP_TILE_TQUANT_MX_RAW = ir.get_op("tile.tquant_mx_raw").name
 _OP_TILE_TMOV_X2ZZ = ir.get_op("tile.tmov_x2zz").name
 _OP_TILE_TRANSPOSE = ir.get_op("tile.transpose").name
+_OP_TILE_COL_EXPAND_MUL = ir.get_op("tile.col_expand_mul").name
 
 # Primitive tile ops the decomposition is allowed to emit (besides framework
 # infrastructure ops like tile.load / tile.store / tile.move that wrap the
@@ -389,6 +391,122 @@ def test_tquant_mx_is_decomposed_to_value_returning_ops(
 
     twice = passes.lower_composite_ops()(After)
     ir.assert_structural_equal(twice, After)
+
+
+def _tquant_mx_raw_src_call(program):
+    """Return the Call that produces ``tile.tquant_mx_raw``'s arg0, if any."""
+
+    class Finder(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.raw_src = None
+            self.defs = {}
+
+        def visit_assign_stmt(self, stmt):
+            self.defs[stmt.var] = stmt.value
+            super().visit_assign_stmt(stmt)
+
+        def visit_call(self, call):
+            if call.op.name == _OP_TILE_TQUANT_MX_RAW and call.args:
+                self.raw_src = call.args[0]
+            super().visit_call(call)
+
+    finder = Finder()
+    finder.visit_program(program)
+    assert finder.raw_src is not None
+    src = finder.raw_src
+    while isinstance(src, (ir.Var, ir.IterArg)) and src in finder.defs:
+        src = finder.defs[src]
+    return src
+
+
+def test_tquant_mx_load_src_skips_densify_move():
+    """``quant_mx(load)`` on group_axis=1 must not insert a densify ``tile.move``."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            src: pl.Tensor[[16, 64], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            quant, _scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+            return pl.store(quant, [0, 0], out)
+
+        @pl.function
+        def main(self, src: pl.Tensor[[16, 64], pl.FP16]) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            out = pl.create_tensor([16, 64], dtype=pl.FP8E4M3FN)
+            return self.main_incore_0(src, out)
+
+    After = passes.lower_composite_ops()(Before)
+    names = _collect_op_names(After)
+    assert _OP_TILE_TQUANT_MX_RAW in names
+    assert _OP_TILE_MOVE not in names
+    src_def = _tquant_mx_raw_src_call(After)
+    assert isinstance(src_def, ir.Call) and src_def.op.name == _OP_TILE_LOAD
+
+
+def test_tquant_mx_vector_chain_inserts_densify_move():
+    """Gate-like transpose → col_expand_mul → transpose → quant_mx densifies before raw."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            src: pl.Tensor[[16, 64], pl.FP16],
+            col: pl.Tensor[[1, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            x = pl.load(src, [0, 0], [16, 64])
+            c = pl.load(col, [0, 0], [1, 16])
+            x_t = pl.transpose(x, 0, 1)
+            scaled = pl.col_expand_mul(x_t, c)
+            x_tt = pl.transpose(scaled, 0, 1)
+            quant, _scale = pl.quant_mx(x_tt, group_axis=1)
+            return pl.store(quant, [0, 0], out)
+
+        @pl.function
+        def main(
+            self, src: pl.Tensor[[16, 64], pl.FP16], col: pl.Tensor[[1, 16], pl.FP16]
+        ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            out = pl.create_tensor([16, 64], dtype=pl.FP8E4M3FN)
+            return self.main_incore_0(src, col, out)
+
+    After = passes.lower_composite_ops()(Before)
+    names = _collect_op_names(After)
+    assert _OP_TILE_TQUANT_MX_RAW in names
+    assert _OP_TILE_MOVE in names
+    assert _OP_TILE_COL_EXPAND_MUL in names
+
+    densify_vars = set()
+
+    class CollectDensify(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):
+            if isinstance(stmt.value, ir.Call) and stmt.value.op.name == _OP_TILE_MOVE:
+                if "tq_src_dense" in stmt.var.name_hint:
+                    densify_vars.add(stmt.var)
+            super().visit_assign_stmt(stmt)
+
+    CollectDensify().visit_program(After)
+    assert densify_vars
+
+    class RawArg(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.src = None
+
+        def visit_call(self, call):
+            if call.op.name == _OP_TILE_TQUANT_MX_RAW:
+                self.src = call.args[0]
+            super().visit_call(call)
+
+    raw = RawArg()
+    raw.visit_program(After)
+    assert raw.src in densify_vars
+    src_def = _tquant_mx_raw_src_call(After)
+    assert isinstance(src_def, ir.Call) and src_def.op.name == _OP_TILE_MOVE
 
 
 def test_both_sin_and_cos_in_same_function():

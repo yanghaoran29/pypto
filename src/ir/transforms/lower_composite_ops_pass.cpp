@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -387,12 +388,33 @@ class LoweringBuilder {
   LoweringBuilder(std::string base_name, std::size_t& temp_counter, bool nested)
       : base_name_(std::move(base_name)), temp_counter_(temp_counter), nested_(nested) {}
 
+  /// Seed SSA RHS lookup with definitions already visited by the mutator so
+  /// rules can walk through prior ``AssignStmt`` values (e.g. densify checks).
+  void SetOuterVarRhs(const std::unordered_map<const Var*, ExprPtr>* outer_var_rhs) {
+    outer_var_rhs_ = outer_var_rhs;
+  }
+
+  /// Resolve the RHS expression bound to ``var``, preferring temps created by
+  /// this builder and falling back to the mutator's outer map. Returns nullptr
+  /// for function parameters / unknown vars (conservative "needs densify").
+  ExprPtr LookupVarRhs(const Var* var) const {
+    if (!var) return nullptr;
+    auto local = local_var_rhs_.find(var);
+    if (local != local_var_rhs_.end()) return local->second;
+    if (outer_var_rhs_) {
+      auto outer = outer_var_rhs_->find(var);
+      if (outer != outer_var_rhs_->end()) return outer->second;
+    }
+    return nullptr;
+  }
+
   /// Append an ``AssignStmt`` binding a fresh ``Var`` to ``expr`` and return
   /// the new ``Var`` so it can be used as input to subsequent ops. The
   /// ``qualifier`` is woven into the temp name for debuggability.
   ExprPtr Bind(const std::string& qualifier, const ExprPtr& expr, const Span& span) {
     auto var = std::make_shared<Var>(MakeTempName(qualifier), expr->GetType(), span);
     stmts_.push_back(std::make_shared<AssignStmt>(var, expr, span));
+    local_var_rhs_[var.get()] = expr;
     return var;
   }
 
@@ -821,6 +843,10 @@ class LoweringBuilder {
   bool nested_ = false;
   int64_t barrier_count_ = 0;  ///< Call-local generation counter; see EmitBarrier.
   std::vector<StmtPtr> stmts_;
+  /// RHS of temps created by this builder's ``Bind`` (for same-rule SSA walks).
+  std::unordered_map<const Var*, ExprPtr> local_var_rhs_;
+  /// Mutator-owned map of already-visited AssignStmt RHS expressions.
+  const std::unordered_map<const Var*, ExprPtr>* outer_var_rhs_ = nullptr;
 };
 
 // Signature for a composite-lowering rule.
@@ -970,6 +996,37 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 // zero-copy tile.transpose_view yields the public [M̂,N] col/col scale. Same-
 // InCore mix with matmul_mx is not supported yet; stage through GM between AIV
 // and AIC (follow-up).
+
+/// Conservative densify predicate for ``tile.tquant_mx`` src: return false only
+/// when SSA traces (through buffer-aliasing views / ``reinterpret_view``) to a
+/// ``tile.load``. Everything else — transpose, col_expand_mul, adds, params,
+/// or unknown defs — needs a fresh ND Vec materialization before TQUANT.
+bool NeedsQuantMxSrcDensify(const ExprPtr& src, const LoweringBuilder& builder) {
+  ExprPtr cur = src;
+  std::unordered_set<const Expr*> seen;
+  while (cur) {
+    if (!seen.insert(cur.get()).second) return true;
+    if (auto call = As<Call>(cur)) {
+      if (!call->op_) return true;
+      const std::string& name = call->op_->name_;
+      if (name == "tile.load") return false;
+      if (op_predicates::IsBufferAliasingViewOp(name) || name == "tile.reinterpret_view") {
+        if (call->args_.empty() || !call->args_[0]) return true;
+        cur = call->args_[0];
+        continue;
+      }
+      return true;
+    }
+    if (auto var = AsVarLike(cur)) {
+      cur = builder.LookupVarRhs(var.get());
+      if (!cur) return true;  // parameter / unknown → densify
+      continue;
+    }
+    return true;
+  }
+  return true;
+}
+
 ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const auto& span = call->span_;
   auto& reg = OpRegistry::GetInstance();
@@ -1070,6 +1127,20 @@ ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& a
   auto public_dst_type = As<TileType>(public_types->types_[0]);
   INTERNAL_CHECK_SPAN(public_dst_type && public_dst_type->dtype_ == DataType::FP8E4M3FN, span)
       << "Internal error: tile.tquant_mx public destination must be FP8E4M3FN";
+
+  // PTOAS TQUANT expects a static ND Vec src with no alias into outs. Vector
+  // chains (transpose / col_expand_mul / …) may already look statically shaped
+  // after zero-copy views, but are not a freshly materialized dense buffer —
+  // densify unless SSA proves the src is tile.load through pure views.
+  if (NeedsQuantMxSrcDensify(src, b)) {
+    src = b.Bind("tq_src_dense",
+                 reg.Create("tile.move", {src},
+                            {{"target_memory", MemorySpace::Vec},
+                             {"blayout", TileLayout::row_major},
+                             {"slayout", TileLayout::none_box}},
+                            span),
+                 span);
+  }
 
   // Value-returning TQUANT (gather_compare-style): Bind the TupleType result,
   // then project dst/exp so InitMemRef + ResolveTupleResultElements see real
@@ -2658,6 +2729,7 @@ class LowerCompositeOpsMutator : public IRMutator {
       // MakeTuple via var_remap_, also seed var_remap_ for the alias Var so
       // later projections and ConvertToSSA see a concrete tuple.
       if (assign) {
+        var_rhs_[op->var_.get()] = assign->value_;
         if (auto mt = ResolveCompositeTuple(assign->value_)) {
           composite_tuples_[op->var_.get()] = mt;
           if (As<MakeTuple>(assign->value_)) {
@@ -2669,7 +2741,16 @@ class LowerCompositeOpsMutator : public IRMutator {
     }
     CompositeLoweringFn rule = LookupRule(call);
     if (!rule) {
-      return IRMutator::VisitStmt_(op);
+      auto visited = IRMutator::VisitStmt_(op);
+      if (auto assign = As<AssignStmt>(visited)) {
+        var_rhs_[op->var_.get()] = assign->value_;
+      } else {
+        // Non-composite Call stayed an AssignStmt under normal mutation; if a
+        // subclass somehow rewrote it, still record the pre-visit RHS so
+        // densify walks can see tile.load / views.
+        var_rhs_[op->var_.get()] = op->value_;
+      }
+      return visited;
     }
 
     // Apply var_remap_ (if any) to operand expressions before handing them
@@ -2677,6 +2758,7 @@ class LowerCompositeOpsMutator : public IRMutator {
     std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
 
     LoweringBuilder builder(op->var_->name_hint_, temp_counter_);
+    builder.SetOuterVarRhs(&var_rhs_);
     ExprPtr result = rule(call, visited_args, builder);
     if (auto mt = As<MakeTuple>(result)) {
       // Record privately for TupleGetItem folding, and also seed var_remap_ so
@@ -2685,6 +2767,7 @@ class LowerCompositeOpsMutator : public IRMutator {
       composite_tuples_[op->var_.get()] = mt;
       var_remap_[op->var_.get()] = result;
     }
+    var_rhs_[op->var_.get()] = result;
 
     auto stmts = builder.TakeStmts();
     // Bind the final result to the original target Var (preserves uses
@@ -2707,6 +2790,7 @@ class LowerCompositeOpsMutator : public IRMutator {
     std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
 
     LoweringBuilder builder("eval", temp_counter_);
+    builder.SetOuterVarRhs(&var_rhs_);
     static_cast<void>(rule(call, visited_args, builder));
 
     auto stmts = builder.TakeStmts();
@@ -2738,6 +2822,7 @@ class LowerCompositeOpsMutator : public IRMutator {
         std::vector<ExprPtr> visited_args = VisitArgs(call->args_, op->span_);
         const std::string base = "ret" + std::to_string(i);
         LoweringBuilder builder(base, temp_counter_);
+        builder.SetOuterVarRhs(&var_rhs_);
         ExprPtr decomposed = rule(call, visited_args, builder);
         // Bind the decomposed result to a fresh Var so ReturnStmt::value_
         // continues to hold a Var (matches the SSA invariant the rest of the
@@ -2816,6 +2901,9 @@ class LowerCompositeOpsMutator : public IRMutator {
   /// MakeTuples produced by composite lowering rules (and their SSA aliases).
   /// Used only to fold TupleGetItem projections; does not affect global var_remap_.
   std::unordered_map<const Expr*, MakeTuplePtr> composite_tuples_;
+  /// AssignStmt RHS keyed by LHS Var for SSA walks inside lowering rules
+  /// (``NeedsQuantMxSrcDensify`` and similar).
+  std::unordered_map<const Var*, ExprPtr> var_rhs_;
 };
 
 /// A managed collective is one written in an *orchestration* body — HOST/L3 or

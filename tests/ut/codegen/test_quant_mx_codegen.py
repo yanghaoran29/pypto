@@ -108,6 +108,37 @@ class TestQuantMxCodegen:
         for index, lhs in enumerate(ranges):
             assert all(lhs[1] <= rhs[0] or rhs[1] <= lhs[0] for rhs in ranges[index + 1 :])
 
+    def test_vector_chain_emits_densify_tmov_before_tquant(self):
+        """Vector-chain quant_mx must materialize src (tmov) before pto.tquant.mx."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[16, 64], pl.BF16],
+                col: pl.Tensor[[1, 16], pl.BF16],
+                out: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+            ):
+                x = pl.load(src, [0, 0], [16, 64])
+                c = pl.load(col, [0, 0], [1, 16])
+                x_t = pl.transpose(x, 0, 1)
+                scaled = pl.col_expand_mul(x_t, c)
+                x_tt = pl.transpose(scaled, 0, 1)
+                quant, _scale = pl.quant_mx(x_tt, group_axis=1)
+                pl.store(quant, [0, 0], out)
+
+        mlir = _generate_mlir(Program)
+        lines = mlir.splitlines()
+        tquant_idx = next(i for i, line in enumerate(lines) if "pto.tquant.mx" in line)
+        densify_idxs = [
+            i
+            for i, line in enumerate(lines)
+            if "pto.tmov" in line and "tq_src_dense" in line and "x2zz" not in line
+        ]
+        assert densify_idxs, "expected densify tmov for vector-chain quant_mx src"
+        assert max(densify_idxs) < tquant_idx
+
     def test_raw_is_value_returning_after_optimization(self):
         @pl.program
         class Program:
