@@ -639,6 +639,8 @@ void BindPass(nb::module_& m) {
              "allreduce is skipped for LowerHostTensorCollectives. FP32-only for trig. Idempotent.");
   passes.def("flatten_call_expr", &pass::FlattenCallExpr,
              "Create a pass that flattens nested call expressions");
+  passes.def("pack_fp4", &pass::PackFp4,
+             "Pack frontend logical FP4 nibble types into packed FP4E2M1X2 after SSA flattening");
   passes.def("inline_functions", &pass::InlineFunctions,
              "Create a pass that eliminates FunctionType::Inline functions by splicing\n"
              "their bodies at every call site. Runs as the first pipeline pass.\n"
@@ -674,14 +676,14 @@ void BindPass(nb::module_& m) {
              "neither a physical tensor dimension nor a scalar parameter, so a precompiled kernel\n"
              "never receives it. Adds the symbol as a leading Scalar[INDEX] parameter and passes\n"
              "the caller's actual extent at every call/submit site.");
-  passes.def(
-      "lower_tile_to_buffer", &pass::LowerTileToBuffer,
-      "Replace planned device Tile storage with explicit Buffer IR.\n\n"
-      "Runs last, after storage legalization, address placement and signature materialization.\n"
-      "The initial recipe covers dense static rank-2 Vec FP32 allocations, GM transfers,\n"
-      "add/mul and copies in straight-line kernels and branches. Unsupported recipes fail explicitly.\n"
-      "Verifies storage closure even when automatic verification is disabled, and verifies\n"
-      "BufferIR after conversion.");
+  passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,
+             "Replace planned device Tile storage with explicit Buffer IR.\n\n"
+             "Runs last, after storage legalization, address placement and signature materialization.\n"
+             "The initial recipe covers dense static rank-2 Vec FP32 allocations, GM transfers,\n"
+             "add/mul and copies in straight-line kernels, branches and loops. Unsupported recipes fail "
+             "explicitly.\n"
+             "Verifies storage closure even when automatic verification is disabled, and verifies\n"
+             "BufferIR after conversion.");
   passes.def("stamp_tfree_split", &pass::StampTfreeSplit,
              "Copy each cross-core tpop's split/pipe-id onto its matching tfree op so codegen\n"
              "reads them from the op directly. Covers mixed-kernel and explicit AIC/AIV tfrees.");

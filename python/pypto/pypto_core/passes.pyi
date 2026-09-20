@@ -739,6 +739,9 @@ def expand_manual_phase_fence() -> Pass:
 def flatten_call_expr() -> Pass:
     """Create a pass that flattens nested call expressions."""
 
+def pack_fp4() -> Pass:
+    """Pack frontend logical FP4 nibble types into packed FP4E2M1X2 after SSA flattening."""
+
 def inline_functions() -> Pass:
     """Create a pass that eliminates ``FunctionType.Inline`` functions.
 
@@ -832,7 +835,7 @@ def lower_tile_to_buffer() -> Pass:
 
     Runs last, after storage legalization, address placement and signature materialization.
     The initial recipe covers dense static rank-2 Vec FP32 allocations, GM transfers,
-    add/mul and copies in straight-line kernels and branches. Unsupported recipes fail explicitly.
+    add/mul and copies in straight-line kernels, branches and loops. Unsupported recipes fail explicitly.
     Verifies storage closure even when automatic verification is disabled, and verifies
     BufferIR after conversion.
     """
@@ -1116,6 +1119,7 @@ __all__ = [
     "materialize_valid_shape_symbols",
     "lower_tile_to_buffer",
     "flatten_call_expr",
+    "pack_fp4",
     "inline_functions",
     "normalize_stmt_structure",
     "derive_call_directions",
