@@ -147,8 +147,8 @@ pl.set_cache_policy(b, BYPASS)                 statement, consumed at parse
 
 | Hop | Carrier | Payload type | Written by | Consumed by |
 | --- | ------- | ------------ | ---------- | ----------- |
-| 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/09-outline_incore_scopes.md) (pass 9) |
-| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 9 | [`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md) (pass 11) |
+| 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/10-outline_incore_scopes.md) (pass 9) |
+| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 9 | [`ConvertTensorToTileOps`](../passes/12-convert_tensor_to_tile_ops.md) (pass 11) |
 | 3 | `tile.load` kwarg `cache` | `int` (`ir::CachePolicy`) | pass 11 | PTO codegen |
 
 Design notes that keep the chain honest:
@@ -156,16 +156,16 @@ Design notes that keep the chain honest:
 - **Not a field on `TensorView`.** A plain kernel parameter has no
   `tensor_view_` at all, so stamping a policy there would force one into
   existence — dragging in the strict `TensorViewCanonical` verifier, and
-  [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
+  [`MaterializeTensorStrides`](../passes/34-materialize_tensor_strides.md)
   rebuilds the view through a positional constructor that would silently drop
   the field.
 - **Param indices are valid only across passes 8..10.** Only
   `OutlineClusterScopes` sits between them, and it does not mutate an outlined
   InCore param list. Downstream passes *do*:
-  [`InjectGMPipeBuffer`](../passes/25-inject_gm_pipe_buffer.md) and
-  [`MaterializeDistTensorCtx`](../passes/47-materialize_dist_tensor_ctx.md)
+  [`InjectGMPipeBuffer`](../passes/26-inject_gm_pipe_buffer.md) and
+  [`MaterializeDistTensorCtx`](../passes/48-materialize_dist_tensor_ctx.md)
   append, and
-  [`MaterializeValidShapeSymbols`](../passes/52-materialize_valid_shape_symbols.md)
+  [`MaterializeValidShapeSymbols`](../passes/53-materialize_valid_shape_symbols.md)
   *prepends*. That is why pass 11 erases the attr after converting it.
 - **The kwarg is an `int`, not the enum.** It follows `tile.store`'s `atomic`
   kwarg, so the serializer, deserializer, `structural_hash` and
@@ -224,11 +224,11 @@ Three properties of the emit are worth stating, because each one is asserted in
 
 ### Older assemblers
 
-The emit is unconditional: there is no version gate, and no mechanism in the
-tree reads the pinned assembler version at compile time. A build pointed at an
-assembler older than the `PTOAS_VERSION` this repo pins is therefore out of
-contract — `cache_policy` is a v0.61 addition, so expect it to fail the
-`pto.tload` verifier there.
+The emit itself is unconditional — `cache_policy` is a v0.61 addition, and an
+older assembler would fail it at the `pto.tload` verifier. That never happens
+in practice: before the first `.pto` is assembled, codegen runs `ptoas --version`
+and rejects any assembler older than the `PTOAS_VERSION` this repo pins, with
+an error that names both versions.
 
 ### Limits
 
@@ -256,5 +256,5 @@ contract — `cache_policy` is a v0.61 addition, so expect it to fail the
 
 - [Statements and Control Flow](01-statements.md) — scope forms and the other
   parse-time markers (`pl.dump_tag`, `pl.static_assert`).
-- [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) — hop 1 → hop 2.
-- [ConvertTensorToTileOps](../passes/11-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.
+- [OutlineIncoreScopes](../passes/10-outline_incore_scopes.md) — hop 1 → hop 2.
+- [ConvertTensorToTileOps](../passes/12-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.

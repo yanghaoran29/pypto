@@ -110,7 +110,7 @@ class DataType {
   static const DataType UINT32;     // 32-bit unsigned integer
   static const DataType UINT64;     // 64-bit unsigned integer
   static const DataType FP4;        // 4-bit floating point (logical nibble; frontend only)
-  static const DataType FP4E2M1X2;  // Packed pair of E2M1 FP4 (1 byte); PTOAS / Torch carrier
+  static const DataType FP4E2M1X2;  // Packed pair of E2M1 FP4 (1 byte); compiler-internal after PackFp4
   static const DataType FP8E4M3FN;  // 8-bit floating point (IEEE 754 e4m3fn format)
   static const DataType FP8E5M2;    // 8-bit floating point (IEEE 754 e5m2 format)
   static const DataType FP8E8M0;    // 8-bit floating point (E8M0 MX block-scale exponent)
@@ -377,9 +377,9 @@ class DataType {
    */
   [[nodiscard]] constexpr uint8_t Code() const { return code_; }
 
-  /// Frontend logical nibble FP4.
+  /// Frontend logical nibble FP4 (pre-PackFp4).
   [[nodiscard]] constexpr bool IsLogicalFp4() const { return code_ == kFp4Code; }
-  /// Packed E2M1x2 carrier.
+  /// Packed E2M1x2 carrier (post-PackFp4).
   [[nodiscard]] constexpr bool IsPackedFp4() const { return code_ == kFp4e2m1x2Code; }
   [[nodiscard]] constexpr bool IsFp4Family() const { return IsLogicalFp4() || IsPackedFp4(); }
 

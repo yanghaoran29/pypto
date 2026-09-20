@@ -292,7 +292,7 @@ Pass MaterializeValidShapeSymbols();
  *
  * Runs last, after storage legalization, address placement and signature
  * materialization. The initial recipe covers dense static rank-2 Vec FP32
- * allocations, GM transfers, add/mul and copies in straight-line kernels and branches.
+ * allocations, GM transfers, add/mul and copies in straight-line kernels, branches and loops.
  * Unsupported recipes fail explicitly. Verifies storage closure even when
  * automatic verification is disabled, and verifies BufferIR after conversion.
  */
@@ -902,6 +902,15 @@ Pass LowerCompositeOps();
  * @brief Create a pass that flattens nested call expressions
  */
 Pass FlattenCallExpr();
+
+/**
+ * @brief Pack frontend logical FP4 nibble types into packed FP4E2M1X2.
+ *
+ * Rewrites Tensor/Tile/Buffer dtypes and last-axis coordinates so later
+ * passes and codegen address packed !pto.f4E2M1x2 elements. Inserted after
+ * FlattenCallExpr and before Outline / ConvertTensorToTileOps.
+ */
+Pass PackFp4();
 
 /**
  * @brief Create a pass that normalizes statement structure
