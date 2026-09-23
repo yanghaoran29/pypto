@@ -219,13 +219,12 @@ both pinned with their provenance at the emission sites. See
 `codegen::EncodeFixpipePreQuant` for the register layout, `99-verifier.md` for
 the per-backend dtype tables.
 
-The `pto.tinsert` half is **emitted but not currently reachable**: both handlers
-withhold `pre_quant` for `FixpipeDest::kMat` because ptoas emits an ambiguous
-call for it (the scale binds to `indexRow` —
-[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570), and
-`99-verifier.md` for the mechanism), so the
-emitter code below is exercised only with verification off. `pre_relu` alone on
-`Acc → Mat`, and the whole `Acc → GM` path, are unaffected.
+PTOAS 0.65 resolves the scaled `pto.tinsert` overload ambiguity tracked by
+[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570) by emitting a
+`uint64_t` scale and `uint16_t` row/column operands. Both A2/A3 and A5 therefore
+allow the validated `INT32 Acc → FP16 Mat` (`DEQF16`) form. Other scaled
+Acc-to-Mat dtype pairs remain rejected by `FixpipeEpilogueValid`; the wider
+per-backend tables continue to govern Acc-to-GM stores independently.
 
 **`tile.set_validshape` lowering details.**  `pto.set_validshape` mutates the
 operand's `valid_row` / `valid_col` operands, so the operand must be a handle
@@ -475,15 +474,18 @@ top of each other.
 | Form | ptoas behaviour | Upstream |
 | ---- | --------------- | -------- |
 | Two slots filled and read in the same iteration | ≤ 0.55 guards only the first `multi_tile_get`; the second load races the next iteration's write (measured wrong on device with 0.54). 0.56+ guards the body with one static event for the whole region — correct, but none of the per-slot overlap the region form exists for | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118), fixed in 0.56 |
-| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63 |
+| Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one. 0.63 primes only the slot the loop writes first; 0.64 and 0.65 prime both again | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63, regressed in 0.64 |
 
 `CoLiveSlotCollector` counts slot selections per loop body, so it cannot tell the
-two forms apart, and the pinned ptoas (0.61) still has the second bug. Codegen
-therefore refuses both and points at the PyPTO planner, whose baked-address
-`alloc_tile` path runs the same-iteration form correctly on device.
+two forms apart, and the second bug is back after its fix. Measured on device, the
+prefetch form runs correctly under 0.63, but under 0.64 and 0.65 it returns a later
+block's data for an even trip count and hangs for an odd one; the same-iteration
+form runs correctly under 0.65. Codegen therefore refuses both and points at the
+PyPTO planner, whose baked-address `alloc_tile` path runs the same-iteration form
+correctly on device.
 Straight-line code is unaffected — with no loop there is no cross-iteration reuse
 to guard. Lifting the restriction is one condition in `PlanMultiBufferRegions`;
-it needs the ptoas pin at 0.63 or later and a device run of both forms.
+it needs a pinned ptoas that runs the prefetch form correctly on device.
 
 Under `PYPTO` no region is emitted at all: a region at `--pto-level=level3` needs
 an explicit base `addr`, which codegen does not emit yet. ptoas is not the limit —

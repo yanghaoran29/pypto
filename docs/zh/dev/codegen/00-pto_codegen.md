@@ -208,12 +208,12 @@ scale 还**决定**走哪条下沉路径，而不只是搭个便车——`INT32`
 对方推出——二者连同其出处都逐字钉在各自的发射点上。寄存器编码见
 `codegen::EncodeFixpipePreQuant`，各后端的 dtype 表见 `99-verifier.md`。
 
-`pto.tinsert` 那一半**能发射但当前走不到**：两个 handler 都对
-`FixpipeDest::kMat` 关闭了 `pre_quant`，因为 ptoas 为它发出的调用有歧义（scale
-被绑到了 `indexRow`，见 [PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570)，
-机制详见 `99-verifier.md`），所以下面这段 emitter 代码只在关闭
-校验的情况下被覆盖。`Acc → Mat` 上单独的 `pre_relu`，以及整条 `Acc → GM` 路径，
-都不受影响。
+PTOAS 0.65 通过为 scale 发出 `uint64_t`、为行列索引发出 `uint16_t`，解决了
+[PTOAS#1570](https://github.com/hw-native-sys/PTOAS/issues/1570) 跟踪的 scaled
+`pto.tinsert` 重载歧义。因此 A2/A3 与 A5 均开放已验证的
+`INT32 Acc → FP16 Mat`（`DEQF16`）形式。其他带 scale 的 Acc-to-Mat dtype 组合
+仍由 `FixpipeEpilogueValid` 拒绝；范围更广的各后端能力表继续独立管辖 Acc-to-GM
+store。
 
 **`tile.set_validshape` 下沉细节。** `pto.set_validshape` 修改的是操作数的
 `valid_row` / `valid_col` 操作数，因此操作数必须是拥有它们的 handle：alloc、
@@ -445,13 +445,14 @@ ptoas 的 `[2, 16]` 内）会报 `ValueError` 并指明具体形态，因为回�
 | 形态 | ptoas 行为 | 上游 |
 | ---- | ---------- | ---- |
 | 同一轮迭代内填充并读取两个槽位 | ≤ 0.55 只保护**第一个** `multi_tile_get`，第二个 load 与下一轮迭代的写入竞争（0.54 真机实测算错）。0.56 起用整个区域的一个静态 event 保护循环体——正确，但没有区域形式赖以存在的逐槽位重叠 | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118)，0.56 修复 |
-| 预取：循环前填充槽位 0，之后每轮迭代填充槽位 `(i+1) % 2`、同时读取槽位 `i % 2` | ≤ 0.62 像一槽位轮转那样为两个槽位的 event 都做 prime 和 drain，在这里差一：迭代次数为偶数时算错，为奇数时设备挂死 | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)，0.63 修复 |
+| 预取：循环前填充槽位 0，之后每轮迭代填充槽位 `(i+1) % 2`、同时读取槽位 `i % 2` | ≤ 0.62 像一槽位轮转那样为两个槽位的 event 都做 prime 和 drain，在这里差一：迭代次数为偶数时算错，为奇数时设备挂死。0.63 只 prime 循环最先写入的那个槽位；0.64 和 0.65 又对两个槽位都做 prime | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)，0.63 修复，0.64 回退 |
 
-`CoLiveSlotCollector` 只按循环体统计槽位选取次数，分不清这两种形态，而当前固定的 ptoas（0.61）
-仍有第二个缺陷。因此代码生成对两者都拒绝，并指向 PyPTO planner——它的固化地址 `alloc_tile`
-路径在真机上能正确运行同轮迭代那种形态。直线代码不受影响：没有循环就没有跨迭代复用需要
-保护。放宽限制只需改 `PlanMultiBufferRegions` 里一个条件，但前提是把 ptoas 固定版本升到 0.63
-或更高，并在真机上跑通这两种形态。
+`CoLiveSlotCollector` 只按循环体统计槽位选取次数，分不清这两种形态，而第二个缺陷在修复后又
+回来了。真机实测：预取形态在 0.63 下运行正确，但在 0.64 和 0.65 下迭代次数为偶数时读到后面
+块的数据、为奇数时挂死；同轮迭代形态在 0.65 下运行正确。因此代码生成对两者都拒绝，并指向
+PyPTO planner——它的固化地址 `alloc_tile` 路径在真机上能正确运行同轮迭代那种形态。直线代码
+不受影响：没有循环就没有跨迭代复用需要保护。放宽限制只需改 `PlanMultiBufferRegions` 里一个
+条件，但前提是固定的 ptoas 能在真机上正确运行预取形态。
 
 `PYPTO` 模式下则完全不发射区域：`--pto-level=level3` 下的区域需要显式的基地址 `addr`，而
 codegen 目前还不发射它。限制不在 ptoas——给定常量 `addr`，ptoas 自 0.55 起在 level3 下推导出的
